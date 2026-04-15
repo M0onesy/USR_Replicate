@@ -1,0 +1,9 @@
+# Public runtime dependencies for:
+# - Code/allcode_Need.py
+# - Code/convert_bz2_to_csv.py
+# Excludes proprietary SDK/API dependencies used by Code/getApidb.py.
+
+numpy>=1.23
+pandas>=1.5
+scipy>=1.10
+matplotlib>=3.7
