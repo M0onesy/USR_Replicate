@@ -6,16 +6,16 @@ returns, and writes fast processed panels for `allcode_Need.py`.
 """
 
 from __future__ import annotations
-
 import argparse
 import hashlib
 import json
+import os
+import numpy as np
+import pandas as pd
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
-
-import numpy as np
-import pandas as pd
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -43,6 +43,19 @@ CN_5MIN_BAR_CODES = np.array(
 STRICT_BALANCED_SAMPLE = "strict_balanced"
 NEAR_BALANCED_99_SAMPLE = "near_balanced_99"
 SUSPICIOUS_OVERNIGHT_THRESHOLDS = (0.12, 0.20)
+
+
+def _default_worker_count() -> int:
+    """给大数据预处理使用的保守默认并行度，避免磁盘和内存被打满。"""
+    cpu_count = os.cpu_count() or 1
+    return max(1, min(cpu_count - 1, 8))
+
+
+def _normalize_worker_count(workers: Optional[int]) -> int:
+    """把 CLI/API 传入的 worker 数规范为正整数。"""
+    if workers is None:
+        return _default_worker_count()
+    return max(1, int(workers))
 
 
 def _ensure_path(path_like: str | Path) -> Path:
@@ -557,18 +570,107 @@ def _select_sample_rows(
     return selected
 
 
-def _save_symbol_outputs(proc_root: Path, symbol: str, meta: Dict[str, Any], arrays: Dict[str, np.ndarray]) -> None:
+def _save_symbol_outputs(
+    proc_root: Path,
+    symbol: str,
+    meta: Dict[str, Any],
+    arrays: Dict[str, np.ndarray],
+    compress: bool = False,
+) -> None:
     """保存单只股票的复权收益数组和元数据。"""
     npz_path = _symbol_npz_path(proc_root, symbol)
     npz_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(npz_path, **arrays)
+    if compress:
+        np.savez_compressed(npz_path, **arrays)
+    else:
+        np.savez(npz_path, **arrays)
     _write_json(_symbol_meta_path(proc_root, symbol), meta)
+
+
+def _symbol_output_row(proc_root: Path, symbol: str, raw_file_path: Path, meta: Dict[str, Any]) -> Dict[str, Any]:
+    """把单只股票元数据整理成 universe 表的一行。"""
+    return {
+        "symbol": symbol,
+        "file_path": str(_symbol_npz_path(proc_root, symbol).resolve()),
+        "raw_file_path": str(raw_file_path.resolve()),
+        "n_observed_days": meta["n_observed_days"],
+        "n_valid_days": meta["n_valid_days"],
+        "n_invalid_days": meta["n_invalid_days"],
+        "first_valid_date": meta["first_valid_date"],
+        "last_valid_date": meta["last_valid_date"],
+        "missing_factor_days": meta["missing_factor_days"],
+        "max_abs_raw_overnight": meta["max_abs_raw_overnight"],
+        "max_abs_overnight": meta["max_abs_overnight"],
+        "suspicious_raw_overnight_count_012": meta["suspicious_raw_overnight_count_012"],
+        "suspicious_raw_overnight_count_020": meta["suspicious_raw_overnight_count_020"],
+        "suspicious_overnight_count_012": meta["suspicious_overnight_count_012"],
+        "suspicious_overnight_count_020": meta["suspicious_overnight_count_020"],
+        "valid_dates": meta["valid_dates"],
+        "valid_days_by_year": meta["valid_days_by_year"],
+        "observed_days_by_year": meta["observed_days_by_year"],
+    }
+
+
+def _preprocess_symbol_task(task: Tuple[str, str, str, List[str], List[float], str, bool]) -> Dict[str, Any]:
+    """Windows 多进程 worker：处理并保存一只股票，只返回小型元数据。"""
+    proc_root_text, symbol, file_path_text, factor_dates, factor_values, return_mode, compress = task
+    proc_root = Path(proc_root_text)
+    file_path = Path(file_path_text)
+    try:
+        factor_by_date = pd.Series(factor_values, index=factor_dates, dtype="float64")
+        meta, arrays = _build_adjusted_symbol_returns(file_path, factor_by_date, return_mode=return_mode)
+        _save_symbol_outputs(proc_root, symbol, meta, arrays, compress=compress)
+        row = _symbol_output_row(proc_root, symbol, file_path, meta)
+        return {"ok": True, "symbol": symbol, "row": row, "error": None}
+    except Exception as exc:
+        return {"ok": False, "symbol": symbol, "row": None, "error": repr(exc)}
 
 
 def _load_symbol_arrays(proc_root: Path, symbol: str) -> Dict[str, np.ndarray]:
     """读取单只股票的预处理收益数组。"""
     arrays_raw = np.load(_symbol_npz_path(proc_root, symbol), allow_pickle=False)
     return {name: arrays_raw[name] for name in arrays_raw.files}
+
+
+def _align_symbol_to_panel(
+    proc_root: Path,
+    symbol: str,
+    date_codes: np.ndarray,
+    allow_missing: bool,
+) -> Tuple[str, np.ndarray, np.ndarray, np.ndarray]:
+    """按目标日期一次性对齐单只股票收益，供串行和线程面板组装共用。"""
+    arrays = _load_symbol_arrays(proc_root, symbol)
+    source_codes = arrays["date_codes"].astype(np.int32, copy=False)
+    if len(source_codes) == 0:
+        if not allow_missing:
+            raise ValueError(f"严格平衡面板缺少 {symbol} 的全部目标交易日")
+        day_count = len(date_codes)
+        bar_count = len(CN_5MIN_BAR_TIMES)
+        return (
+            symbol,
+            np.full(day_count * bar_count, np.nan, dtype=np.float64),
+            np.full(day_count, np.nan, dtype=np.float64),
+            np.full(day_count, np.nan, dtype=np.float64),
+        )
+    source_pos = np.searchsorted(source_codes, date_codes)
+    matched = (source_pos < len(source_codes)) & (source_codes[source_pos.clip(max=max(len(source_codes) - 1, 0))] == date_codes)
+    if not bool(matched.all()) and not allow_missing:
+        missing_code = int(date_codes[np.where(~matched)[0][0]])
+        raise ValueError(f"严格平衡面板缺少 {symbol} 在 {_date_code_to_text(missing_code)} 的完整数据")
+
+    day_count = len(date_codes)
+    bar_count = len(CN_5MIN_BAR_TIMES)
+    fill_value = np.nan if allow_missing else 0.0
+    intra_col = np.full((day_count, bar_count), fill_value, dtype=np.float64)
+    night_col = np.full(day_count, fill_value, dtype=np.float64)
+    daily_col = np.full(day_count, fill_value, dtype=np.float64)
+    if matched.any():
+        target_idx = np.where(matched)[0]
+        source_idx = source_pos[matched]
+        intra_col[target_idx, :] = arrays["intraday_returns"][source_idx]
+        night_col[target_idx] = arrays["overnight_returns"][source_idx]
+        daily_col[target_idx] = arrays["daily_returns"][source_idx]
+    return symbol, intra_col.reshape(day_count * bar_count), night_col, daily_col
 
 
 def _write_panel(
@@ -579,6 +681,7 @@ def _write_panel(
     dates: Sequence[str],
     allow_missing: bool,
     return_mode: str = "open_close",
+    panel_workers: int = 1,
 ) -> Dict[str, Any]:
     """把逐股票收益数组拼成面板文件。"""
     tickers = selected["symbol"].tolist()
@@ -592,20 +695,28 @@ def _write_panel(
     R_night = np.full((day_count, stock_count), fill_value, dtype=np.float64)
     R_daily = np.full((day_count, stock_count), fill_value, dtype=np.float64)
 
+    panel_workers = max(1, int(panel_workers))
+    if panel_workers == 1 or stock_count <= 1:
+        aligned_columns = [
+            _align_symbol_to_panel(proc_root, symbol, date_codes, allow_missing)
+            for symbol in tickers
+        ]
+    else:
+        aligned_columns = []
+        with ThreadPoolExecutor(max_workers=panel_workers) as executor:
+            futures = {
+                executor.submit(_align_symbol_to_panel, proc_root, symbol, date_codes, allow_missing): symbol
+                for symbol in tickers
+            }
+            for future in as_completed(futures):
+                aligned_columns.append(future.result())
+
+    column_lookup = {symbol: (intra, night, daily) for symbol, intra, night, daily in aligned_columns}
     for col_idx, symbol in enumerate(tickers):
-        arrays = _load_symbol_arrays(proc_root, symbol)
-        locate = {int(code): idx for idx, code in enumerate(arrays["date_codes"].tolist())}
-        for day_idx, date_code in enumerate(date_codes):
-            source_idx = locate.get(int(date_code))
-            if source_idx is None:
-                if allow_missing:
-                    continue
-                raise ValueError(f"严格平衡面板缺少 {symbol} 在 {_date_code_to_text(date_code)} 的完整数据")
-            start = day_idx * bar_count
-            end = start + bar_count
-            R_intra[start:end, col_idx] = arrays["intraday_returns"][source_idx]
-            R_night[day_idx, col_idx] = arrays["overnight_returns"][source_idx]
-            R_daily[day_idx, col_idx] = arrays["daily_returns"][source_idx]
+        intra_col, night_col, daily_col = column_lookup[symbol]
+        R_intra[:, col_idx] = intra_col
+        R_night[:, col_idx] = night_col
+        R_daily[:, col_idx] = daily_col
 
     day_ids = np.repeat(np.arange(day_count), bar_count).astype(np.int32)
     sample_report = {
@@ -620,6 +731,7 @@ def _write_panel(
         "selected_calendar_end": dates[-1] if dates else None,
         "target_symbols": tickers,
         "contains_nan": bool(np.isnan(R_intra).any()),
+        "panel_workers": int(panel_workers),
     }
 
     panel_array_dir, meta_path = _panel_paths(proc_root, sample_mode, panel_name)
@@ -702,12 +814,17 @@ def preprocess_cn_data(
     max_stocks: Optional[int] = None,
     refresh: bool = False,
     return_mode: str = "open_close",
+    workers: Optional[int] = None,
+    panel_workers: Optional[int] = None,
+    compress_symbol_returns: bool = False,
 ) -> Dict[str, Any]:
     """执行完整预处理流程，并返回 manifest。"""
     raw_root = _ensure_path(raw_root)
     factor_path = _ensure_path(factor_path)
     proc_root = _ensure_path(proc_root)
     years = _normalize_years(years)
+    workers = _normalize_worker_count(workers)
+    panel_workers = _normalize_worker_count(panel_workers)
     manifest_path = proc_root / "manifest.json"
     raw_files = _find_raw_kline_files(raw_root)
     raw_symbol_count = len(raw_files)
@@ -726,6 +843,7 @@ def preprocess_cn_data(
         "max_stocks": max_stocks,
         "return_mode": return_mode,
         "adjustment": "backward",
+        "compress_symbol_returns": bool(compress_symbol_returns),
     }
     input_hash = _signature_hash(input_signature)
     if manifest_path.exists() and not refresh:
@@ -759,36 +877,48 @@ def preprocess_cn_data(
     symbols = selected_universe["symbol"].tolist()
     factor_matrix = load_backward_factor_matrix(factor_path, symbols=symbols, dates=target_dates)
 
-    rows: List[Dict[str, Any]] = []
-    for symbol_idx, row in enumerate(selected_universe.itertuples(index=False), start=1):
+    tasks = []
+    factor_dates = [str(date) for date in factor_matrix.index.tolist()]
+    for row in selected_universe.itertuples(index=False):
         symbol = str(row.symbol)
-        print(f"[{symbol_idx}/{len(symbols)}] 预处理 {symbol}")
-        meta, arrays = _build_adjusted_symbol_returns(Path(row.file_path), factor_matrix[symbol], return_mode=return_mode)
-        _save_symbol_outputs(proc_root, symbol, meta, arrays)
+        factor_values = [float(value) if pd.notna(value) else np.nan for value in factor_matrix[symbol].to_numpy(dtype=np.float64)]
+        tasks.append((str(proc_root), symbol, str(Path(row.file_path).resolve()), factor_dates, factor_values, return_mode, bool(compress_symbol_returns)))
 
-        out_row = {
-            "symbol": symbol,
-            "file_path": str(_symbol_npz_path(proc_root, symbol).resolve()),
-            "raw_file_path": str(Path(row.file_path).resolve()),
-            "n_observed_days": meta["n_observed_days"],
-            "n_valid_days": meta["n_valid_days"],
-            "n_invalid_days": meta["n_invalid_days"],
-            "first_valid_date": meta["first_valid_date"],
-            "last_valid_date": meta["last_valid_date"],
-            "missing_factor_days": meta["missing_factor_days"],
-            "max_abs_raw_overnight": meta["max_abs_raw_overnight"],
-            "max_abs_overnight": meta["max_abs_overnight"],
-            "suspicious_raw_overnight_count_012": meta["suspicious_raw_overnight_count_012"],
-            "suspicious_raw_overnight_count_020": meta["suspicious_raw_overnight_count_020"],
-            "suspicious_overnight_count_012": meta["suspicious_overnight_count_012"],
-            "suspicious_overnight_count_020": meta["suspicious_overnight_count_020"],
-            "valid_dates": meta["valid_dates"],
-            "valid_days_by_year": meta["valid_days_by_year"],
-            "observed_days_by_year": meta["observed_days_by_year"],
-        }
-        rows.append(out_row)
+    rows: List[Dict[str, Any]] = []
+    failed_rows: List[Dict[str, Any]] = []
+    print(f"[INFO] 预处理 {len(tasks)} 只股票，workers={workers}，panel_workers={panel_workers}")
+    if workers == 1 or len(tasks) <= 1:
+        for symbol_idx, task in enumerate(tasks, start=1):
+            print(f"[{symbol_idx}/{len(tasks)}] 预处理 {task[1]}")
+            result = _preprocess_symbol_task(task)
+            if result["ok"]:
+                rows.append(result["row"])
+            else:
+                failed_rows.append({"symbol": result["symbol"], "error": result["error"]})
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_preprocess_symbol_task, task): task[1] for task in tasks}
+            completed = 0
+            for future in as_completed(futures):
+                completed += 1
+                result = future.result()
+                symbol = str(result["symbol"])
+                if result["ok"]:
+                    rows.append(result["row"])
+                    print(f"[{completed}/{len(tasks)}] 完成 {symbol}")
+                else:
+                    failed_rows.append({"symbol": symbol, "error": result["error"]})
+                    print(f"[{completed}/{len(tasks)}] 失败 {symbol}: {result['error']}")
 
-    processed_universe = pd.DataFrame(rows)
+    if failed_rows:
+        failed_path = proc_root / "metadata" / "failed_symbols.csv"
+        failed_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(failed_rows).sort_values("symbol").to_csv(failed_path, index=False, encoding="utf-8-sig")
+        print(f"[WARN] {len(failed_rows)} 只股票预处理失败，详情见 {failed_path}")
+    if not rows:
+        raise RuntimeError("所有股票预处理均失败，无法生成面板")
+
+    processed_universe = pd.DataFrame(rows).sort_values("symbol").reset_index(drop=True)
     processed_universe, processed_summary = _summarize_processed_universe(processed_universe, proc_root)
     processed_summary["raw_symbol_count"] = int(raw_symbol_count)
     processed_summary["processed_symbol_count"] = int(len(processed_universe))
@@ -797,19 +927,19 @@ def preprocess_cn_data(
     panel_outputs: List[Dict[str, Any]] = []
     strict_selected = _select_sample_rows(processed_universe, STRICT_BALANCED_SAMPLE, years=None)
     if not strict_selected.empty:
-        panel_outputs.append(_write_panel(proc_root, STRICT_BALANCED_SAMPLE, "full", strict_selected, processed_summary["global_dates"], allow_missing=False, return_mode=return_mode))
+        panel_outputs.append(_write_panel(proc_root, STRICT_BALANCED_SAMPLE, "full", strict_selected, processed_summary["global_dates"], allow_missing=False, return_mode=return_mode, panel_workers=panel_workers))
         for year, year_dates in processed_summary["global_dates_by_year"].items():
             strict_year = _select_sample_rows(processed_universe, STRICT_BALANCED_SAMPLE, years=[int(year)])
             if not strict_year.empty:
-                panel_outputs.append(_write_panel(proc_root, STRICT_BALANCED_SAMPLE, f"year_{year}", strict_year, year_dates, allow_missing=False, return_mode=return_mode))
+                panel_outputs.append(_write_panel(proc_root, STRICT_BALANCED_SAMPLE, f"year_{year}", strict_year, year_dates, allow_missing=False, return_mode=return_mode, panel_workers=panel_workers))
 
     near_full = _select_sample_rows(processed_universe, NEAR_BALANCED_99_SAMPLE, years=None)
     if not near_full.empty:
-        panel_outputs.append(_write_panel(proc_root, NEAR_BALANCED_99_SAMPLE, "full", near_full, processed_summary["global_dates"], allow_missing=True, return_mode=return_mode))
+        panel_outputs.append(_write_panel(proc_root, NEAR_BALANCED_99_SAMPLE, "full", near_full, processed_summary["global_dates"], allow_missing=True, return_mode=return_mode, panel_workers=panel_workers))
     for year, year_dates in processed_summary["global_dates_by_year"].items():
         near_year = _select_sample_rows(processed_universe, NEAR_BALANCED_99_SAMPLE, years=[int(year)])
         if not near_year.empty:
-            panel_outputs.append(_write_panel(proc_root, NEAR_BALANCED_99_SAMPLE, f"year_{year}", near_year, year_dates, allow_missing=True, return_mode=return_mode))
+            panel_outputs.append(_write_panel(proc_root, NEAR_BALANCED_99_SAMPLE, f"year_{year}", near_year, year_dates, allow_missing=True, return_mode=return_mode, panel_workers=panel_workers))
 
     manifest = {
         "version": PREPROCESS_VERSION,
@@ -825,6 +955,10 @@ def preprocess_cn_data(
         "max_stocks": max_stocks,
         "raw_symbol_count": int(raw_symbol_count),
         "processed_symbol_count": int(len(processed_universe)),
+        "failed_symbol_count": int(len(failed_rows)),
+        "workers": int(workers),
+        "panel_workers": int(panel_workers),
+        "symbol_return_storage": "npz_compressed" if compress_symbol_returns else "npz_uncompressed",
         "strict_balanced_symbols": int(processed_summary["strict_balanced_symbols"]),
         "near_balanced_99_symbols": int(processed_summary["near_balanced_99_symbols"]),
         "summary": processed_summary,
@@ -851,6 +985,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--years", nargs="+", type=int, help="只预处理指定年份")
     parser.add_argument("--max-stocks", type=int, help="smoke run 用：限制每类样本股票数量")
     parser.add_argument("--refresh", action="store_true", help="忽略已有 manifest，强制重建")
+    parser.add_argument("--workers", type=int, help="逐股票预处理并行进程数；默认 min(cpu_count - 1, 8)")
+    parser.add_argument("--panel-workers", type=int, help="面板拼接并行线程数；默认 min(cpu_count - 1, 8)")
+    parser.add_argument("--compress-symbol-returns", action="store_true", help="压缩逐股票 .npz 中间文件；更省空间但 IO 更慢")
     return parser
 
 
@@ -864,6 +1001,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_stocks=args.max_stocks,
         refresh=args.refresh,
         return_mode=args.return_mode,
+        workers=args.workers,
+        panel_workers=args.panel_workers,
+        compress_symbol_returns=args.compress_symbol_returns,
     )
     return 0
 
