@@ -249,7 +249,7 @@ def _load_factor_dates(factor_path: Path, years: Optional[Sequence[int]]) -> Lis
 
 
 def _infer_smoke_target_dates(raw_root: Path, factor_path: Path, factor_dates: Sequence[str]) -> List[str]:
-    """???????????????????????? K ????"""
+    """Infer a smoke-test trading calendar from the first usable raw symbol."""
     factor_date_set = set(str(date) for date in factor_dates)
     factor_header = set(pd.read_csv(factor_path, nrows=0).columns.tolist())
     for file_path in sorted(raw_root.rglob("data.bz2")):
@@ -261,7 +261,7 @@ def _infer_smoke_target_dates(raw_root: Path, factor_path: Path, factor_dates: S
         valid_dates = [date for date in day_info["valid_dates"] if date in factor_date_set]
         if valid_dates:
             return valid_dates
-    raise RuntimeError("????? K ???????????")
+    raise RuntimeError("Unable to infer a smoke-test calendar from raw K-line files")
 
 
 def _select_smoke_symbols_fast(
@@ -754,7 +754,7 @@ def preprocess_cn_data(
         selected_universe = pd.DataFrame(rows_for_all_symbols).sort_values("symbol").reset_index(drop=True)
         target_dates = factor_dates
     if selected_universe.empty:
-        raise ValueError("?????????")
+        raise ValueError("No symbols are available for preprocessing")
 
     symbols = selected_universe["symbol"].tolist()
     factor_matrix = load_backward_factor_matrix(factor_path, symbols=symbols, dates=target_dates)
