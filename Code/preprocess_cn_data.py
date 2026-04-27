@@ -1,7 +1,8 @@
-"""中国 A 股 5 分钟 K 线预处理脚本。
+"""Preprocess China A-share 5-minute K-line data for the Pelger replication.
 
-本脚本只做数据层工作：读取原始 `data.bz2`，按日匹配后复权因子，
-生成论文复现脚本可以直接加载的收益数组、样本元数据和面板文件。
+This script is the only project stage that reads raw `data.bz2` files. It cleans
+raw bars, applies `backward_factor.csv`, constructs intraday/overnight/daily
+returns, and writes fast processed panels for `allcode_Need.py`.
 """
 
 from __future__ import annotations
@@ -16,30 +17,61 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-from allcode_Need import (
-    CN_5MIN_BAR_CODES,
-    CN_5MIN_BAR_TIMES,
-    NEAR_BALANCED_99_SAMPLE,
-    STRICT_BALANCED_SAMPLE,
-    SUSPICIOUS_OVERNIGHT_THRESHOLDS,
-    _classify_symbol_days,
-    _ensure_path,
-    _find_bz2_files,
-    _json_ready,
-    _load_cn_symbol_frame,
-    _normalize_years,
-    _select_sample_rows,
-    _selected_calendar_dates,
-    scan_cn_bz2_universe,
-)
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RAW_ROOT = REPO_ROOT / "Data" / "kline_Data" / "EXTRA_STOCK_A"
 DEFAULT_FACTOR_PATH = REPO_ROOT / "Data" / "fact_Data" / "backward_factor.csv"
 DEFAULT_PROC_ROOT = REPO_ROOT / "Data" / "proc_Data" / "pelger_cn_adjusted"
 DEFAULT_PREPROCESS_CACHE_ROOT = REPO_ROOT / ".hf_cache" / "pelger_cn_preprocess"
-PREPROCESS_VERSION = "v1"
+PREPROCESS_VERSION = "v2"
+
+REQUIRED_RAW_COLUMNS = ["code", "kline_time", "open", "high", "low", "close", "volume", "amount"]
+CN_5MIN_BAR_TIMES = [
+    "09:30:00", "09:35:00", "09:40:00", "09:45:00", "09:50:00", "09:55:00",
+    "10:00:00", "10:05:00", "10:10:00", "10:15:00", "10:20:00", "10:25:00",
+    "10:30:00", "10:35:00", "10:40:00", "10:45:00", "10:50:00", "10:55:00",
+    "11:00:00", "11:05:00", "11:10:00", "11:15:00", "11:20:00", "11:25:00",
+    "13:00:00", "13:05:00", "13:10:00", "13:15:00", "13:20:00", "13:25:00",
+    "13:30:00", "13:35:00", "13:40:00", "13:45:00", "13:50:00", "13:55:00",
+    "14:00:00", "14:05:00", "14:10:00", "14:15:00", "14:20:00", "14:25:00",
+    "14:30:00", "14:35:00", "14:40:00", "14:45:00", "14:50:00", "14:55:00",
+]
+CN_5MIN_BAR_CODES = np.array(
+    [int(time_text[:2]) * 100 + int(time_text[3:5]) for time_text in CN_5MIN_BAR_TIMES],
+    dtype=np.int32,
+)
+STRICT_BALANCED_SAMPLE = "strict_balanced"
+NEAR_BALANCED_99_SAMPLE = "near_balanced_99"
+SUSPICIOUS_OVERNIGHT_THRESHOLDS = (0.12, 0.20)
+
+
+def _ensure_path(path_like: str | Path) -> Path:
+    return Path(path_like).expanduser().resolve()
+
+
+def _normalize_years(years: Optional[Sequence[int]]) -> Optional[List[int]]:
+    if years is None:
+        return None
+    normalized = sorted({int(year) for year in years})
+    return normalized or None
+
+
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, dict):
+        return {str(k): _json_ready(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(item) for item in value]
+    return value
 
 
 def _write_json(path: Path, payload: Dict[str, Any]) -> None:
@@ -80,6 +112,86 @@ def _date_code_to_text(code: int) -> str:
     return f"{text[:4]}-{text[4:6]}-{text[6:]}"
 
 
+def _find_raw_kline_files(raw_root: Path) -> List[Path]:
+    """Return all raw symbol files under EXTRA_STOCK_A."""
+    files = sorted(raw_root.rglob("data.bz2"))
+    if not files:
+        raise FileNotFoundError(f"No data.bz2 files found under {raw_root}")
+    return files
+
+
+def _load_cn_symbol_frame(file_path: Path) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    """Read one pandas-bz2 K-line file and normalize columns used downstream."""
+    raw = pd.read_pickle(file_path, compression="bz2")
+    missing = sorted(set(REQUIRED_RAW_COLUMNS) - set(raw.columns))
+    if missing:
+        raise ValueError(f"{file_path} is missing required columns: {missing}")
+    df = raw.loc[:, REQUIRED_RAW_COLUMNS].copy()
+    raw_rows = int(len(df))
+    df["kline_time"] = pd.to_datetime(df["kline_time"], errors="coerce")
+    for col in ["open", "high", "low", "close", "volume", "amount"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["kline_time", "open", "high", "low", "close"])
+    dropped_bad_rows = raw_rows - int(len(df))
+    duplicate_rows = int(df.duplicated(subset=["kline_time"], keep="last").sum())
+    df = df.drop_duplicates(subset=["kline_time"], keep="last").sort_values("kline_time").reset_index(drop=True)
+    return df, {"raw_rows": raw_rows, "dropped_bad_rows": dropped_bad_rows, "duplicate_rows": duplicate_rows}
+
+
+def _classify_symbol_days(df: pd.DataFrame) -> Dict[str, Any]:
+    """Classify complete 48-bar trading days for one symbol."""
+    valid_dates: List[str] = []
+    invalid_dates: List[str] = []
+    valid_days_by_year: Dict[int, int] = {}
+    observed_days_by_year: Dict[int, int] = {}
+    bars_by_year: Dict[int, int] = {}
+    bad_price_days = 0
+    if df.empty:
+        return {"valid_dates": valid_dates, "invalid_dates": invalid_dates, "valid_days_by_year": valid_days_by_year, "observed_days_by_year": observed_days_by_year, "bars_by_year": bars_by_year, "bad_price_days": bad_price_days}
+    timestamps = df["kline_time"]
+    dates = timestamps.to_numpy(dtype="datetime64[D]")
+    time_codes = (timestamps.dt.hour.to_numpy(dtype=np.int16) * 100 + timestamps.dt.minute.to_numpy(dtype=np.int16)).astype(np.int32)
+    price_ok_rows = df[["open", "high", "low", "close"]].gt(0.0).to_numpy().all(axis=1)
+    boundaries = np.flatnonzero(dates[1:] != dates[:-1]) + 1
+    starts = np.r_[0, boundaries]
+    ends = np.r_[boundaries, len(df)]
+    for start, end in zip(starts, ends):
+        date_text = str(np.datetime_as_string(dates[start], unit="D"))
+        year = int(pd.Timestamp(date_text).year)
+        observed_days_by_year[year] = observed_days_by_year.get(year, 0) + 1
+        bars_by_year[year] = bars_by_year.get(year, 0) + int(end - start)
+        prices_ok = bool(price_ok_rows[start:end].all())
+        if not prices_ok:
+            bad_price_days += 1
+        is_valid_day = (end - start) == len(CN_5MIN_BAR_TIMES) and prices_ok and np.array_equal(time_codes[start:end], CN_5MIN_BAR_CODES)
+        if is_valid_day:
+            valid_dates.append(date_text)
+            valid_days_by_year[year] = valid_days_by_year.get(year, 0) + 1
+        else:
+            invalid_dates.append(date_text)
+    return {"valid_dates": valid_dates, "invalid_dates": invalid_dates, "valid_days_by_year": valid_days_by_year, "observed_days_by_year": observed_days_by_year, "bars_by_year": bars_by_year, "bad_price_days": bad_price_days}
+
+
+def _raw_symbol_record(file_path: Path) -> Dict[str, Any]:
+    df, clean_stats = _load_cn_symbol_frame(file_path)
+    day_info = _classify_symbol_days(df)
+    valid_dates = day_info["valid_dates"]
+    invalid_dates = day_info["invalid_dates"]
+    stat = file_path.stat()
+    return {"symbol": file_path.parent.name, "file_path": str(file_path.resolve()), "file_size": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns), "first_valid_date": valid_dates[0] if valid_dates else None, "last_valid_date": valid_dates[-1] if valid_dates else None, "n_valid_days": int(len(valid_dates)), "n_invalid_days": int(len(invalid_dates)), "valid_dates": valid_dates, "invalid_dates": invalid_dates, "valid_days_by_year": day_info["valid_days_by_year"], "observed_days_by_year": day_info["observed_days_by_year"], "bars_by_year": day_info["bars_by_year"], "bad_price_days": int(day_info["bad_price_days"]), **clean_stats}
+
+
+def scan_raw_kline_universe(raw_root: str | Path = DEFAULT_RAW_ROOT, max_files: Optional[int] = None) -> pd.DataFrame:
+    """Scan raw K-line files. This is intentionally owned by preprocessing only."""
+    raw_root = _ensure_path(raw_root)
+    files = _find_raw_kline_files(raw_root)
+    if max_files is not None:
+        files = files[: int(max_files)]
+    rows = [_raw_symbol_record(file_path) for file_path in files]
+    universe = pd.DataFrame(rows).sort_values("symbol").reset_index(drop=True)
+    return _summarize_symbol_universe(universe, raw_root)
+
+
 def _symbol_npz_path(proc_root: Path, symbol: str) -> Path:
     """逐股票收益数组保存位置。"""
     return proc_root / "symbol_returns" / f"{symbol}.npz"
@@ -93,7 +205,7 @@ def _symbol_meta_path(proc_root: Path, symbol: str) -> Path:
 def _panel_paths(proc_root: Path, sample_mode: str, panel_name: str) -> Tuple[Path, Path]:
     """面板数组和面板元数据保存位置。"""
     panel_dir = proc_root / "panels" / sample_mode
-    return panel_dir / f"{panel_name}.npz", panel_dir / f"{panel_name}.json"
+    return panel_dir / panel_name, panel_dir / f"{panel_name}.json"
 
 
 def load_backward_factor_matrix(
@@ -391,6 +503,60 @@ def _summarize_processed_universe(universe: pd.DataFrame, proc_root: Path) -> Tu
     return universe, summary
 
 
+def _summarize_symbol_universe(universe: pd.DataFrame, data_root: Path) -> pd.DataFrame:
+    """Attach coverage summary to a raw scan table."""
+    summarized, summary = _summarize_processed_universe(universe, data_root)
+    summary["source"] = "raw_kline"
+    summary["adjustment"] = "none"
+    summarized.attrs["summary"] = summary
+    return summarized
+
+
+def _selected_calendar_dates(summary: Dict[str, Any], years: Optional[Sequence[int]]) -> List[str]:
+    years = _normalize_years(years)
+    if years is None:
+        return list(summary["global_dates"])
+    by_year = {int(k): list(v) for k, v in summary["global_dates_by_year"].items()}
+    selected: List[str] = []
+    for year in years:
+        selected.extend(by_year[int(year)])
+    return selected
+
+
+def _select_sample_rows(
+    universe: pd.DataFrame,
+    sample_mode: str,
+    years: Optional[Sequence[int]] = None,
+    coverage_threshold: float = 0.99,
+    max_stocks: Optional[int] = None,
+) -> pd.DataFrame:
+    """Select strict-balanced or 99%-coverage symbols from a summarized universe."""
+    if "summary" not in universe.attrs:
+        raise ValueError("universe.attrs['summary'] is required before sample selection")
+    summary = universe.attrs["summary"]
+    years = _normalize_years(years)
+    if sample_mode not in {STRICT_BALANCED_SAMPLE, NEAR_BALANCED_99_SAMPLE}:
+        raise ValueError(f"Unknown sample_mode: {sample_mode}")
+
+    if years is None:
+        mask = universe["is_strict_balanced"] if sample_mode == STRICT_BALANCED_SAMPLE else universe["is_near_balanced_99"]
+    else:
+        days_by_year = {int(k): int(v) for k, v in summary["calendar_days_by_year"].items()}
+        total_days = int(sum(days_by_year[int(year)] for year in years))
+        valid_sum = sum(universe[f"valid_days_{int(year)}"] for year in years)
+        observed_sum = sum(universe[f"observed_days_{int(year)}"] for year in years)
+        if sample_mode == STRICT_BALANCED_SAMPLE:
+            mask = (valid_sum == total_days) & (observed_sum == total_days)
+        else:
+            mask = (valid_sum / float(total_days) >= coverage_threshold) & (observed_sum == valid_sum)
+
+    selected = universe.loc[mask].sort_values("symbol").copy()
+    if max_stocks is not None:
+        selected = selected.head(int(max_stocks)).copy()
+    selected.attrs["summary"] = summary
+    return selected
+
+
 def _save_symbol_outputs(proc_root: Path, symbol: str, meta: Dict[str, Any], arrays: Dict[str, np.ndarray]) -> None:
     """保存单只股票的复权收益数组和元数据。"""
     npz_path = _symbol_npz_path(proc_root, symbol)
@@ -456,9 +622,18 @@ def _write_panel(
         "contains_nan": bool(np.isnan(R_intra).any()),
     }
 
-    npz_path, meta_path = _panel_paths(proc_root, sample_mode, panel_name)
-    npz_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(npz_path, R_intra=R_intra, R_night=R_night, R_daily=R_daily, day_ids=day_ids)
+    panel_array_dir, meta_path = _panel_paths(proc_root, sample_mode, panel_name)
+    panel_array_dir.mkdir(parents=True, exist_ok=True)
+    array_files = {
+        "R_intra": str((panel_array_dir / "R_intra.npy").relative_to(proc_root)),
+        "R_night": str((panel_array_dir / "R_night.npy").relative_to(proc_root)),
+        "R_daily": str((panel_array_dir / "R_daily.npy").relative_to(proc_root)),
+        "day_ids": str((panel_array_dir / "day_ids.npy").relative_to(proc_root)),
+    }
+    np.save(panel_array_dir / "R_intra.npy", R_intra, allow_pickle=False)
+    np.save(panel_array_dir / "R_night.npy", R_night, allow_pickle=False)
+    np.save(panel_array_dir / "R_daily.npy", R_daily, allow_pickle=False)
+    np.save(panel_array_dir / "day_ids.npy", day_ids, allow_pickle=False)
     panel_meta = {
         "version": PREPROCESS_VERSION,
         "sample_mode": sample_mode,
@@ -468,7 +643,8 @@ def _write_panel(
         "tickers": tickers,
         "bar_times": list(CN_5MIN_BAR_TIMES),
         "sample_report": sample_report,
-        "npz_path": str(npz_path.relative_to(proc_root)),
+        "storage_format": "npy_dir",
+        "array_files": array_files,
     }
     _write_json(meta_path, panel_meta)
     return panel_meta
@@ -526,7 +702,6 @@ def preprocess_cn_data(
     max_stocks: Optional[int] = None,
     refresh: bool = False,
     return_mode: str = "open_close",
-    save_adjusted_bars: bool = False,
 ) -> Dict[str, Any]:
     """执行完整预处理流程，并返回 manifest。"""
     raw_root = _ensure_path(raw_root)
@@ -534,10 +709,18 @@ def preprocess_cn_data(
     proc_root = _ensure_path(proc_root)
     years = _normalize_years(years)
     manifest_path = proc_root / "manifest.json"
+    raw_files = _find_raw_kline_files(raw_root)
+    raw_symbol_count = len(raw_files)
+    raw_file_state = {
+        "count": raw_symbol_count,
+        "total_size": int(sum(file_path.stat().st_size for file_path in raw_files)),
+        "max_mtime_ns": int(max(file_path.stat().st_mtime_ns for file_path in raw_files)),
+    }
 
     input_signature = {
         "version": PREPROCESS_VERSION,
         "raw_root": str(raw_root),
+        "raw_files": raw_file_state,
         "factor": _file_signature(factor_path),
         "years": years,
         "max_stocks": max_stocks,
@@ -552,9 +735,8 @@ def preprocess_cn_data(
             return manifest
 
     proc_root.mkdir(parents=True, exist_ok=True)
+    factor_dates = _load_factor_dates(factor_path, years)
     if max_stocks is not None:
-        # Smoke run ??????????????? 2891 ??????
-        factor_dates = _load_factor_dates(factor_path, years)
         target_dates = factor_dates if years is not None else _infer_smoke_target_dates(raw_root, factor_path, factor_dates)
         selected_universe = _select_smoke_symbols_fast(
             raw_root=raw_root,
@@ -563,16 +745,14 @@ def preprocess_cn_data(
             max_stocks=max_stocks,
         )
     else:
-        # ???????????????????????????????
-        raw_universe = scan_cn_bz2_universe(
-            data_root=raw_root,
-            use_cache=True,
-            refresh_cache=False,
-            cache_root=DEFAULT_PREPROCESS_CACHE_ROOT,
-        )
-        selected_universe = _select_preprocess_symbols(raw_universe, years=years, max_stocks=max_stocks)
-        raw_summary = raw_universe.attrs["summary"]
-        target_dates = _selected_calendar_dates(raw_summary, years)
+        factor_header = set(pd.read_csv(factor_path, nrows=0).columns.tolist())
+        rows_for_all_symbols = [
+            {"symbol": file_path.parent.name, "file_path": str(file_path.resolve())}
+            for file_path in raw_files
+            if file_path.parent.name in factor_header
+        ]
+        selected_universe = pd.DataFrame(rows_for_all_symbols).sort_values("symbol").reset_index(drop=True)
+        target_dates = factor_dates
     if selected_universe.empty:
         raise ValueError("?????????")
 
@@ -610,6 +790,8 @@ def preprocess_cn_data(
 
     processed_universe = pd.DataFrame(rows)
     processed_universe, processed_summary = _summarize_processed_universe(processed_universe, proc_root)
+    processed_summary["raw_symbol_count"] = int(raw_symbol_count)
+    processed_summary["processed_symbol_count"] = int(len(processed_universe))
     _save_metadata_tables(proc_root, processed_universe, processed_summary)
 
     panel_outputs: List[Dict[str, Any]] = []
@@ -641,6 +823,10 @@ def preprocess_cn_data(
         "return_mode": return_mode,
         "years": years,
         "max_stocks": max_stocks,
+        "raw_symbol_count": int(raw_symbol_count),
+        "processed_symbol_count": int(len(processed_universe)),
+        "strict_balanced_symbols": int(processed_summary["strict_balanced_symbols"]),
+        "near_balanced_99_symbols": int(processed_summary["near_balanced_99_symbols"]),
         "summary": processed_summary,
         "panel_outputs": panel_outputs,
         "metadata_files": {
@@ -665,7 +851,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--years", nargs="+", type=int, help="只预处理指定年份")
     parser.add_argument("--max-stocks", type=int, help="smoke run 用：限制每类样本股票数量")
     parser.add_argument("--refresh", action="store_true", help="忽略已有 manifest，强制重建")
-    parser.add_argument("--save-adjusted-bars", action="store_true", help="预留开关：默认不保存全量复权 bar，避免膨胀磁盘")
     return parser
 
 
@@ -679,7 +864,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_stocks=args.max_stocks,
         refresh=args.refresh,
         return_mode=args.return_mode,
-        save_adjusted_bars=args.save_adjusted_bars,
     )
     return 0
 

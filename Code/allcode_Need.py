@@ -1,35 +1,17 @@
 """
-================================================================================
 Pelger (2020) "Understanding Systematic Risk: A High-Frequency Approach"
-中国 A 股 5 分钟数据复现脚本
---------------------------------------------------------------------------------
-本文件把论文中的通用数学框架改造成了可以直接对接本地
-`EXTRA_STOCK_A/<symbol>/data.bz2` 数据的一站式脚本。
+China A-share 5-minute replication core.
 
-当前默认口径:
-1. 读取本地中国 A 股 5 分钟 K 线 `.bz2` 数据
-2. 扫描样本覆盖度, 识别严格平衡样本和 99% 覆盖样本
-3. 构造 `HFPanel`
-4. 使用 TOD 阈值法拆分连续/跳跃收益
-5. 使用 PCA + 扰动特征值比率提取系统性风险因子
-6. 计算日内/隔夜/日度 Sharpe
-7. 输出滚动因子空间稳定性结果
-8. 对年度 99% 覆盖样本做 pairwise-covariance 稳健性比较
-
-只依赖本地已有 K 线数据即可完成论文主干复现。行业因子、FFC、测试资产
-组合等扩展数据接口已经预留，但不会自动下载任何外部数据。
-
-依赖:
-    numpy, pandas, scipy
-可选绘图:
-    matplotlib
-================================================================================
+This file does not read raw K-line `data.bz2` files. Raw data cleaning,
+backward adjustment, and panel construction are owned by `preprocess_cn_data.py`.
+The replication core consumes processed panels from `Data/proc_Data`, runs the
+paper's jump decomposition, PCA factor extraction, Sharpe calculations, rolling
+stability analysis, and exports results to `Result/`.
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,17 +21,6 @@ import numpy as np
 import pandas as pd
 from scipy.linalg import eigh
 
-
-REQUIRED_BZ2_COLUMNS = [
-    "code",
-    "kline_time",
-    "open",
-    "high",
-    "low",
-    "close",
-    "volume",
-    "amount",
-]
 
 CN_5MIN_BAR_TIMES = [
     "09:30:00", "09:35:00", "09:40:00", "09:45:00", "09:50:00", "09:55:00",
@@ -70,14 +41,8 @@ STRICT_BALANCED_SAMPLE = "strict_balanced"
 NEAR_BALANCED_99_SAMPLE = "near_balanced_99"
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_DATA_ROOT = REPO_ROOT / "Data" / "kline_Data" / "EXTRA_STOCK_A"
 DEFAULT_PROC_ROOT = REPO_ROOT / "Data" / "proc_Data" / "pelger_cn_adjusted"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "Result" / "pelger_cn_adjusted"
-DEFAULT_CACHE_ROOT = REPO_ROOT / ".hf_cache" / "pelger_cn"
-SCAN_CACHE_VERSION = "v2"
-RETURNS_CACHE_VERSION = "v1"
-PANEL_CACHE_VERSION = "v2"
-SUSPICIOUS_OVERNIGHT_THRESHOLDS = (0.12, 0.20)
 
 
 def _safe_inv(mat: np.ndarray, eps: float = 1e-10) -> np.ndarray:
@@ -135,749 +100,6 @@ def _write_json(path: Path, payload: Dict[str, Any]) -> None:
 
 def _load_json(path: Path) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
-
-
-def _cache_root(cache_root: Optional[str | Path]) -> Path:
-    return _ensure_path(cache_root or DEFAULT_CACHE_ROOT)
-
-
-def _cache_subdir(cache_root: Optional[str | Path], *parts: str) -> Path:
-    root = _cache_root(cache_root)
-    path = root.joinpath(*parts)
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _safe_symbol_name(symbol: str) -> str:
-    return symbol.replace("/", "_").replace("\\", "_").replace(":", "_")
-
-
-def _symbol_file_signature(file_path: Path) -> Dict[str, Any]:
-    stat = file_path.stat()
-    return {
-        "path": str(file_path.resolve()),
-        "size": int(stat.st_size),
-        "mtime_ns": int(stat.st_mtime_ns),
-    }
-
-
-def _signature_hash(payload: Dict[str, Any]) -> str:
-    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
-    return hashlib.sha1(encoded).hexdigest()
-
-
-def _returns_cache_key(file_path: Path, return_mode: str) -> str:
-    payload = {
-        "version": RETURNS_CACHE_VERSION,
-        "return_mode": return_mode,
-        **_symbol_file_signature(file_path),
-    }
-    return _signature_hash(payload)
-
-
-def _scan_cache_paths(cache_root: Optional[str | Path]) -> Tuple[Path, Path, Path, Path]:
-    root = _cache_subdir(cache_root, "scan")
-    return (
-        root / "manifest.json",
-        root / "summary.json",
-        root / "universe.pkl",
-        root / "universe.csv",
-    )
-
-
-def _returns_cache_paths(
-    cache_root: Optional[str | Path],
-    file_path: Path,
-    return_mode: str,
-) -> Tuple[Path, Path]:
-    root = _cache_subdir(cache_root, "returns", return_mode)
-    symbol = _safe_symbol_name(file_path.parent.name)
-    key = _returns_cache_key(file_path, return_mode)
-    base = root / f"{symbol}_{key}"
-    return base.with_suffix(".json"), base.with_suffix(".npz")
-
-
-def _panel_cache_dir(cache_root: Optional[str | Path]) -> Path:
-    return _cache_subdir(cache_root, "panels")
-
-
-def _selected_sample_signature_hash(selected: pd.DataFrame) -> str:
-    records: List[Dict[str, Any]] = []
-    if selected.empty:
-        return _signature_hash({"symbols": records})
-
-    for row in selected.itertuples(index=False):
-        signature = getattr(row, "signature", None)
-        if not isinstance(signature, dict):
-            signature = _symbol_file_signature(Path(row.file_path))
-        records.append({
-            "symbol": str(row.symbol),
-            "signature": signature,
-        })
-    return _signature_hash({"symbols": records})
-
-
-def _panel_cache_key(
-    data_root: Path,
-    summary: Dict[str, Any],
-    sample_mode: str,
-    return_mode: str,
-    years: Optional[Sequence[int]],
-    max_stocks: Optional[int],
-    sample_signature_hash: str,
-) -> str:
-    payload = {
-        "version": PANEL_CACHE_VERSION,
-        "data_root": str(data_root),
-        "sample_mode": sample_mode,
-        "return_mode": return_mode,
-        "years": _normalize_years(years),
-        "max_stocks": None if max_stocks is None else int(max_stocks),
-        "sample_signature_hash": sample_signature_hash,
-        "global_start": summary["global_start"],
-        "global_end": summary["global_end"],
-        "total_symbols": summary["total_symbols"],
-        "strict_balanced_symbols": summary["strict_balanced_symbols"],
-        "near_balanced_99_symbols": summary["near_balanced_99_symbols"],
-    }
-    return _signature_hash(payload)
-
-
-def _panel_cache_paths(
-    cache_root: Optional[str | Path],
-    cache_key: str,
-) -> Tuple[Path, Path]:
-    root = _panel_cache_dir(cache_root)
-    return root / f"{cache_key}.json", root / f"{cache_key}.npz"
-
-
-def _date_codes_from_dates(dates: Sequence[str]) -> np.ndarray:
-    return np.array([int(str(date).replace("-", "")) for date in dates], dtype=np.int32)
-
-
-def _date_code_to_text(code: int) -> str:
-    code_text = f"{int(code):08d}"
-    return f"{code_text[:4]}-{code_text[4:6]}-{code_text[6:]}"
-
-
-def _load_cn_symbol_frame(file_path: Path) -> Tuple[pd.DataFrame, Dict[str, int]]:
-    """读取单只股票 bz2 数据, 返回清洗后的 DataFrame 和清洗统计."""
-    raw = pd.read_pickle(file_path, compression="bz2")
-    missing = sorted(set(REQUIRED_BZ2_COLUMNS) - set(raw.columns))
-    if missing:
-        raise ValueError(f"{file_path} 缺少字段: {missing}")
-
-    df = raw.loc[:, REQUIRED_BZ2_COLUMNS].copy()
-    raw_rows = int(len(df))
-    df["kline_time"] = pd.to_datetime(df["kline_time"], errors="coerce")
-    for col in ["open", "high", "low", "close", "volume", "amount"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    bad_timestamp_rows = int(df["kline_time"].isna().sum())
-    bad_numeric_rows = int(df[["open", "high", "low", "close"]].isna().any(axis=1).sum())
-
-    df = df.dropna(subset=["kline_time", "open", "high", "low", "close"]).copy()
-    df.sort_values("kline_time", inplace=True)
-    duplicate_rows = int(df.duplicated(subset=["kline_time"], keep="last").sum())
-    df = df.drop_duplicates(subset=["kline_time"], keep="last").reset_index(drop=True)
-
-    return df, {
-        "raw_rows": raw_rows,
-        "bad_timestamp_rows": bad_timestamp_rows,
-        "bad_numeric_rows": bad_numeric_rows,
-        "duplicate_rows": duplicate_rows,
-    }
-
-
-def _symbol_scan_record(file_path: Path) -> Dict[str, Any]:
-    """读取单只股票并生成扫描缓存记录."""
-    symbol = file_path.parent.name
-    df, clean_stats = _load_cn_symbol_frame(file_path)
-    day_info = _classify_symbol_days(df)
-    valid_dates = day_info["valid_dates"]
-    invalid_dates = day_info["invalid_dates"]
-    returns_meta, _ = _build_symbol_returns_cache_payload(
-        file_path,
-        return_mode="open_close",
-        df=df,
-    )
-
-    row: Dict[str, Any] = {
-        "symbol": symbol,
-        "file_path": str(file_path.resolve()),
-        "raw_rows": clean_stats["raw_rows"],
-        "n_rows": int(len(df)),
-        "bad_timestamp_rows": clean_stats["bad_timestamp_rows"],
-        "bad_numeric_rows": clean_stats["bad_numeric_rows"],
-        "duplicate_rows": clean_stats["duplicate_rows"],
-        "n_observed_days": int(sum(day_info["observed_days_by_year"].values())),
-        "n_valid_days": int(len(valid_dates)),
-        "n_invalid_days": int(len(invalid_dates)),
-        "bad_price_days": int(day_info["bad_price_days"]),
-        "first_timestamp": df["kline_time"].min().isoformat() if not df.empty else None,
-        "last_timestamp": df["kline_time"].max().isoformat() if not df.empty else None,
-        "first_valid_date": valid_dates[0] if valid_dates else None,
-        "last_valid_date": valid_dates[-1] if valid_dates else None,
-        "expected_bars_per_day": len(CN_5MIN_BAR_TIMES),
-        "max_abs_overnight": float(returns_meta["max_abs_overnight"]),
-        "suspicious_overnight_count_012": int(returns_meta["suspicious_overnight_count_012"]),
-        "suspicious_overnight_count_020": int(returns_meta["suspicious_overnight_count_020"]),
-        "valid_dates": valid_dates,
-        "invalid_dates": invalid_dates,
-        "valid_days_by_year": {str(k): int(v) for k, v in day_info["valid_days_by_year"].items()},
-        "observed_days_by_year": {str(k): int(v) for k, v in day_info["observed_days_by_year"].items()},
-        "bars_by_year": {str(k): int(v) for k, v in day_info["bars_by_year"].items()},
-        "signature": _symbol_file_signature(file_path),
-    }
-    return row
-
-
-def _classify_symbol_days(
-    df: pd.DataFrame,
-    expected_times: Sequence[str] = CN_5MIN_BAR_TIMES,
-) -> Dict[str, Any]:
-    """
-    判断每个交易日是否是完整的 A 股 5 分钟网格.
-    完整日要求:
-    - 恰好 48 根 bar
-    - 时间顺序与 `CN_5MIN_BAR_TIMES` 完全一致
-    - OHLC 全部严格大于 0
-    """
-    if df.empty:
-        return {
-            "valid_dates": [],
-            "invalid_dates": [],
-            "valid_days_by_year": {},
-            "observed_days_by_year": {},
-            "bars_by_year": {},
-            "bad_price_days": 0,
-        }
-
-    valid_dates: List[str] = []
-    invalid_dates: List[str] = []
-    valid_days_by_year: Dict[int, int] = {}
-    observed_days_by_year: Dict[int, int] = {}
-    bars_by_year: Dict[int, int] = {}
-    bad_price_days = 0
-
-    ts = df["kline_time"]
-    dates = ts.to_numpy(dtype="datetime64[D]")
-    years = ts.dt.year.to_numpy(dtype=np.int32)
-    time_codes = (ts.dt.hour.to_numpy(dtype=np.int16) * 100 + ts.dt.minute.to_numpy(dtype=np.int16)).astype(np.int32)
-    price_ok_rows = df[["open", "high", "low", "close"]].gt(0.0).to_numpy().all(axis=1)
-
-    boundaries = np.flatnonzero(dates[1:] != dates[:-1]) + 1
-    starts = np.r_[0, boundaries]
-    ends = np.r_[boundaries, len(df)]
-    expected_codes = CN_5MIN_BAR_CODES if list(expected_times) == CN_5MIN_BAR_TIMES else np.asarray(
-        [int(time_text[:2]) * 100 + int(time_text[3:5]) for time_text in expected_times],
-        dtype=np.int32,
-    )
-
-    for start, end in zip(starts, ends):
-        year = int(years[start])
-        observed_days_by_year[year] = observed_days_by_year.get(year, 0) + 1
-        bars_by_year[year] = bars_by_year.get(year, 0) + int(end - start)
-
-        prices_ok = bool(price_ok_rows[start:end].all())
-        if not prices_ok:
-            bad_price_days += 1
-
-        is_valid_day = (
-            (end - start) == len(expected_times)
-            and prices_ok
-            and np.array_equal(time_codes[start:end], expected_codes)
-        )
-
-        date_text = np.datetime_as_string(dates[start], unit="D")
-        if is_valid_day:
-            valid_dates.append(date_text)
-            valid_days_by_year[year] = valid_days_by_year.get(year, 0) + 1
-        else:
-            invalid_dates.append(date_text)
-
-    return {
-        "valid_dates": valid_dates,
-        "invalid_dates": invalid_dates,
-        "valid_days_by_year": valid_days_by_year,
-        "observed_days_by_year": observed_days_by_year,
-        "bars_by_year": bars_by_year,
-        "bad_price_days": bad_price_days,
-    }
-
-
-def _find_bz2_files(data_root: Path) -> List[Path]:
-    files = sorted(data_root.rglob("data.bz2"))
-    if not files:
-        raise FileNotFoundError(f"在 {data_root} 下没有找到 data.bz2 文件")
-    return files
-
-
-def scan_cn_bz2_universe(
-    data_root: str | Path = DEFAULT_DATA_ROOT,
-    use_cache: bool = True,
-    refresh_cache: bool = False,
-    cache_root: Optional[str | Path] = None,
-) -> pd.DataFrame:
-    """
-    扫描全部 `.bz2` 数据并生成样本元数据表.
-
-    返回的 DataFrame 按 `symbol` 排序, 并在 `attrs["summary"]` 中附带全样本摘要:
-    - 全局交易日历
-    - 每年交易日数
-    - 严格平衡样本数量
-    - 99% 覆盖样本数量
-    """
-    data_root = _ensure_path(data_root)
-    files = _find_bz2_files(data_root)
-    file_map = {file_path.parent.name: file_path for file_path in files}
-
-    manifest_path, summary_path, universe_pkl_path, universe_csv_path = _scan_cache_paths(cache_root)
-    manifest: Dict[str, Any] = {"version": SCAN_CACHE_VERSION, "symbols": {}}
-    cached_universe: Optional[pd.DataFrame] = None
-    cached_summary: Optional[Dict[str, Any]] = None
-
-    if (
-        use_cache
-        and not refresh_cache
-        and manifest_path.exists()
-        and summary_path.exists()
-        and universe_pkl_path.exists()
-    ):
-        try:
-            manifest = _load_json(manifest_path)
-            if manifest.get("version") == SCAN_CACHE_VERSION:
-                cached_summary = _load_json(summary_path)
-                cached_universe = pd.read_pickle(universe_pkl_path)
-        except Exception:
-            manifest = {"version": SCAN_CACHE_VERSION, "symbols": {}}
-            cached_summary = None
-            cached_universe = None
-
-    current_signatures = {symbol: _symbol_file_signature(file_path) for symbol, file_path in file_map.items()}
-    cached_signatures = manifest.get("symbols", {})
-
-    changed_symbols = sorted(
-        symbol
-        for symbol, signature in current_signatures.items()
-        if cached_signatures.get(symbol) != signature
-    )
-    stale_symbols = sorted(set(cached_signatures) - set(current_signatures))
-
-    if (
-        use_cache
-        and not refresh_cache
-        and cached_universe is not None
-        and cached_summary is not None
-        and not changed_symbols
-        and not stale_symbols
-    ):
-        cached_universe = cached_universe.copy()
-        cached_universe.attrs["summary"] = cached_summary
-        return cached_universe
-
-    base_rows_df = cached_universe.copy() if cached_universe is not None else pd.DataFrame()
-    if not base_rows_df.empty:
-        base_rows_df = base_rows_df.loc[~base_rows_df["symbol"].isin(set(changed_symbols) | set(stale_symbols))].copy()
-
-    refreshed_rows = []
-    for symbol in changed_symbols:
-        refreshed_rows.append(_symbol_scan_record(file_map[symbol]))
-
-    refreshed_df = pd.DataFrame(refreshed_rows)
-    if base_rows_df.empty:
-        universe = refreshed_df
-    elif refreshed_df.empty:
-        universe = base_rows_df
-    else:
-        universe = pd.concat([base_rows_df, refreshed_df], ignore_index=True)
-    universe = universe.sort_values("symbol").reset_index(drop=True)
-
-    manifest = {
-        "version": SCAN_CACHE_VERSION,
-        "data_root": str(data_root),
-        "symbols": current_signatures,
-    }
-    rows = universe.to_dict("records")
-    global_valid_dates: set[str] = set()
-    year_set: set[int] = set()
-    for row in rows:
-        global_valid_dates.update(str(date) for date in row["valid_dates"])
-        year_set.update(int(year) for year in row["observed_days_by_year"])
-        year_set.update(int(year) for year in row["valid_days_by_year"])
-    years_all = sorted(year_set)
-    for year in years_all:
-        observed_values = []
-        valid_values = []
-        bars_values = []
-        for row in rows:
-            observed_values.append(int(row["observed_days_by_year"].get(str(year), 0)))
-            valid_values.append(int(row["valid_days_by_year"].get(str(year), 0)))
-            bars_values.append(int(row["bars_by_year"].get(str(year), 0)))
-        universe[f"observed_days_{year}"] = observed_values
-        universe[f"valid_days_{year}"] = valid_values
-        universe[f"bars_{year}"] = bars_values
-        for prefix in ("observed_days", "valid_days", "bars"):
-            col = f"{prefix}_{year}"
-            universe[col] = universe[col].fillna(0).astype(int)
-
-    global_dates = [str(date) for date in sorted(global_valid_dates)]
-    if not global_dates:
-        raise RuntimeError("未能从数据中识别出任何完整交易日")
-
-    global_start = global_dates[0]
-    global_end = global_dates[-1]
-    calendar_days = len(global_dates)
-    calendar_days_by_year = {
-        int(year): int(count)
-        for year, count in pd.Series(pd.to_datetime(global_dates).year).value_counts(sort=False).sort_index().items()
-    }
-
-    universe["missing_days"] = calendar_days - universe["n_valid_days"]
-    universe["coverage_ratio"] = universe["n_valid_days"] / float(calendar_days)
-    universe["is_strict_balanced"] = (
-        (universe["n_valid_days"] == calendar_days)
-        & (universe["n_invalid_days"] == 0)
-        & (universe["first_valid_date"] == global_start)
-        & (universe["last_valid_date"] == global_end)
-    )
-    universe["is_near_balanced_99"] = (
-        (universe["coverage_ratio"] >= 0.99)
-        & (universe["n_invalid_days"] == 0)
-    )
-
-    global_dates_by_year = {
-        int(year): sorted(date for date in global_dates if pd.Timestamp(date).year == int(year))
-        for year in calendar_days_by_year
-    }
-
-    for year, year_days in calendar_days_by_year.items():
-        valid_col = f"valid_days_{year}"
-        observed_col = f"observed_days_{year}"
-        universe[f"coverage_{year}"] = universe[valid_col] / float(year_days)
-        universe[f"is_strict_{year}"] = (
-            (universe[valid_col] == year_days)
-            & (universe[observed_col] == year_days)
-        )
-        universe[f"is_near_99_{year}"] = (
-            (universe[f"coverage_{year}"] >= 0.99)
-            & (universe[observed_col] == universe[valid_col])
-        )
-
-    summary = {
-        "data_root": str(data_root),
-        "total_symbols": int(len(universe)),
-        "global_start": global_start,
-        "global_end": global_end,
-        "global_calendar_days": calendar_days,
-        "bars_per_day": len(CN_5MIN_BAR_TIMES),
-        "bar_times": list(CN_5MIN_BAR_TIMES),
-        "calendar_days_by_year": calendar_days_by_year,
-        "global_dates": global_dates,
-        "global_dates_by_year": global_dates_by_year,
-        "strict_balanced_symbols": int(universe["is_strict_balanced"].sum()),
-        "near_balanced_99_symbols": int(universe["is_near_balanced_99"].sum()),
-    }
-    universe.attrs["summary"] = summary
-
-    if use_cache:
-        _write_json(manifest_path, manifest)
-        _write_json(summary_path, summary)
-        universe_pkl_path.parent.mkdir(parents=True, exist_ok=True)
-        universe.to_pickle(universe_pkl_path)
-        csv_ready = universe.drop(columns=[col for col in ["valid_dates", "invalid_dates", "valid_days_by_year", "observed_days_by_year", "bars_by_year", "signature"] if col in universe.columns])
-        universe_csv_path.parent.mkdir(parents=True, exist_ok=True)
-        csv_ready.to_csv(universe_csv_path, index=False, encoding="utf-8-sig")
-
-    return universe
-
-
-def _get_universe_summary(
-    universe: Optional[pd.DataFrame],
-    data_root: str | Path,
-) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    if universe is None or "summary" not in universe.attrs:
-        universe = scan_cn_bz2_universe(data_root=data_root)
-    return universe, universe.attrs["summary"]
-
-
-def summarize_cn_universe(universe: pd.DataFrame) -> Dict[str, Any]:
-    universe, summary = _get_universe_summary(universe, data_root=DEFAULT_DATA_ROOT)
-    stats = dict(summary)
-    stats["coverage_ratio_quantiles"] = {
-        "p0": float(universe["coverage_ratio"].min()),
-        "p25": float(universe["coverage_ratio"].quantile(0.25)),
-        "p50": float(universe["coverage_ratio"].quantile(0.50)),
-        "p75": float(universe["coverage_ratio"].quantile(0.75)),
-        "p95": float(universe["coverage_ratio"].quantile(0.95)),
-        "p100": float(universe["coverage_ratio"].max()),
-    }
-    stats["invalid_day_symbols"] = int((universe["n_invalid_days"] > 0).sum())
-    if "suspicious_overnight_count_012" in universe.columns:
-        stats["corp_action_risk_summary"] = {
-            "symbols_with_suspicious_overnight_012": int((universe["suspicious_overnight_count_012"] > 0).sum()),
-            "symbols_with_suspicious_overnight_020": int((universe["suspicious_overnight_count_020"] > 0).sum()),
-            "max_abs_overnight_overall": float(universe["max_abs_overnight"].max()),
-        }
-    return stats
-
-
-def _years_total_days(summary: Dict[str, Any], years: Optional[Sequence[int]]) -> int:
-    years = _normalize_years(years)
-    if years is None:
-        return int(summary["global_calendar_days"])
-    calendar_days_by_year = {int(k): int(v) for k, v in summary["calendar_days_by_year"].items()}
-    return int(sum(calendar_days_by_year[year] for year in years))
-
-
-def _selected_calendar_dates(summary: Dict[str, Any], years: Optional[Sequence[int]]) -> List[str]:
-    years = _normalize_years(years)
-    if years is None:
-        return list(summary["global_dates"])
-    global_dates_by_year = {int(k): list(v) for k, v in summary["global_dates_by_year"].items()}
-    selected: List[str] = []
-    for year in years:
-        selected.extend(global_dates_by_year[year])
-    return selected
-
-
-def _select_sample_rows(
-    universe: pd.DataFrame,
-    sample_mode: str,
-    years: Optional[Sequence[int]] = None,
-    coverage_threshold: float = 0.99,
-    max_stocks: Optional[int] = None,
-) -> pd.DataFrame:
-    universe, summary = _get_universe_summary(universe, data_root=DEFAULT_DATA_ROOT)
-    years = _normalize_years(years)
-
-    if sample_mode not in {STRICT_BALANCED_SAMPLE, NEAR_BALANCED_99_SAMPLE}:
-        raise ValueError(f"未知 sample_mode: {sample_mode}")
-
-    if years is None:
-        if sample_mode == STRICT_BALANCED_SAMPLE:
-            mask = universe["is_strict_balanced"]
-        else:
-            mask = universe["is_near_balanced_99"]
-    else:
-        total_days = _years_total_days(summary, years)
-        valid_sum = sum(universe[f"valid_days_{year}"] for year in years)
-        observed_sum = sum(universe[f"observed_days_{year}"] for year in years)
-        coverage = valid_sum / float(total_days)
-
-        if sample_mode == STRICT_BALANCED_SAMPLE:
-            mask = (valid_sum == total_days) & (observed_sum == total_days)
-        else:
-            mask = (coverage >= coverage_threshold) & (observed_sum == valid_sum)
-
-    selected = universe.loc[mask].sort_values("symbol").copy()
-    if max_stocks is not None:
-        selected = selected.head(int(max_stocks)).copy()
-
-    selected.attrs["summary"] = summary
-    selected.attrs["sample_mode"] = sample_mode
-    selected.attrs["years"] = years
-    return selected
-
-
-def _build_daily_return_map(
-    df: pd.DataFrame,
-    return_mode: str = "open_close",
-) -> Dict[str, Dict[str, Any]]:
-    """
-    对单只股票构造完整交易日的日内/隔夜收益映射.
-
-    返回值:
-        {
-            "YYYY-MM-DD": {
-                "intraday": np.ndarray shape (48,),
-                "overnight": float,
-                "day_open": float,
-                "day_close": float,
-                "daily": float,
-            },
-            ...
-        }
-    """
-    if return_mode not in {"open_close", "close_close"}:
-        raise ValueError(f"未知 return_mode: {return_mode}")
-
-    temp = df.copy()
-    temp["date"] = temp["kline_time"].dt.normalize()
-    temp["time"] = temp["kline_time"].dt.strftime("%H:%M:%S")
-
-    daily_map: Dict[str, Dict[str, Any]] = {}
-    previous_close: Optional[float] = None
-
-    for date, day in temp.groupby("date", sort=True):
-        times = day["time"].tolist()
-        if len(day) != len(CN_5MIN_BAR_TIMES) or times != CN_5MIN_BAR_TIMES:
-            continue
-        if not bool(day[["open", "high", "low", "close"]].gt(0.0).all().all()):
-            continue
-
-        open_px = day["open"].to_numpy(dtype=float)
-        close_px = day["close"].to_numpy(dtype=float)
-
-        if return_mode == "open_close":
-            intraday = np.log(close_px / open_px)
-        else:
-            intraday = np.empty(len(close_px), dtype=float)
-            intraday[0] = np.log(close_px[0] / open_px[0])
-            intraday[1:] = np.log(close_px[1:] / close_px[:-1])
-
-        day_open = float(open_px[0])
-        day_close = float(close_px[-1])
-        overnight = 0.0 if previous_close is None else float(np.log(day_open / previous_close))
-        daily_map[date.strftime("%Y-%m-%d")] = {
-            "intraday": intraday,
-            "overnight": overnight,
-            "day_open": day_open,
-            "day_close": day_close,
-            "daily": float(intraday.sum() + overnight),
-        }
-        previous_close = day_close
-
-    return daily_map
-
-
-def _build_symbol_returns_cache_payload(
-    file_path: Path,
-    return_mode: str,
-    df: Optional[pd.DataFrame] = None,
-) -> Tuple[Dict[str, Any], Dict[str, np.ndarray]]:
-    if df is None:
-        df, _ = _load_cn_symbol_frame(file_path)
-
-    if df.empty:
-        intraday = np.zeros((0, len(CN_5MIN_BAR_TIMES)), dtype=np.float64)
-        overnight = np.zeros(0, dtype=np.float64)
-        day_open = np.zeros(0, dtype=np.float64)
-        day_close = np.zeros(0, dtype=np.float64)
-        daily = np.zeros(0, dtype=np.float64)
-        date_codes = np.zeros(0, dtype=np.int32)
-        sorted_dates: List[str] = []
-    else:
-        ts = df["kline_time"]
-        dates = ts.to_numpy(dtype="datetime64[D]")
-        time_codes = (ts.dt.hour.to_numpy(dtype=np.int16) * 100 + ts.dt.minute.to_numpy(dtype=np.int16)).astype(np.int32)
-        open_px_all = df["open"].to_numpy(dtype=np.float64)
-        close_px_all = df["close"].to_numpy(dtype=np.float64)
-        price_ok_rows = df[["open", "high", "low", "close"]].gt(0.0).to_numpy().all(axis=1)
-
-        boundaries = np.flatnonzero(dates[1:] != dates[:-1]) + 1
-        starts = np.r_[0, boundaries]
-        ends = np.r_[boundaries, len(df)]
-
-        valid_intraday = []
-        valid_open = []
-        valid_close = []
-        sorted_dates = []
-        previous_close: Optional[float] = None
-        overnight_list: List[float] = []
-        daily_list: List[float] = []
-
-        for start, end in zip(starts, ends):
-            is_valid_day = (
-                (end - start) == len(CN_5MIN_BAR_TIMES)
-                and bool(price_ok_rows[start:end].all())
-                and np.array_equal(time_codes[start:end], CN_5MIN_BAR_CODES)
-            )
-            if not is_valid_day:
-                continue
-
-            day_open_arr = open_px_all[start:end]
-            day_close_arr = close_px_all[start:end]
-            if return_mode == "open_close":
-                intraday_day = np.log(day_close_arr / day_open_arr)
-            else:
-                intraday_day = np.empty(len(day_close_arr), dtype=np.float64)
-                intraday_day[0] = np.log(day_close_arr[0] / day_open_arr[0])
-                intraday_day[1:] = np.log(day_close_arr[1:] / day_close_arr[:-1])
-
-            day_open_val = float(day_open_arr[0])
-            day_close_val = float(day_close_arr[-1])
-            overnight_val = 0.0 if previous_close is None else float(np.log(day_open_val / previous_close))
-
-            valid_intraday.append(intraday_day)
-            valid_open.append(day_open_val)
-            valid_close.append(day_close_val)
-            overnight_list.append(overnight_val)
-            daily_list.append(float(intraday_day.sum() + overnight_val))
-            sorted_dates.append(np.datetime_as_string(dates[start], unit="D"))
-            previous_close = day_close_val
-
-        if sorted_dates:
-            intraday = np.vstack(valid_intraday).astype(np.float64, copy=False)
-            overnight = np.asarray(overnight_list, dtype=np.float64)
-            day_open = np.asarray(valid_open, dtype=np.float64)
-            day_close = np.asarray(valid_close, dtype=np.float64)
-            daily = np.asarray(daily_list, dtype=np.float64)
-            date_codes = np.array([int(date.replace("-", "")) for date in sorted_dates], dtype=np.int32)
-        else:
-            intraday = np.zeros((0, len(CN_5MIN_BAR_TIMES)), dtype=np.float64)
-            overnight = np.zeros(0, dtype=np.float64)
-            day_open = np.zeros(0, dtype=np.float64)
-            day_close = np.zeros(0, dtype=np.float64)
-            daily = np.zeros(0, dtype=np.float64)
-            date_codes = np.zeros(0, dtype=np.int32)
-
-    abs_overnight = np.abs(overnight)
-    suspicious_012 = abs_overnight > SUSPICIOUS_OVERNIGHT_THRESHOLDS[0]
-    suspicious_020 = abs_overnight > SUSPICIOUS_OVERNIGHT_THRESHOLDS[1]
-
-    meta = {
-        "version": RETURNS_CACHE_VERSION,
-        "symbol": file_path.parent.name,
-        "return_mode": return_mode,
-        "signature": _symbol_file_signature(file_path),
-        "n_days": int(len(sorted_dates)),
-        "first_date": sorted_dates[0] if sorted_dates else None,
-        "last_date": sorted_dates[-1] if sorted_dates else None,
-        "suspicious_overnight_count_012": int(suspicious_012.sum()),
-        "suspicious_overnight_count_020": int(suspicious_020.sum()),
-        "max_abs_overnight": float(abs_overnight.max()) if len(abs_overnight) else 0.0,
-    }
-    arrays = {
-        "date_codes": date_codes,
-        "intraday_returns": intraday,
-        "overnight_returns": overnight,
-        "day_open": day_open,
-        "day_close": day_close,
-        "daily_returns": daily,
-        "valid_day_mask": np.ones(len(date_codes), dtype=np.uint8),
-        "suspicious_overnight_mask_012": suspicious_012.astype(np.uint8, copy=False),
-        "suspicious_overnight_mask_020": suspicious_020.astype(np.uint8, copy=False),
-    }
-    return meta, arrays
-
-
-def _load_symbol_returns_cached(
-    file_path: Path,
-    return_mode: str,
-    use_cache: bool = True,
-    refresh_cache: bool = False,
-    cache_root: Optional[str | Path] = None,
-) -> Tuple[Dict[str, Any], Dict[str, np.ndarray]]:
-    meta_path, npz_path = _returns_cache_paths(cache_root, file_path, return_mode)
-    signature = _symbol_file_signature(file_path)
-
-    if use_cache and not refresh_cache and meta_path.exists() and npz_path.exists():
-        try:
-            meta = _load_json(meta_path)
-            if meta.get("signature") == signature and meta.get("version") == RETURNS_CACHE_VERSION:
-                arrays_raw = np.load(npz_path, allow_pickle=False)
-                arrays = {name: arrays_raw[name] for name in arrays_raw.files}
-                return meta, arrays
-        except Exception:
-            pass
-
-    meta, arrays = _build_symbol_returns_cache_payload(file_path, return_mode=return_mode)
-    if use_cache:
-        meta_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(npz_path, **arrays)
-        _write_json(meta_path, meta)
-    return meta, arrays
 
 
 @dataclass
@@ -983,6 +205,31 @@ def load_proc_universe(proc_root: str | Path = DEFAULT_PROC_ROOT) -> pd.DataFram
     return universe
 
 
+
+def summarize_cn_universe(universe: pd.DataFrame) -> Dict[str, Any]:
+    """Summarize the already-preprocessed universe table."""
+    if "summary" not in universe.attrs:
+        raise ValueError("Processed universe is missing attrs['summary']; reload it with load_proc_universe().")
+    summary = dict(universe.attrs["summary"])
+    stats = dict(summary)
+    if "coverage_ratio" in universe.columns and not universe.empty:
+        stats["coverage_ratio_quantiles"] = {
+            "p0": float(universe["coverage_ratio"].min()),
+            "p25": float(universe["coverage_ratio"].quantile(0.25)),
+            "p50": float(universe["coverage_ratio"].quantile(0.50)),
+            "p75": float(universe["coverage_ratio"].quantile(0.75)),
+            "p95": float(universe["coverage_ratio"].quantile(0.95)),
+            "p100": float(universe["coverage_ratio"].max()),
+        }
+    stats["invalid_day_symbols"] = int((universe.get("n_invalid_days", pd.Series(dtype=float)) > 0).sum())
+    if "suspicious_overnight_count_012" in universe.columns:
+        stats["corp_action_risk_summary"] = {
+            "symbols_with_suspicious_overnight_012": int((universe["suspicious_overnight_count_012"] > 0).sum()),
+            "symbols_with_suspicious_overnight_020": int((universe["suspicious_overnight_count_020"] > 0).sum()),
+            "max_abs_overnight_overall": float(universe["max_abs_overnight"].max()) if "max_abs_overnight" in universe.columns and not universe.empty else 0.0,
+        }
+    return stats
+
 def _proc_panel_paths(proc_root: Path, sample_mode: str, panel_name: str) -> Tuple[Path, Path]:
     panel_dir = proc_root / "panels" / sample_mode
     return panel_dir / f"{panel_name}.npz", panel_dir / f"{panel_name}.json"
@@ -1023,11 +270,22 @@ def _subset_panel_columns(panel: HFPanel, max_stocks: Optional[int]) -> HFPanel:
 
 def _load_proc_panel_file(proc_root: Path, sample_mode: str, panel_name: str) -> HFPanel:
     npz_path, meta_path = _proc_panel_paths(proc_root, sample_mode, panel_name)
-    if not npz_path.exists() or not meta_path.exists():
-        raise FileNotFoundError(f"未找到预处理面板: {npz_path}")
+    if not meta_path.exists():
+        raise FileNotFoundError(
+            f"Processed panel metadata not found: {meta_path}. Run Code/preprocess_cn_data.py first."
+        )
 
     meta = _load_json(meta_path)
-    arrays = np.load(npz_path, allow_pickle=False)
+    if "array_files" in meta:
+        arrays = {name: np.load(proc_root / rel_path, allow_pickle=False) for name, rel_path in meta["array_files"].items()}
+    else:
+        if not npz_path.exists():
+            raise FileNotFoundError(
+                f"Processed panel arrays not found: {npz_path}. Run Code/preprocess_cn_data.py first."
+            )
+        arrays_raw = np.load(npz_path, allow_pickle=False)
+        arrays = {name: arrays_raw[name] for name in arrays_raw.files}
+
     return HFPanel(
         R_intra=arrays["R_intra"],
         R_night=arrays["R_night"],
@@ -1040,7 +298,6 @@ def _load_proc_panel_file(proc_root: Path, sample_mode: str, panel_name: str) ->
         sample_mode=meta["sample_mode"],
         return_mode=meta.get("return_mode", "open_close"),
     )
-
 
 def load_proc_hf_panel(
     proc_root: str | Path = DEFAULT_PROC_ROOT,
@@ -1066,222 +323,6 @@ def load_proc_hf_panel(
     panel.sample_report["years"] = _normalize_years(years)
     return _subset_panel_columns(panel, max_stocks)
 
-
-def build_cn_hf_panel(
-    data_root: str | Path = DEFAULT_DATA_ROOT,
-    sample_mode: str = STRICT_BALANCED_SAMPLE,
-    return_mode: str = "open_close",
-    years: Optional[Sequence[int]] = None,
-    universe: Optional[pd.DataFrame] = None,
-    max_stocks: Optional[int] = None,
-    use_cache: bool = True,
-    refresh_cache: bool = False,
-    refresh_symbol_cache: bool = False,
-    cache_root: Optional[str | Path] = None,
-) -> HFPanel:
-    """
-    从本地 A 股 `.bz2` 数据构造 `HFPanel`.
-
-    默认主流程使用 `strict_balanced`:
-        - 全样本默认会得到 2013-01-04 到 2016-12-30 的严格平衡样本
-        - 每天 48 根日内收益
-
-    `near_balanced_99` 可直接构造一个交集日历面板, 但这不是论文主结果默认口径.
-    """
-    data_root = _ensure_path(data_root)
-    if universe is None:
-        universe = scan_cn_bz2_universe(
-            data_root=data_root,
-            use_cache=use_cache,
-            refresh_cache=refresh_cache,
-            cache_root=cache_root,
-        )
-    universe, summary = _get_universe_summary(universe, data_root=data_root)
-    # Determine cache dependencies before attempting to load a cached panel.
-    selected = _select_sample_rows(
-        universe=universe,
-        sample_mode=sample_mode,
-        years=years,
-        max_stocks=max_stocks,
-    )
-    if selected.empty:
-        raise ValueError("娌℃湁绛涢€夊嚭浠讳綍鑲＄エ, 鏃犳硶鏋勯€?HFPanel")
-    sample_signature_hash = _selected_sample_signature_hash(selected)
-    panel_key = _panel_cache_key(
-        data_root=data_root,
-        summary=summary,
-        sample_mode=sample_mode,
-        return_mode=return_mode,
-        years=years,
-        max_stocks=max_stocks,
-        sample_signature_hash=sample_signature_hash,
-    )
-    panel_meta_path, panel_npz_path = _panel_cache_paths(cache_root, panel_key)
-    if use_cache and not (refresh_cache or refresh_symbol_cache) and panel_meta_path.exists() and panel_npz_path.exists():
-        try:
-            panel_meta = _load_json(panel_meta_path)
-            if panel_meta.get("version") == PANEL_CACHE_VERSION:
-                arrays_raw = np.load(panel_npz_path, allow_pickle=False)
-                sample_report = panel_meta["sample_report"]
-                return HFPanel(
-                    R_intra=arrays_raw["R_intra"],
-                    R_night=arrays_raw["R_night"],
-                    day_ids=arrays_raw["day_ids"],
-                    tickers=list(panel_meta["tickers"]),
-                    dates=[pd.Timestamp(date) for date in panel_meta["dates"]],
-                    R_daily=arrays_raw["R_daily"],
-                    bar_times=list(panel_meta["bar_times"]),
-                    sample_report=sample_report,
-                    sample_mode=panel_meta["sample_mode"],
-                    return_mode=panel_meta["return_mode"],
-                )
-        except Exception:
-            pass
-
-    selected = _select_sample_rows(
-        universe=universe,
-        sample_mode=sample_mode,
-        years=years,
-        max_stocks=max_stocks,
-    )
-    if selected.empty:
-        raise ValueError("没有筛选出任何股票, 无法构造 HFPanel")
-
-    target_dates = _selected_calendar_dates(summary, years)
-    if not target_dates:
-        raise ValueError("所选年份下没有交易日")
-
-    target_date_codes = _date_codes_from_dates(target_dates)
-    if sample_mode == STRICT_BALANCED_SAMPLE:
-        common_date_codes = target_date_codes
-        common_dates = target_dates
-    else:
-        target_date_code_set = {int(code) for code in target_date_codes.tolist()}
-        common_date_codes_set: Optional[set[int]] = None
-        for row in selected.itertuples(index=False):
-            _, arrays = _load_symbol_returns_cached(
-                Path(row.file_path),
-                return_mode=return_mode,
-                use_cache=use_cache,
-                refresh_cache=refresh_cache or refresh_symbol_cache,
-                cache_root=cache_root,
-            )
-            valid_date_codes = {
-                int(code)
-                for code in arrays["date_codes"].tolist()
-                if int(code) in target_date_code_set
-            }
-            common_date_codes_set = (
-                valid_date_codes
-                if common_date_codes_set is None
-                else (common_date_codes_set & valid_date_codes)
-            )
-        common_date_codes = np.array(
-            [int(code) for code in target_date_codes if int(code) in (common_date_codes_set or set())],
-            dtype=np.int32,
-        )
-        common_dates = [_date_code_to_text(code) for code in common_date_codes.tolist()]
-        if not common_dates:
-            raise ValueError("近似平衡样本在交集日历下没有可用交易日")
-
-    D = len(common_dates)
-    M = len(CN_5MIN_BAR_TIMES)
-    N = len(selected)
-
-    R_intra = np.zeros((D * M, N), dtype=float)
-    R_night = np.zeros((D, N), dtype=float)
-    R_daily = np.zeros((D, N), dtype=float)
-    tickers = selected["symbol"].tolist()
-    corp_action_rows: List[Dict[str, Any]] = []
-
-    for col_idx, row in enumerate(selected.itertuples(index=False)):
-        meta, arrays = _load_symbol_returns_cached(
-            Path(row.file_path),
-            return_mode=return_mode,
-            use_cache=use_cache,
-            refresh_cache=refresh_cache or refresh_symbol_cache,
-            cache_root=cache_root,
-        )
-        date_codes = arrays["date_codes"]
-        locate = {int(code): idx for idx, code in enumerate(date_codes.tolist())}
-
-        for day_idx, date_code in enumerate(common_date_codes):
-            arr_idx = locate.get(int(date_code))
-            if arr_idx is None:
-                raise ValueError(
-                    f"{row.symbol} 缺少 {str(date_code)} 的完整日内数据; "
-                    f"请改用严格平衡样本或更窄年份窗口"
-                )
-            start = day_idx * M
-            end = start + M
-            R_intra[start:end, col_idx] = arrays["intraday_returns"][arr_idx]
-            R_night[day_idx, col_idx] = arrays["overnight_returns"][arr_idx]
-            R_daily[day_idx, col_idx] = arrays["daily_returns"][arr_idx]
-
-        corp_action_rows.append(
-            {
-                "symbol": row.symbol,
-                "max_abs_overnight": float(meta.get("max_abs_overnight", 0.0)),
-                "suspicious_overnight_count_012": int(meta.get("suspicious_overnight_count_012", 0)),
-                "suspicious_overnight_count_020": int(meta.get("suspicious_overnight_count_020", 0)),
-            }
-        )
-
-    day_ids = np.repeat(np.arange(D), M)
-    dates = [pd.Timestamp(date_text) for date_text in common_dates]
-    corp_action_df = pd.DataFrame(corp_action_rows)
-    corp_action_summary = {
-        "symbols_with_suspicious_overnight_012": int((corp_action_df["suspicious_overnight_count_012"] > 0).sum()),
-        "symbols_with_suspicious_overnight_020": int((corp_action_df["suspicious_overnight_count_020"] > 0).sum()),
-        "max_abs_overnight_overall": float(corp_action_df["max_abs_overnight"].max()) if not corp_action_df.empty else 0.0,
-    }
-
-    sample_report = {
-        "data_root": str(data_root),
-        "sample_mode": sample_mode,
-        "return_mode": return_mode,
-        "years": _normalize_years(years),
-        "n_symbols_selected": int(N),
-        "n_days_selected": int(D),
-        "bars_per_day": int(M),
-        "target_calendar_days": int(len(target_dates)),
-        "selected_calendar_start": common_dates[0],
-        "selected_calendar_end": common_dates[-1],
-        "target_symbols": tickers,
-        "corp_action_risk_summary": corp_action_summary,
-    }
-    panel = HFPanel(
-        R_intra=R_intra,
-        R_night=R_night,
-        day_ids=day_ids,
-        tickers=tickers,
-        dates=dates,
-        R_daily=R_daily,
-        bar_times=list(CN_5MIN_BAR_TIMES),
-        sample_report=sample_report,
-        sample_mode=sample_mode,
-        return_mode=return_mode,
-    )
-    if use_cache:
-        panel_meta = {
-            "version": PANEL_CACHE_VERSION,
-            "sample_mode": sample_mode,
-            "return_mode": return_mode,
-            "dates": [date.strftime("%Y-%m-%d") for date in dates],
-            "tickers": tickers,
-            "bar_times": list(CN_5MIN_BAR_TIMES),
-            "sample_report": sample_report,
-            "sample_signature_hash": sample_signature_hash,
-        }
-        np.savez_compressed(
-            panel_npz_path,
-            R_intra=panel.R_intra,
-            R_night=panel.R_night,
-            R_daily=panel.R_daily,
-            day_ids=panel.day_ids,
-        )
-        _write_json(panel_meta_path, panel_meta)
-    return panel
 
 
 def subset_panel_by_years(panel: HFPanel, years: Sequence[int]) -> HFPanel:
@@ -1850,151 +891,49 @@ def print_pipeline_summary(pipe: PelgerPipeline) -> None:
     print("=" * 78)
 
 
-def _build_nan_intraday_matrix_for_year(
-    selected: pd.DataFrame,
-    year_dates: Sequence[str],
-    return_mode: str,
-) -> Tuple[np.ndarray, List[str]]:
-    """为年度非平衡样本构造带 NaN 的日内收益矩阵."""
-    M = len(CN_5MIN_BAR_TIMES)
-    D = len(year_dates)
-    N = len(selected)
-    R = np.full((D * M, N), np.nan, dtype=float)
-    tickers = selected["symbol"].tolist()
-
-    date_index = {date: idx for idx, date in enumerate(year_dates)}
-    for col_idx, row in enumerate(selected.itertuples(index=False)):
-        df, _ = _load_cn_symbol_frame(Path(row.file_path))
-        daily_map = _build_daily_return_map(df, return_mode=return_mode)
-        for date_text, day_info in daily_map.items():
-            if date_text not in date_index:
-                continue
-            day_idx = date_index[date_text]
-            start = day_idx * M
-            end = start + M
-            R[start:end, col_idx] = day_info["intraday"]
-
-    return R, tickers
-
-
-def _build_strict_year_panel(
-    data_root: Path,
-    universe: pd.DataFrame,
-    year: int,
-    return_mode: str,
-) -> HFPanel:
-    return build_cn_hf_panel(
-        data_root=data_root,
-        sample_mode=STRICT_BALANCED_SAMPLE,
-        return_mode=return_mode,
-        years=[year],
-        universe=universe,
-    )
-
-
 def run_near_balanced_robustness(
-    data_root: str | Path,
+    proc_root: str | Path,
     universe: pd.DataFrame,
     years: Optional[Sequence[int]],
     K_compare: int,
-    proc_root: Optional[str | Path] = None,
     return_mode: str = "open_close",
     jump_a: float = 3.0,
     max_near_symbols: Optional[int] = None,
-    use_cache: bool = True,
-    refresh_cache: bool = False,
-    refresh_symbol_cache: bool = False,
-    cache_root: Optional[str | Path] = None,
 ) -> pd.DataFrame:
-    """
-    对年度 99% 覆盖样本做稳健性比较:
-    - 平衡样本: 常规 PCA
-    - 99% 样本: pairwise-covariance PCA + PSD 修正
-    - 比较两者连续因子空间的 generalized correlation
-    """
-    data_root = _ensure_path(data_root)
-    proc_root_path = _ensure_path(proc_root) if proc_root is not None else None
-    universe, summary = _get_universe_summary(universe, data_root=data_root)
+    """Compare yearly 99%-coverage panels with the strict-balanced factor space."""
+    proc_root = _ensure_path(proc_root)
+    if "summary" not in universe.attrs:
+        universe = load_proc_universe(proc_root)
+    summary = universe.attrs["summary"]
     years = _normalize_years(years) or sorted(int(year) for year in summary["calendar_days_by_year"])
-    if proc_root_path is not None:
-        strict_full_panel = load_proc_hf_panel(
-            proc_root=proc_root_path,
-            sample_mode=STRICT_BALANCED_SAMPLE,
-            years=None,
-            return_mode=return_mode,
-        )
-    else:
-        strict_full_panel = build_cn_hf_panel(
-            data_root=data_root,
-            sample_mode=STRICT_BALANCED_SAMPLE,
-            return_mode=return_mode,
-            years=None,
-            universe=universe,
-            use_cache=use_cache,
-            refresh_cache=refresh_cache,
-            refresh_symbol_cache=refresh_symbol_cache,
-            cache_root=cache_root,
-        )
+
+    strict_full_panel = load_proc_hf_panel(
+        proc_root=proc_root,
+        sample_mode=STRICT_BALANCED_SAMPLE,
+        years=None,
+        return_mode=return_mode,
+    )
 
     rows: List[Dict[str, Any]] = []
     for year in years:
-        near_selected = _select_sample_rows(
-            universe=universe,
-            sample_mode=NEAR_BALANCED_99_SAMPLE,
-            years=[year],
-            max_stocks=max_near_symbols,
-        )
-        if near_selected.empty:
-            continue
-
-        strict_panel = subset_panel_by_years(strict_full_panel, [year])
-        R_cont_strict, _ = detect_jumps(strict_panel, a=jump_a)
-        pca_strict = pca_factors(R_cont_strict, K=K_compare, use_corr=True)
-
-        if proc_root_path is not None:
+        try:
             near_panel = load_proc_hf_panel(
-                proc_root=proc_root_path,
+                proc_root=proc_root,
                 sample_mode=NEAR_BALANCED_99_SAMPLE,
                 years=[year],
                 return_mode=return_mode,
                 max_stocks=max_near_symbols,
             )
-        else:
-            year_dates = _selected_calendar_dates(summary, [year])
-            year_date_codes = np.array([int(date.replace("-", "")) for date in year_dates], dtype=np.int32)
-            M = len(CN_5MIN_BAR_TIMES)
-            R_near = np.full((len(year_dates) * M, len(near_selected)), np.nan, dtype=float)
-            for col_idx, row in enumerate(near_selected.itertuples(index=False)):
-                _, arrays = _load_symbol_returns_cached(
-                    Path(row.file_path),
-                    return_mode=return_mode,
-                    use_cache=use_cache,
-                    refresh_cache=refresh_cache or refresh_symbol_cache,
-                    cache_root=cache_root,
-                )
-                locate = {int(code): idx for idx, code in enumerate(arrays["date_codes"].tolist())}
-                for day_idx, date_code in enumerate(year_date_codes):
-                    arr_idx = locate.get(int(date_code))
-                    if arr_idx is None:
-                        continue
-                    start = day_idx * M
-                    end = start + M
-                    R_near[start:end, col_idx] = arrays["intraday_returns"][arr_idx]
-            day_ids = np.repeat(np.arange(len(year_dates)), len(CN_5MIN_BAR_TIMES))
-            near_panel = HFPanel(
-                R_intra=R_near,
-                R_night=np.zeros((len(year_dates), len(near_selected))),
-                day_ids=day_ids,
-                tickers=near_selected["symbol"].tolist(),
-                dates=[pd.Timestamp(date) for date in year_dates],
-                bar_times=list(CN_5MIN_BAR_TIMES),
-                sample_mode=NEAR_BALANCED_99_SAMPLE,
-                return_mode=return_mode,
-            )
-        R_cont_near, _ = detect_jumps(near_panel, a=jump_a)
-        pca_near = pca_factors_pairwise(R_cont_near, K=K_compare, use_corr=True, psd_fix=True)
+        except FileNotFoundError:
+            continue
 
+        strict_panel = subset_panel_by_years(strict_full_panel, [year])
+        R_cont_strict, _ = detect_jumps(strict_panel, a=jump_a)
+        R_cont_near, _ = detect_jumps(near_panel, a=jump_a)
+        pca_strict = pca_factors(R_cont_strict, K=K_compare, use_corr=True)
+        pca_near = pca_factors_pairwise(R_cont_near, K=K_compare, use_corr=True, psd_fix=True)
         gc = generalized_correlations(pca_strict.F, pca_near.F)
+
         row = {
             "year": int(year),
             "n_strict_symbols": int(strict_panel.N),
@@ -2008,7 +947,6 @@ def run_near_balanced_robustness(
     if not rows:
         return pd.DataFrame(columns=["year", "n_strict_symbols", "n_near_symbols", "n_days"])
     return pd.DataFrame(rows).sort_values("year").reset_index(drop=True)
-
 
 def load_external_factor_csv(
     path: str | Path,
@@ -2244,8 +1182,7 @@ def export_replication_outputs(
 
 
 def run_cn_replication(
-    data_root: str | Path = DEFAULT_DATA_ROOT,
-    proc_root: Optional[str | Path] = DEFAULT_PROC_ROOT,
+    proc_root: str | Path = DEFAULT_PROC_ROOT,
     output_root: str | Path = DEFAULT_OUTPUT_ROOT,
     years: Optional[Sequence[int]] = None,
     run_robustness: bool = True,
@@ -2257,53 +1194,25 @@ def run_cn_replication(
     gamma: float = 0.08,
     save_plots: bool = True,
     universe: Optional[pd.DataFrame] = None,
-    use_cache: bool = True,
-    refresh_cache: bool = False,
-    refresh_symbol_cache: bool = False,
-    cache_root: Optional[str | Path] = None,
 ) -> ReplicationResult:
-    """
-    一站式运行中国 A 股复现流程.
-
-    默认行为:
-    - 扫描全市场 `.bz2`
-    - 用严格平衡样本构造主面板
-    - 跑完整论文主干
-    - 导出核心表和图
-    - 可选执行年度 99% 样本稳健性
-    """
-    data_root = _ensure_path(data_root)
-    proc_root_path = _ensure_path(proc_root) if proc_root is not None else None
+    """Run the China A-share replication from preprocessed proc_Data panels only."""
+    proc_root = _ensure_path(proc_root)
     output_root = _ensure_path(output_root)
+    manifest_path = proc_root / "manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(
+            f"Processed data manifest not found: {manifest_path}. Run Code/preprocess_cn_data.py first."
+        )
 
-    if proc_root_path is not None:
-        universe = load_proc_universe(proc_root_path) if universe is None else universe
-        panel = load_proc_hf_panel(
-            proc_root=proc_root_path,
-            sample_mode=sample_mode,
-            years=years,
-            return_mode=return_mode,
-            max_stocks=max_stocks,
-        )
-    else:
-        universe = scan_cn_bz2_universe(
-            data_root=data_root,
-            use_cache=use_cache,
-            refresh_cache=refresh_cache,
-            cache_root=cache_root,
-        ) if universe is None else universe
-        panel = build_cn_hf_panel(
-            data_root=data_root,
-            sample_mode=sample_mode,
-            return_mode=return_mode,
-            years=years,
-            universe=universe,
-            max_stocks=max_stocks,
-            use_cache=use_cache,
-            refresh_cache=refresh_cache,
-            refresh_symbol_cache=refresh_symbol_cache,
-            cache_root=cache_root,
-        )
+    universe = load_proc_universe(proc_root) if universe is None else universe
+    panel = load_proc_hf_panel(
+        proc_root=proc_root,
+        sample_mode=sample_mode,
+        years=years,
+        return_mode=return_mode,
+        max_stocks=max_stocks,
+    )
+
     corp_action_rows = []
     for ticker in panel.tickers:
         row = universe.loc[universe["symbol"] == ticker]
@@ -2320,13 +1229,7 @@ def run_cn_replication(
         )
     corp_action_risk = pd.DataFrame(corp_action_rows)
 
-    pipeline = PelgerPipeline(
-        panel=panel,
-        jump_a=jump_a,
-        K_max=k_max,
-        gamma=gamma,
-    ).run_full()
-
+    pipeline = PelgerPipeline(panel=panel, jump_a=jump_a, K_max=k_max, gamma=gamma).run_full()
     rolling_window = 21 if panel.D >= 21 else max(5, panel.D // 3)
     rolling_gc = rolling_gc_vs_global(
         R=pipeline.R_cont,
@@ -2347,17 +1250,12 @@ def run_cn_replication(
     robustness = pd.DataFrame()
     if run_robustness:
         robustness = run_near_balanced_robustness(
-            data_root=data_root,
+            proc_root=proc_root,
             universe=universe,
             years=years,
             K_compare=pipeline.K_cont_hat,
-            proc_root=proc_root_path,
             return_mode=return_mode,
             jump_a=jump_a,
-            use_cache=use_cache,
-            refresh_cache=refresh_cache,
-            refresh_symbol_cache=refresh_symbol_cache,
-            cache_root=cache_root,
         )
 
     result = ReplicationResult(
@@ -2372,7 +1270,6 @@ def run_cn_replication(
     )
     export_replication_outputs(result, save_plots=save_plots)
     return result
-
 
 def _print_scan_summary(universe: pd.DataFrame) -> None:
     summary = summarize_cn_universe(universe)
@@ -2399,55 +1296,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run Pelger (2020) replication on preprocessed China A-share 5-minute data."
     )
-    parser.add_argument("--proc-root", default=str(DEFAULT_PROC_ROOT), help="预处理数据目录")
-    parser.add_argument("--use-raw-data", action="store_true", help="回退到原始 .bz2 数据热路径")
-    parser.add_argument("--data-root", default=str(DEFAULT_DATA_ROOT), help="EXTRA_STOCK_A 根目录")
-    parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT), help="结果输出目录")
-    parser.add_argument("--cache-root", default=str(DEFAULT_CACHE_ROOT), help="缓存目录")
-    parser.add_argument("--no-cache", action="store_true", help="禁用缓存")
-    parser.add_argument("--refresh-cache", action="store_true", help="刷新全部缓存")
-    parser.add_argument("--refresh-symbol-cache", action="store_true", help="刷新逐股票收益缓存")
-    parser.add_argument("--scan-only", action="store_true", help="只扫描样本, 不运行主流程")
-    parser.add_argument(
-        "--sample-mode",
-        default=STRICT_BALANCED_SAMPLE,
-        choices=[STRICT_BALANCED_SAMPLE, NEAR_BALANCED_99_SAMPLE],
-        help="主流程样本口径",
-    )
-    parser.add_argument(
-        "--return-mode",
-        default="open_close",
-        choices=["open_close", "close_close"],
-        help="日内收益构造口径",
-    )
-    parser.add_argument("--years", nargs="+", type=int, help="只运行指定年份, 例如 --years 2015 2016")
-    parser.add_argument("--max-stocks", type=int, help="仅取前若干只股票做 smoke test")
-    parser.add_argument("--no-robustness", action="store_true", help="跳过 99% 覆盖样本稳健性分析")
-    parser.add_argument("--no-plots", action="store_true", help="不输出 PNG 图形")
-    parser.add_argument("--jump-a", type=float, default=3.0, help="跳跃阈值倍数")
-    parser.add_argument("--k-max", type=int, default=10, help="扰动特征值比率搜索上限")
-    parser.add_argument("--gamma", type=float, default=0.08, help="扰动特征值比率阈值")
+    parser.add_argument("--proc-root", default=str(DEFAULT_PROC_ROOT), help="Preprocessed data directory")
+    parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT), help="Result output directory")
+    parser.add_argument("--sample-mode", default=STRICT_BALANCED_SAMPLE, choices=[STRICT_BALANCED_SAMPLE, NEAR_BALANCED_99_SAMPLE])
+    parser.add_argument("--return-mode", default="open_close", choices=["open_close", "close_close"])
+    parser.add_argument("--years", nargs="+", type=int, help="Run selected years, e.g. --years 2015 2016")
+    parser.add_argument("--max-stocks", type=int, help="Use first N symbols for smoke tests")
+    parser.add_argument("--no-robustness", action="store_true", help="Skip yearly 99%-coverage robustness")
+    parser.add_argument("--no-plots", action="store_true", help="Do not export PNG figures")
+    parser.add_argument("--jump-a", type=float, default=3.0, help="Jump threshold multiplier")
+    parser.add_argument("--k-max", type=int, default=10, help="Maximum factor count search bound")
+    parser.add_argument("--gamma", type=float, default=0.08, help="Eigenvalue-ratio perturbation threshold")
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
-    data_root = _ensure_path(args.data_root)
-    proc_root = None if args.use_raw_data else _ensure_path(args.proc_root)
+    proc_root = _ensure_path(args.proc_root)
     output_root = _ensure_path(args.output_root)
-    cache_root = _ensure_path(args.cache_root)
-    use_cache = not args.no_cache
-    refresh_cache = bool(args.refresh_cache)
-
-    if proc_root is not None:
-        universe = load_proc_universe(proc_root)
-    else:
-        universe = scan_cn_bz2_universe(
-            data_root=data_root,
-            use_cache=use_cache,
-            refresh_cache=refresh_cache,
-            cache_root=cache_root,
-        )
+    universe = load_proc_universe(proc_root)
     _print_scan_summary(universe)
 
     output_root.mkdir(parents=True, exist_ok=True)
@@ -2456,11 +1323,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     universe.to_csv(diagnostics_dir / "universe_scan.csv", index=False, encoding="utf-8-sig")
     _write_json(diagnostics_dir / "universe_summary.json", summarize_cn_universe(universe))
 
-    if args.scan_only:
-        return 0
-
     result = run_cn_replication(
-        data_root=data_root,
         proc_root=proc_root,
         output_root=output_root,
         years=args.years,
@@ -2473,10 +1336,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         gamma=args.gamma,
         save_plots=not args.no_plots,
         universe=universe,
-        use_cache=use_cache,
-        refresh_cache=refresh_cache,
-        refresh_symbol_cache=bool(args.refresh_symbol_cache),
-        cache_root=cache_root,
     )
     print_pipeline_summary(result.pipeline)
     print("Exported files:")
