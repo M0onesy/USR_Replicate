@@ -1302,7 +1302,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--return-mode", default="open_close", choices=["open_close", "close_close"])
     parser.add_argument("--years", nargs="+", type=int, help="Run selected years, e.g. --years 2015 2016")
     parser.add_argument("--max-stocks", type=int, help="Use first N symbols for smoke tests")
-    parser.add_argument("--no-robustness", action="store_true", help="Skip yearly 99%-coverage robustness")
+    parser.add_argument("--no-robustness", action="store_true", help="Skip yearly 99%%-coverage robustness")
     parser.add_argument("--no-plots", action="store_true", help="Do not export PNG figures")
     parser.add_argument("--jump-a", type=float, default=3.0, help="Jump threshold multiplier")
     parser.add_argument("--k-max", type=int, default=10, help="Maximum factor count search bound")
