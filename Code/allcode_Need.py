@@ -69,9 +69,11 @@ CN_5MIN_BAR_CODES = np.array(
 STRICT_BALANCED_SAMPLE = "strict_balanced"
 NEAR_BALANCED_99_SAMPLE = "near_balanced_99"
 
-DEFAULT_DATA_ROOT = Path(__file__).resolve().parent / "EXTRA_STOCK_A"
-DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parent / "replication_output"
-DEFAULT_CACHE_ROOT = Path(__file__).resolve().parent / ".hf_cache" / "pelger_cn"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_DATA_ROOT = REPO_ROOT / "Data" / "kline_Data" / "EXTRA_STOCK_A"
+DEFAULT_PROC_ROOT = REPO_ROOT / "Data" / "proc_Data" / "pelger_cn_adjusted"
+DEFAULT_OUTPUT_ROOT = REPO_ROOT / "Result" / "pelger_cn_adjusted"
+DEFAULT_CACHE_ROOT = REPO_ROOT / ".hf_cache" / "pelger_cn"
 SCAN_CACHE_VERSION = "v2"
 RETURNS_CACHE_VERSION = "v1"
 PANEL_CACHE_VERSION = "v2"
@@ -961,6 +963,110 @@ class HFPanel:
         return int(self.R_intra.shape[0] / max(self.D, 1))
 
 
+def load_proc_universe(proc_root: str | Path = DEFAULT_PROC_ROOT) -> pd.DataFrame:
+    """读取预处理阶段生成的样本清单，并恢复 summary 元数据。"""
+    proc_root = _ensure_path(proc_root)
+    universe_path = proc_root / "metadata" / "universe.pkl"
+    summary_path = proc_root / "metadata" / "universe_summary.json"
+    if not universe_path.exists() or not summary_path.exists():
+        raise FileNotFoundError(
+            f"未找到预处理样本文件，请先运行 Code/preprocess_cn_data.py: {proc_root}"
+        )
+
+    universe = pd.read_pickle(universe_path)
+    summary = _load_json(summary_path)
+    if "calendar_days_by_year" in summary:
+        summary["calendar_days_by_year"] = {int(k): int(v) for k, v in summary["calendar_days_by_year"].items()}
+    if "global_dates_by_year" in summary:
+        summary["global_dates_by_year"] = {int(k): list(v) for k, v in summary["global_dates_by_year"].items()}
+    universe.attrs["summary"] = summary
+    return universe
+
+
+def _proc_panel_paths(proc_root: Path, sample_mode: str, panel_name: str) -> Tuple[Path, Path]:
+    panel_dir = proc_root / "panels" / sample_mode
+    return panel_dir / f"{panel_name}.npz", panel_dir / f"{panel_name}.json"
+
+
+def _proc_panel_name(years: Optional[Sequence[int]]) -> Optional[str]:
+    years = _normalize_years(years)
+    if years is None:
+        return "full"
+    if len(years) == 1:
+        return f"year_{years[0]}"
+    return None
+
+
+def _subset_panel_columns(panel: HFPanel, max_stocks: Optional[int]) -> HFPanel:
+    if max_stocks is None or panel.N <= int(max_stocks):
+        return panel
+
+    keep = slice(0, int(max_stocks))
+    sample_report = dict(panel.sample_report or {})
+    sample_report["n_symbols_selected"] = int(max_stocks)
+    sample_report["target_symbols"] = list(panel.tickers[keep])
+    return HFPanel(
+        R_intra=panel.R_intra[:, keep],
+        R_night=panel.R_night[:, keep],
+        day_ids=panel.day_ids.copy(),
+        tickers=list(panel.tickers[keep]),
+        dates=list(panel.dates),
+        R_daily=panel.R_daily[:, keep],
+        rf_intra=panel.rf_intra.copy(),
+        rf_night=panel.rf_night.copy(),
+        bar_times=list(panel.bar_times or []),
+        sample_report=sample_report,
+        sample_mode=panel.sample_mode,
+        return_mode=panel.return_mode,
+    )
+
+
+def _load_proc_panel_file(proc_root: Path, sample_mode: str, panel_name: str) -> HFPanel:
+    npz_path, meta_path = _proc_panel_paths(proc_root, sample_mode, panel_name)
+    if not npz_path.exists() or not meta_path.exists():
+        raise FileNotFoundError(f"未找到预处理面板: {npz_path}")
+
+    meta = _load_json(meta_path)
+    arrays = np.load(npz_path, allow_pickle=False)
+    return HFPanel(
+        R_intra=arrays["R_intra"],
+        R_night=arrays["R_night"],
+        day_ids=arrays["day_ids"],
+        tickers=list(meta["tickers"]),
+        dates=[pd.Timestamp(date) for date in meta["dates"]],
+        R_daily=arrays["R_daily"],
+        bar_times=list(meta["bar_times"]),
+        sample_report=dict(meta.get("sample_report", {})),
+        sample_mode=meta["sample_mode"],
+        return_mode=meta.get("return_mode", "open_close"),
+    )
+
+
+def load_proc_hf_panel(
+    proc_root: str | Path = DEFAULT_PROC_ROOT,
+    sample_mode: str = STRICT_BALANCED_SAMPLE,
+    years: Optional[Sequence[int]] = None,
+    return_mode: str = "open_close",
+    max_stocks: Optional[int] = None,
+) -> HFPanel:
+    """从 Data/proc_Data 中读取预处理好的 HFPanel。"""
+    proc_root = _ensure_path(proc_root)
+    panel_name = _proc_panel_name(years)
+    if panel_name is not None:
+        try:
+            panel = _load_proc_panel_file(proc_root, sample_mode, panel_name)
+        except FileNotFoundError:
+            panel = subset_panel_by_years(_load_proc_panel_file(proc_root, sample_mode, "full"), _normalize_years(years) or [])
+    else:
+        panel = subset_panel_by_years(_load_proc_panel_file(proc_root, sample_mode, "full"), _normalize_years(years) or [])
+
+    panel.return_mode = return_mode
+    panel.sample_report = dict(panel.sample_report or {})
+    panel.sample_report["proc_root"] = str(proc_root)
+    panel.sample_report["years"] = _normalize_years(years)
+    return _subset_panel_columns(panel, max_stocks)
+
+
 def build_cn_hf_panel(
     data_root: str | Path = DEFAULT_DATA_ROOT,
     sample_mode: str = STRICT_BALANCED_SAMPLE,
@@ -1791,6 +1897,7 @@ def run_near_balanced_robustness(
     universe: pd.DataFrame,
     years: Optional[Sequence[int]],
     K_compare: int,
+    proc_root: Optional[str | Path] = None,
     return_mode: str = "open_close",
     jump_a: float = 3.0,
     max_near_symbols: Optional[int] = None,
@@ -1806,19 +1913,28 @@ def run_near_balanced_robustness(
     - 比较两者连续因子空间的 generalized correlation
     """
     data_root = _ensure_path(data_root)
+    proc_root_path = _ensure_path(proc_root) if proc_root is not None else None
     universe, summary = _get_universe_summary(universe, data_root=data_root)
     years = _normalize_years(years) or sorted(int(year) for year in summary["calendar_days_by_year"])
-    strict_full_panel = build_cn_hf_panel(
-        data_root=data_root,
-        sample_mode=STRICT_BALANCED_SAMPLE,
-        return_mode=return_mode,
-        years=None,
-        universe=universe,
-        use_cache=use_cache,
-        refresh_cache=refresh_cache,
-        refresh_symbol_cache=refresh_symbol_cache,
-        cache_root=cache_root,
-    )
+    if proc_root_path is not None:
+        strict_full_panel = load_proc_hf_panel(
+            proc_root=proc_root_path,
+            sample_mode=STRICT_BALANCED_SAMPLE,
+            years=None,
+            return_mode=return_mode,
+        )
+    else:
+        strict_full_panel = build_cn_hf_panel(
+            data_root=data_root,
+            sample_mode=STRICT_BALANCED_SAMPLE,
+            return_mode=return_mode,
+            years=None,
+            universe=universe,
+            use_cache=use_cache,
+            refresh_cache=refresh_cache,
+            refresh_symbol_cache=refresh_symbol_cache,
+            cache_root=cache_root,
+        )
 
     rows: List[Dict[str, Any]] = []
     for year in years:
@@ -1835,37 +1951,46 @@ def run_near_balanced_robustness(
         R_cont_strict, _ = detect_jumps(strict_panel, a=jump_a)
         pca_strict = pca_factors(R_cont_strict, K=K_compare, use_corr=True)
 
-        year_dates = _selected_calendar_dates(summary, [year])
-        year_date_codes = np.array([int(date.replace("-", "")) for date in year_dates], dtype=np.int32)
-        M = len(CN_5MIN_BAR_TIMES)
-        R_near = np.full((len(year_dates) * M, len(near_selected)), np.nan, dtype=float)
-        for col_idx, row in enumerate(near_selected.itertuples(index=False)):
-            _, arrays = _load_symbol_returns_cached(
-                Path(row.file_path),
+        if proc_root_path is not None:
+            near_panel = load_proc_hf_panel(
+                proc_root=proc_root_path,
+                sample_mode=NEAR_BALANCED_99_SAMPLE,
+                years=[year],
                 return_mode=return_mode,
-                use_cache=use_cache,
-                refresh_cache=refresh_cache or refresh_symbol_cache,
-                cache_root=cache_root,
+                max_stocks=max_near_symbols,
             )
-            locate = {int(code): idx for idx, code in enumerate(arrays["date_codes"].tolist())}
-            for day_idx, date_code in enumerate(year_date_codes):
-                arr_idx = locate.get(int(date_code))
-                if arr_idx is None:
-                    continue
-                start = day_idx * M
-                end = start + M
-                R_near[start:end, col_idx] = arrays["intraday_returns"][arr_idx]
-        day_ids = np.repeat(np.arange(len(year_dates)), len(CN_5MIN_BAR_TIMES))
-        near_panel = HFPanel(
-            R_intra=R_near,
-            R_night=np.zeros((len(year_dates), len(near_selected))),
-            day_ids=day_ids,
-            tickers=near_selected["symbol"].tolist(),
-            dates=[pd.Timestamp(date) for date in year_dates],
-            bar_times=list(CN_5MIN_BAR_TIMES),
-            sample_mode=NEAR_BALANCED_99_SAMPLE,
-            return_mode=return_mode,
-        )
+        else:
+            year_dates = _selected_calendar_dates(summary, [year])
+            year_date_codes = np.array([int(date.replace("-", "")) for date in year_dates], dtype=np.int32)
+            M = len(CN_5MIN_BAR_TIMES)
+            R_near = np.full((len(year_dates) * M, len(near_selected)), np.nan, dtype=float)
+            for col_idx, row in enumerate(near_selected.itertuples(index=False)):
+                _, arrays = _load_symbol_returns_cached(
+                    Path(row.file_path),
+                    return_mode=return_mode,
+                    use_cache=use_cache,
+                    refresh_cache=refresh_cache or refresh_symbol_cache,
+                    cache_root=cache_root,
+                )
+                locate = {int(code): idx for idx, code in enumerate(arrays["date_codes"].tolist())}
+                for day_idx, date_code in enumerate(year_date_codes):
+                    arr_idx = locate.get(int(date_code))
+                    if arr_idx is None:
+                        continue
+                    start = day_idx * M
+                    end = start + M
+                    R_near[start:end, col_idx] = arrays["intraday_returns"][arr_idx]
+            day_ids = np.repeat(np.arange(len(year_dates)), len(CN_5MIN_BAR_TIMES))
+            near_panel = HFPanel(
+                R_intra=R_near,
+                R_night=np.zeros((len(year_dates), len(near_selected))),
+                day_ids=day_ids,
+                tickers=near_selected["symbol"].tolist(),
+                dates=[pd.Timestamp(date) for date in year_dates],
+                bar_times=list(CN_5MIN_BAR_TIMES),
+                sample_mode=NEAR_BALANCED_99_SAMPLE,
+                return_mode=return_mode,
+            )
         R_cont_near, _ = detect_jumps(near_panel, a=jump_a)
         pca_near = pca_factors_pairwise(R_cont_near, K=K_compare, use_corr=True, psd_fix=True)
 
@@ -1873,8 +1998,8 @@ def run_near_balanced_robustness(
         row = {
             "year": int(year),
             "n_strict_symbols": int(strict_panel.N),
-            "n_near_symbols": int(len(near_selected)),
-            "n_days": int(len(year_dates)),
+            "n_near_symbols": int(near_panel.N),
+            "n_days": int(near_panel.D),
         }
         for idx, value in enumerate(gc, start=1):
             row[f"gc_{idx}"] = float(value)
@@ -1993,10 +2118,17 @@ def export_replication_outputs(
     """导出核心表格、摘要和可选图形."""
     output_root = result.output_root
     output_root.mkdir(parents=True, exist_ok=True)
+    tables_dir = output_root / "tables"
+    figures_dir = output_root / "figures"
+    diagnostics_dir = output_root / "diagnostics"
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
 
     universe_summary = summarize_cn_universe(result.universe)
+    sample_report = result.panel.sample_report or {}
     main_summary = {
-        "sample_report": result.panel.sample_report or {},
+        "sample_report": sample_report,
         "jump_stats": result.pipeline.jump_stats,
         "factor_counts": {
             "K_hf_hat": result.pipeline.K_hf_hat,
@@ -2006,26 +2138,49 @@ def export_replication_outputs(
         "sharpes": result.pipeline.sharpes,
     }
 
-    universe_csv = output_root / "universe_scan.csv"
+    universe_csv = diagnostics_dir / "universe_scan.csv"
     result.universe.to_csv(universe_csv, index=False, encoding="utf-8-sig")
-    _write_json(output_root / "universe_summary.json", universe_summary)
-    _write_json(output_root / "main_summary.json", main_summary)
+    _write_json(diagnostics_dir / "universe_summary.json", universe_summary)
+    _write_json(diagnostics_dir / "main_summary.json", main_summary)
 
+    sample_summary_path = tables_dir / "Table_01_sample_summary.csv"
+    pd.DataFrame([
+        {
+            "adjustment": sample_report.get("adjustment", "raw_or_unknown"),
+            "sample_mode": result.panel.sample_mode,
+            "return_mode": result.panel.return_mode,
+            "years": sample_report.get("years"),
+            "n_symbols_selected": result.panel.N,
+            "n_days_selected": result.panel.D,
+            "bars_per_day": result.panel.M_per_day,
+            "selected_calendar_start": sample_report.get("selected_calendar_start"),
+            "selected_calendar_end": sample_report.get("selected_calendar_end"),
+            "universe_total_symbols": universe_summary.get("total_symbols"),
+            "strict_balanced_symbols": universe_summary.get("strict_balanced_symbols"),
+            "near_balanced_99_symbols": universe_summary.get("near_balanced_99_symbols"),
+            "global_start": universe_summary.get("global_start"),
+            "global_end": universe_summary.get("global_end"),
+        }
+    ]).to_csv(sample_summary_path, index=False, encoding="utf-8-sig")
+
+    jump_stats_path = tables_dir / "Table_02_jump_stats.csv"
     pd.DataFrame([result.pipeline.jump_stats]).to_csv(
-        output_root / "jump_stats.csv", index=False, encoding="utf-8-sig"
+        jump_stats_path, index=False, encoding="utf-8-sig"
     )
+    factor_counts_path = tables_dir / "Table_03_factor_counts.csv"
     pd.DataFrame(
         [{
             "K_hf_hat": result.pipeline.K_hf_hat,
             "K_cont_hat": result.pipeline.K_cont_hat,
             "K_jump_hat": result.pipeline.K_jump_hat,
         }]
-    ).to_csv(output_root / "factor_counts.csv", index=False, encoding="utf-8-sig")
+    ).to_csv(factor_counts_path, index=False, encoding="utf-8-sig")
+    sharpes_path = tables_dir / "Table_04_sharpes.csv"
     pd.DataFrame([result.pipeline.sharpes]).to_csv(
-        output_root / "sharpes.csv", index=False, encoding="utf-8-sig"
+        sharpes_path, index=False, encoding="utf-8-sig"
     )
 
-    sample_symbols_path = output_root / "main_sample_symbols.csv"
+    sample_symbols_path = diagnostics_dir / "main_sample_symbols.csv"
     pd.DataFrame({"symbol": result.panel.tickers}).to_csv(
         sample_symbols_path,
         index=False,
@@ -2036,24 +2191,25 @@ def export_replication_outputs(
         result.rolling_gc,
         result.rolling_explained_variation,
     )
-    rolling_gc_path = output_root / "rolling_gc.csv"
-    rolling_ev_path = output_root / "rolling_explained_variation.csv"
+    rolling_gc_path = tables_dir / "Table_05_rolling_gc.csv"
+    rolling_ev_path = tables_dir / "Table_06_rolling_explained_variation.csv"
     rolling_gc_df.to_csv(rolling_gc_path, index=False, encoding="utf-8-sig")
     rolling_explained_df.to_csv(rolling_ev_path, index=False, encoding="utf-8-sig")
 
-    robustness_path = output_root / "robustness_yearly_gc.csv"
+    robustness_path = tables_dir / "Table_07_robustness_yearly_gc.csv"
     result.robustness.to_csv(robustness_path, index=False, encoding="utf-8-sig")
 
-    corp_action_path = output_root / "corp_action_risk.csv"
+    corp_action_path = diagnostics_dir / "corp_action_risk_after_adjustment.csv"
     result.corp_action_risk.to_csv(corp_action_path, index=False, encoding="utf-8-sig")
 
     exported_files = {
         "universe_scan": str(universe_csv),
-        "universe_summary": str(output_root / "universe_summary.json"),
-        "main_summary": str(output_root / "main_summary.json"),
-        "jump_stats": str(output_root / "jump_stats.csv"),
-        "factor_counts": str(output_root / "factor_counts.csv"),
-        "sharpes": str(output_root / "sharpes.csv"),
+        "universe_summary": str(diagnostics_dir / "universe_summary.json"),
+        "main_summary": str(diagnostics_dir / "main_summary.json"),
+        "sample_summary": str(sample_summary_path),
+        "jump_stats": str(jump_stats_path),
+        "factor_counts": str(factor_counts_path),
+        "sharpes": str(sharpes_path),
         "main_sample_symbols": str(sample_symbols_path),
         "rolling_gc": str(rolling_gc_path),
         "rolling_explained_variation": str(rolling_ev_path),
@@ -2062,7 +2218,7 @@ def export_replication_outputs(
     }
 
     if save_plots and not rolling_gc_df.empty:
-        gc_plot = output_root / "rolling_gc.png"
+        gc_plot = figures_dir / "Figure_01_rolling_gc.png"
         if _maybe_save_plot(
             series_df=rolling_gc_df,
             x_col="window_index",
@@ -2073,7 +2229,7 @@ def export_replication_outputs(
             exported_files["rolling_gc_plot"] = str(gc_plot)
 
     if save_plots and not rolling_explained_df.empty:
-        ev_plot = output_root / "rolling_explained_variation.png"
+        ev_plot = figures_dir / "Figure_02_rolling_explained_variation.png"
         if _maybe_save_plot(
             series_df=rolling_explained_df,
             x_col="window_index",
@@ -2089,6 +2245,7 @@ def export_replication_outputs(
 
 def run_cn_replication(
     data_root: str | Path = DEFAULT_DATA_ROOT,
+    proc_root: Optional[str | Path] = DEFAULT_PROC_ROOT,
     output_root: str | Path = DEFAULT_OUTPUT_ROOT,
     years: Optional[Sequence[int]] = None,
     run_robustness: bool = True,
@@ -2116,26 +2273,37 @@ def run_cn_replication(
     - 可选执行年度 99% 样本稳健性
     """
     data_root = _ensure_path(data_root)
+    proc_root_path = _ensure_path(proc_root) if proc_root is not None else None
     output_root = _ensure_path(output_root)
 
-    universe = scan_cn_bz2_universe(
-        data_root=data_root,
-        use_cache=use_cache,
-        refresh_cache=refresh_cache,
-        cache_root=cache_root,
-    ) if universe is None else universe
-    panel = build_cn_hf_panel(
-        data_root=data_root,
-        sample_mode=sample_mode,
-        return_mode=return_mode,
-        years=years,
-        universe=universe,
-        max_stocks=max_stocks,
-        use_cache=use_cache,
-        refresh_cache=refresh_cache,
-        refresh_symbol_cache=refresh_symbol_cache,
-        cache_root=cache_root,
-    )
+    if proc_root_path is not None:
+        universe = load_proc_universe(proc_root_path) if universe is None else universe
+        panel = load_proc_hf_panel(
+            proc_root=proc_root_path,
+            sample_mode=sample_mode,
+            years=years,
+            return_mode=return_mode,
+            max_stocks=max_stocks,
+        )
+    else:
+        universe = scan_cn_bz2_universe(
+            data_root=data_root,
+            use_cache=use_cache,
+            refresh_cache=refresh_cache,
+            cache_root=cache_root,
+        ) if universe is None else universe
+        panel = build_cn_hf_panel(
+            data_root=data_root,
+            sample_mode=sample_mode,
+            return_mode=return_mode,
+            years=years,
+            universe=universe,
+            max_stocks=max_stocks,
+            use_cache=use_cache,
+            refresh_cache=refresh_cache,
+            refresh_symbol_cache=refresh_symbol_cache,
+            cache_root=cache_root,
+        )
     corp_action_rows = []
     for ticker in panel.tickers:
         row = universe.loc[universe["symbol"] == ticker]
@@ -2183,6 +2351,7 @@ def run_cn_replication(
             universe=universe,
             years=years,
             K_compare=pipeline.K_cont_hat,
+            proc_root=proc_root_path,
             return_mode=return_mode,
             jump_a=jump_a,
             use_cache=use_cache,
@@ -2228,8 +2397,10 @@ def _print_scan_summary(universe: pd.DataFrame) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run Pelger (2020) replication on local China A-share 5-minute bz2 data."
+        description="Run Pelger (2020) replication on preprocessed China A-share 5-minute data."
     )
+    parser.add_argument("--proc-root", default=str(DEFAULT_PROC_ROOT), help="预处理数据目录")
+    parser.add_argument("--use-raw-data", action="store_true", help="回退到原始 .bz2 数据热路径")
     parser.add_argument("--data-root", default=str(DEFAULT_DATA_ROOT), help="EXTRA_STOCK_A 根目录")
     parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT), help="结果输出目录")
     parser.add_argument("--cache-root", default=str(DEFAULT_CACHE_ROOT), help="缓存目录")
@@ -2262,28 +2433,35 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     data_root = _ensure_path(args.data_root)
+    proc_root = None if args.use_raw_data else _ensure_path(args.proc_root)
     output_root = _ensure_path(args.output_root)
     cache_root = _ensure_path(args.cache_root)
     use_cache = not args.no_cache
     refresh_cache = bool(args.refresh_cache)
 
-    universe = scan_cn_bz2_universe(
-        data_root=data_root,
-        use_cache=use_cache,
-        refresh_cache=refresh_cache,
-        cache_root=cache_root,
-    )
+    if proc_root is not None:
+        universe = load_proc_universe(proc_root)
+    else:
+        universe = scan_cn_bz2_universe(
+            data_root=data_root,
+            use_cache=use_cache,
+            refresh_cache=refresh_cache,
+            cache_root=cache_root,
+        )
     _print_scan_summary(universe)
 
     output_root.mkdir(parents=True, exist_ok=True)
-    universe.to_csv(output_root / "universe_scan.csv", index=False, encoding="utf-8-sig")
-    _write_json(output_root / "universe_summary.json", summarize_cn_universe(universe))
+    diagnostics_dir = output_root / "diagnostics"
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    universe.to_csv(diagnostics_dir / "universe_scan.csv", index=False, encoding="utf-8-sig")
+    _write_json(diagnostics_dir / "universe_summary.json", summarize_cn_universe(universe))
 
     if args.scan_only:
         return 0
 
     result = run_cn_replication(
         data_root=data_root,
+        proc_root=proc_root,
         output_root=output_root,
         years=args.years,
         run_robustness=not args.no_robustness,

@@ -1,1 +1,1 @@
-# Please add your 5min_Kline data folder at here ~ 
+# Please add your data folder/file at here ~ 

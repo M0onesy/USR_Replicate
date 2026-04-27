@@ -30,12 +30,6 @@ METADATA_SENTINEL = "__YHDATA_METADATA__"
 
 TYPE_CONFIG = {
     "EXTRA_STOCK_A": {"active_api": "get_code_list", "source_type": "EXTRA_STOCK_A"},
-    # "EXTRA_INDEX_A": {"active_api": "get_code_list", "source_type": "EXTRA_INDEX_A"},
-    # "EXTRA_ETF": {"active_api": "get_code_list", "source_type": "EXTRA_ETF"},
-    # "EXTRA_KZZ": {"active_api": "get_code_list", "source_type": "EXTRA_KZZ"},
-    # "EXTRA_HKT": {"active_api": "get_code_list", "source_type": "EXTRA_HKT"},
-    # "EXTRA_FUTURE": {"active_api": "get_future_code_list", "source_type": "EXTRA_FUTURE"},
-    # "EXTRA_ETF_OP": {"active_api": "get_option_code_list", "source_type": "EXTRA_ETF_OP"},
 }
 
 _FAULT_HANDLER_FILE = None

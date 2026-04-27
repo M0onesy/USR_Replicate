@@ -1,7 +1,11 @@
-api_AmazingData_professional.cp310-win_amd64.pyd
 .idea/
 __pycache__/
-/Data/EXTRA_STOCK_A/
+/Data/kline_Data/
+/Data/fact_Data/
+/Data/proc_Data/
+/Result/
 .hf_cache/
 replication_output*/
 replay_pid*
+test/
+otherFile/

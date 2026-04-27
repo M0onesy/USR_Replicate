@@ -459,3 +459,69 @@ python Code/convert_bz2_to_csv.py Data/EXTRA_STOCK_A/000001.SZ
 - 价格当前未做复权处理，隔夜异常中可能混入除权除息等公司行为影响。
 - 脚本中为外部因子和测试资产预留了接口，但不会自动下载任何外部因子、Fama-French 因子或测试资产数据。
 - `getApidb.py` 依赖外部专有数据源，不是一个任何机器都能直接运行的数据下载脚本。
+
+---
+
+## 后复权预处理工作流
+
+当前推荐的数据流已经拆成两步：先预处理，再复现论文结果。原始 5 分钟 K 线放在 `Data/kline_Data/EXTRA_STOCK_A/`，后复权因子放在 `Data/fact_Data/backward_factor.csv`，预处理产物写入 `Data/proc_Data/pelger_cn_adjusted/`，论文结果写入 `Result/pelger_cn_adjusted/`。
+
+### 1. 生成后复权预处理数据
+
+```bash
+python Code/preprocess_cn_data.py --raw-root Data/kline_Data/EXTRA_STOCK_A --factor-path Data/fact_Data/backward_factor.csv --proc-root Data/proc_Data/pelger_cn_adjusted
+```
+
+常用 smoke run：
+
+```bash
+python Code/preprocess_cn_data.py --years 2016 --max-stocks 10 --refresh
+```
+
+预处理脚本会逐股票读取 `data.bz2`，按交易日匹配 `backward_factor.csv`，用 `adjusted_ohlc = raw_ohlc * backward_factor` 生成后复权 OHLC，再构造日内、隔夜和日度收益。默认不保存全量逐 bar 明细，避免磁盘占用膨胀。
+
+### 2. 使用预处理数据复现论文
+
+```bash
+python Code/allcode_Need.py --proc-root Data/proc_Data/pelger_cn_adjusted --output-root Result/pelger_cn_adjusted
+```
+
+常用 smoke run：
+
+```bash
+python Code/allcode_Need.py --proc-root Data/proc_Data/pelger_cn_adjusted --output-root Result/pelger_cn_adjusted_smoke --years 2016 --max-stocks 10 --no-robustness --no-plots
+```
+
+如需回退到旧的原始 `.bz2` 数据热路径，可显式添加 `--use-raw-data --data-root Data/kline_Data/EXTRA_STOCK_A`。正常复现不建议这样做，因为会重复解压和清洗原始数据。
+
+### 3. 预处理产物结构
+
+`Data/proc_Data/pelger_cn_adjusted/` 中的主要文件包括：
+
+- `manifest.json`：预处理版本、输入路径、复权因子签名、样本区间和面板清单。
+- `metadata/universe.csv`：复权后样本覆盖率和异常诊断摘要。
+- `metadata/corp_action_risk_after_adjustment.csv`：复权前后隔夜异常收益对照。
+- `symbol_returns/<symbol>.npz`：逐股票日内、隔夜和日度收益数组。
+- `panels/strict_balanced/full.npz`：严格平衡主样本面板。
+- `panels/near_balanced_99/year_YYYY.npz`：年度 99% 覆盖非平衡样本面板。
+
+### 4. 结果目录结构
+
+`Result/pelger_cn_adjusted/` 按类型拆分输出：
+
+- `tables/Table_01_sample_summary.csv`：主样本摘要。
+- `tables/Table_02_jump_stats.csv`：跳跃分解统计。
+- `tables/Table_03_factor_counts.csv`：高频、连续、跳跃因子个数。
+- `tables/Table_04_sharpes.csv`：日内、隔夜、日度 Sharpe。
+- `tables/Table_05_rolling_gc.csv`：滚动 generalized correlation。
+- `tables/Table_06_rolling_explained_variation.csv`：滚动解释度。
+- `tables/Table_07_robustness_yearly_gc.csv`：年度 99% 覆盖样本稳健性。
+- `figures/Figure_01_rolling_gc.png`：滚动因子空间稳定性图。
+- `figures/Figure_02_rolling_explained_variation.png`：滚动解释度图。
+- `diagnostics/`：样本清单、主摘要、复权后异常隔夜诊断等辅助文件。
+
+### 5. 注意事项
+
+- 默认复权口径是后复权因子 `backward_factor.csv`；`adj_factor.csv` 当前只保留为后续校验扩展。
+- `Data/fact_Data/`、`Data/proc_Data/` 和 `Result/` 属于本地大数据或生成结果，已加入 `.gitignore`。
+- 如果替换了原始 K 线或复权因子，请用 `--refresh` 重新运行 `Code/preprocess_cn_data.py`。
