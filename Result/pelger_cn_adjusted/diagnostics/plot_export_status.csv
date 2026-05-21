@@ -1,0 +1,16 @@
+﻿figure_id,title,file_path,status,data_source,notes
+Figure_01,"Figure 1. Perturbed Eigenvalue Ratios, Balanced Panel",D:\Courses\机器学习\Reposit\Result\pelger_cn_adjusted\figures\Figure_01_perturbed_er_balanced.png,generated,Table_09_paper_style_factor_count_diagnostics,
+Figure_02,Figure 2. Perturbed ER Diagnostics,D:\Courses\机器学习\Reposit\Result\pelger_cn_adjusted\figures\Figure_02_perturbed_er_diagnostics.png,generated,Table_09_paper_style_factor_count_diagnostics,
+Figure_03,Figure 3. Proxy Factor Portfolio Weights,D:\Courses\机器学习\Reposit\Result\pelger_cn_adjusted\figures\Figure_03_proxy_factor_weights.png,generated,proxy_weights,
+Figure_04,Figure 4. Continuous PCA Factor Weights,D:\Courses\机器学习\Reposit\Result\pelger_cn_adjusted\figures\Figure_04_continuous_pca_weights.png,generated,pca_weights,
+Figure_05,Figure 5. Monthly PCA Factor Weights,D:\Courses\机器学习\Reposit\Result\pelger_cn_adjusted\figures\Figure_05_monthly_pca_weights.png,generated,monthly_pca_weights,
+Figure_06,Figure 6. Time Variation in Loadings,D:\Courses\机器学习\Reposit\Result\pelger_cn_adjusted\figures\Figure_06_time_variation_loadings_gc.png,generated,Table_05_rolling_gc,
+Figure_07,Figure 7. Locally Estimated Continuous Factors,D:\Courses\机器学习\Reposit\Result\pelger_cn_adjusted\figures\Figure_07_local_continuous_factor_gc.png,generated,Table_05_rolling_gc,
+Figure_08,Figure 8. Time-Varying Portfolio Weights,D:\Courses\机器学习\Reposit\Result\pelger_cn_adjusted\figures\Figure_08_time_varying_portfolio_weights.png,generated,rolling_weight_summary,
+Figure_09,Figure 9. Time-Varying Explained Variation,D:\Courses\机器学习\Reposit\Result\pelger_cn_adjusted\figures\Figure_09_time_varying_explained_variation.png,generated,Table_06_rolling_explained_variation,
+Figure_10,Figure 10. Factor-Structure Decomposition,D:\Courses\机器学习\Reposit\Result\pelger_cn_adjusted\figures\Figure_10_factor_structure_decomposition.png,generated,rolling_gc_and_explained_variation,
+Figure_11,Figure 11. Continuous Factor-Structure Decomposition,D:\Courses\机器学习\Reposit\Result\pelger_cn_adjusted\figures\Figure_11_continuous_factor_structure_decomposition.png,generated,rolling_gc,
+Figure_12,Figure 12. Expected Intraday and Overnight Returns,D:\Courses\机器学习\Reposit\Result\pelger_cn_adjusted\figures\Figure_12_expected_intraday_overnight_returns.png,generated,factor_return_summary,
+Figure_13,Figure 13. Cumulative Factor Returns,D:\Courses\机器学习\Reposit\Result\pelger_cn_adjusted\figures\Figure_13_cumulative_factor_returns.png,generated,cumulative_factor_returns,
+Figure_14,Figure 14. Asset Pricing of Industry Portfolios,D:\Courses\机器学习\Reposit\Result\pelger_cn_adjusted\figures\Figure_14_asset_pricing_industry_portfolios.png,placeholder,external_test_assets,External data required: industry portfolio returns
+Figure_15,Figure 15. Asset Pricing of Size- and Value-Sorted Portfolios,D:\Courses\机器学习\Reposit\Result\pelger_cn_adjusted\figures\Figure_15_asset_pricing_size_value_portfolios.png,placeholder,external_test_assets,External data required: size/value portfolio returns

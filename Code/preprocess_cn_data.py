@@ -1,8 +1,8 @@
 """Preprocess China A-share 5-minute K-line data for the Pelger replication.
 
 This script is the only project stage that reads raw `data.bz2` files. It cleans
-raw bars, applies `backward_factor.csv`, constructs intraday/overnight/daily
-returns, and writes fast processed panels for `allcode_Need.py`.
+raw bars, applies `backward_factor.csv`, and writes fixed-return panels for
+`allcode_Need.py`.
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import numpy as np
 import pandas as pd
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
@@ -23,7 +24,8 @@ DEFAULT_RAW_ROOT = REPO_ROOT / "Data" / "kline_Data" / "EXTRA_STOCK_A"
 DEFAULT_FACTOR_PATH = REPO_ROOT / "Data" / "fact_Data" / "backward_factor.csv"
 DEFAULT_PROC_ROOT = REPO_ROOT / "Data" / "proc_Data" / "pelger_cn_adjusted"
 DEFAULT_PREPROCESS_CACHE_ROOT = REPO_ROOT / ".hf_cache" / "pelger_cn_preprocess"
-PREPROCESS_VERSION = "v2"
+PREPROCESS_VERSION = "v3"
+PANEL_RETURN_SCHEME = "daily_intra_night_total_plus_full_5min_v1"
 
 REQUIRED_RAW_COLUMNS = ["code", "kline_time", "open", "high", "low", "close", "volume", "amount"]
 CN_5MIN_BAR_TIMES = [
@@ -41,7 +43,6 @@ CN_5MIN_BAR_CODES = np.array(
     dtype=np.int32,
 )
 STRICT_BALANCED_SAMPLE = "strict_balanced"
-NEAR_BALANCED_99_SAMPLE = "near_balanced_99"
 SUSPICIOUS_OVERNIGHT_THRESHOLDS = (0.12, 0.20)
 
 
@@ -217,6 +218,8 @@ def _symbol_meta_path(proc_root: Path, symbol: str) -> Path:
 
 def _panel_paths(proc_root: Path, sample_mode: str, panel_name: str) -> Tuple[Path, Path]:
     """面板数组和面板元数据保存位置。"""
+    if sample_mode != STRICT_BALANCED_SAMPLE:
+        raise ValueError("当前数据政策仅保留 strict_balanced 面板")
     panel_dir = proc_root / "panels" / sample_mode
     return panel_dir / panel_name, panel_dir / f"{panel_name}.json"
 
@@ -315,14 +318,13 @@ def _build_adjusted_symbol_returns(
     factor_by_date: pd.Series,
     return_mode: str = "open_close",
 ) -> Tuple[Dict[str, Any], Dict[str, np.ndarray]]:
-    """读取单只股票 K 线，生成后复权后的日内、隔夜和日度收益。"""
-    if return_mode not in {"open_close", "close_close"}:
-        raise ValueError(f"未知 return_mode: {return_mode}")
+    """读取单只股票 K 线，生成后复权后的固定收益数组。"""
 
     df, clean_stats = _load_cn_symbol_frame(file_path)
     factor_lookup = factor_by_date.to_dict()
 
-    valid_intraday: List[np.ndarray] = []
+    valid_intraday: List[float] = []
+    valid_full_5min: List[np.ndarray] = []
     overnight_values: List[float] = []
     raw_overnight_values: List[float] = []
     daily_values: List[float] = []
@@ -384,12 +386,14 @@ def _build_adjusted_symbol_returns(
             adjusted_open = open_raw[start:end] * factor_float
             adjusted_close = close_raw[start:end] * factor_float
 
-            if return_mode == "open_close":
-                intraday = np.log(adjusted_close / adjusted_open)
+            intraday = float(np.log(adjusted_close[-1] / adjusted_open[0]))
+
+            full_5min = np.empty(len(adjusted_close), dtype=np.float64)
+            if previous_adjusted_close is None:
+                full_5min[0] = np.log(adjusted_close[0] / adjusted_open[0])
             else:
-                intraday = np.empty(len(adjusted_close), dtype=np.float64)
-                intraday[0] = np.log(adjusted_close[0] / adjusted_open[0])
-                intraday[1:] = np.log(adjusted_close[1:] / adjusted_close[:-1])
+                full_5min[0] = np.log(adjusted_close[0] / previous_adjusted_close)
+            full_5min[1:] = np.log(adjusted_close[1:] / adjusted_close[:-1])
 
             day_open = float(adjusted_open[0])
             day_close = float(adjusted_close[-1])
@@ -402,9 +406,10 @@ def _build_adjusted_symbol_returns(
             valid_days_by_year[year] = valid_days_by_year.get(year, 0) + 1
             factor_values.append(factor_float)
             valid_intraday.append(intraday)
+            valid_full_5min.append(full_5min)
             overnight_values.append(overnight)
             raw_overnight_values.append(raw_overnight)
-            daily_values.append(float(intraday.sum() + overnight))
+            daily_values.append(float(intraday + overnight))
             day_open_values.append(day_open)
             day_close_values.append(day_close)
             raw_day_open_values.append(raw_day_open)
@@ -412,7 +417,8 @@ def _build_adjusted_symbol_returns(
             previous_adjusted_close = day_close
             previous_raw_close = raw_day_close
 
-    intraday_array = np.vstack(valid_intraday).astype(np.float64, copy=False) if valid_intraday else np.zeros((0, len(CN_5MIN_BAR_TIMES)), dtype=np.float64)
+    intraday_array = np.asarray(valid_intraday, dtype=np.float64)
+    full_5min_array = np.vstack(valid_full_5min).astype(np.float64, copy=False) if valid_full_5min else np.zeros((0, len(CN_5MIN_BAR_TIMES)), dtype=np.float64)
     overnight_array = np.asarray(overnight_values, dtype=np.float64)
     raw_overnight_array = np.asarray(raw_overnight_values, dtype=np.float64)
     daily_array = np.asarray(daily_values, dtype=np.float64)
@@ -424,7 +430,8 @@ def _build_adjusted_symbol_returns(
         "version": PREPROCESS_VERSION,
         "symbol": file_path.parent.name,
         "source_file": str(file_path.resolve()),
-        "return_mode": return_mode,
+        "panel_return_scheme": PANEL_RETURN_SCHEME,
+        "requested_return_mode": return_mode,
         "adjustment": "backward",
         "raw_rows": int(clean_stats["raw_rows"]),
         "clean_rows": int(len(df)),
@@ -450,6 +457,7 @@ def _build_adjusted_symbol_returns(
     arrays = {
         "date_codes": date_codes,
         "intraday_returns": intraday_array,
+        "full_5min_returns": full_5min_array,
         "overnight_returns": overnight_array,
         "raw_overnight_returns": raw_overnight_array,
         "daily_returns": daily_array,
@@ -483,7 +491,6 @@ def _summarize_processed_universe(universe: pd.DataFrame, proc_root: Path) -> Tu
         universe[f"observed_days_{year}"] = universe["observed_days_by_year"].apply(lambda item: int(item.get(year, item.get(str(year), 0))))
         universe[f"coverage_{year}"] = universe[f"valid_days_{year}"] / float(len(year_dates))
         universe[f"is_strict_{year}"] = universe[f"valid_days_{year}"].eq(len(year_dates)) & universe[f"observed_days_{year}"].eq(len(year_dates))
-        universe[f"is_near_99_{year}"] = universe[f"coverage_{year}"].ge(0.99) & universe[f"observed_days_{year}"].eq(universe[f"valid_days_{year}"])
 
     calendar_days = len(global_valid_dates)
     universe["missing_days"] = calendar_days - universe["n_valid_days"]
@@ -494,7 +501,6 @@ def _summarize_processed_universe(universe: pd.DataFrame, proc_root: Path) -> Tu
         & universe["first_valid_date"].eq(global_valid_dates[0])
         & universe["last_valid_date"].eq(global_valid_dates[-1])
     )
-    universe["is_near_balanced_99"] = universe["coverage_ratio"].ge(0.99) & universe["n_invalid_days"].eq(0)
 
     summary = {
         "data_root": str(proc_root.resolve()),
@@ -509,9 +515,10 @@ def _summarize_processed_universe(universe: pd.DataFrame, proc_root: Path) -> Tu
         "calendar_days_by_year": {int(k): int(v) for k, v in calendar_days_by_year.items()},
         "global_dates": global_valid_dates,
         "global_dates_by_year": global_dates_by_year,
-        "strict_balanced_symbols": int(universe["is_strict_balanced"].sum()),
-        "near_balanced_99_symbols": int(universe["is_near_balanced_99"].sum()),
+        "strict_balanced_symbols_full": int(universe["is_strict_balanced"].sum()),
+        "strict_balanced_symbols_by_year": {int(year): int(universe[f"is_strict_{year}"].sum()) for year in global_dates_by_year},
     }
+    summary["strict_balanced_symbols"] = int(summary["strict_balanced_symbols_full"])
     universe.attrs["summary"] = summary
     return universe, summary
 
@@ -540,28 +547,22 @@ def _select_sample_rows(
     universe: pd.DataFrame,
     sample_mode: str,
     years: Optional[Sequence[int]] = None,
-    coverage_threshold: float = 0.99,
     max_stocks: Optional[int] = None,
 ) -> pd.DataFrame:
-    """Select strict-balanced or 99%-coverage symbols from a summarized universe."""
+    """Select strict-balanced symbols from a summarized universe."""
     if "summary" not in universe.attrs:
         raise ValueError("universe.attrs['summary'] is required before sample selection")
     summary = universe.attrs["summary"]
     years = _normalize_years(years)
-    if sample_mode not in {STRICT_BALANCED_SAMPLE, NEAR_BALANCED_99_SAMPLE}:
+    if sample_mode != STRICT_BALANCED_SAMPLE:
         raise ValueError(f"Unknown sample_mode: {sample_mode}")
 
     if years is None:
-        mask = universe["is_strict_balanced"] if sample_mode == STRICT_BALANCED_SAMPLE else universe["is_near_balanced_99"]
+        mask = universe["is_strict_balanced"]
     else:
-        days_by_year = {int(k): int(v) for k, v in summary["calendar_days_by_year"].items()}
-        total_days = int(sum(days_by_year[int(year)] for year in years))
-        valid_sum = sum(universe[f"valid_days_{int(year)}"] for year in years)
-        observed_sum = sum(universe[f"observed_days_{int(year)}"] for year in years)
-        if sample_mode == STRICT_BALANCED_SAMPLE:
-            mask = (valid_sum == total_days) & (observed_sum == total_days)
-        else:
-            mask = (valid_sum / float(total_days) >= coverage_threshold) & (observed_sum == valid_sum)
+        mask = universe[f"is_strict_{int(years[0])}"].copy()
+        for year in years[1:]:
+            mask &= universe[f"is_strict_{int(year)}"]
 
     selected = universe.loc[mask].sort_values("symbol").copy()
     if max_stocks is not None:
@@ -637,7 +638,7 @@ def _align_symbol_to_panel(
     symbol: str,
     date_codes: np.ndarray,
     allow_missing: bool,
-) -> Tuple[str, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """按目标日期一次性对齐单只股票收益，供串行和线程面板组装共用。"""
     arrays = _load_symbol_arrays(proc_root, symbol)
     source_codes = arrays["date_codes"].astype(np.int32, copy=False)
@@ -648,9 +649,10 @@ def _align_symbol_to_panel(
         bar_count = len(CN_5MIN_BAR_TIMES)
         return (
             symbol,
+            np.full(day_count, np.nan, dtype=np.float64),
+            np.full(day_count, np.nan, dtype=np.float64),
+            np.full(day_count, np.nan, dtype=np.float64),
             np.full(day_count * bar_count, np.nan, dtype=np.float64),
-            np.full(day_count, np.nan, dtype=np.float64),
-            np.full(day_count, np.nan, dtype=np.float64),
         )
     source_pos = np.searchsorted(source_codes, date_codes)
     matched = (source_pos < len(source_codes)) & (source_codes[source_pos.clip(max=max(len(source_codes) - 1, 0))] == date_codes)
@@ -661,16 +663,22 @@ def _align_symbol_to_panel(
     day_count = len(date_codes)
     bar_count = len(CN_5MIN_BAR_TIMES)
     fill_value = np.nan if allow_missing else 0.0
-    intra_col = np.full((day_count, bar_count), fill_value, dtype=np.float64)
+    intra_col = np.full(day_count, fill_value, dtype=np.float64)
+    full_5min_col = np.full((day_count, bar_count), fill_value, dtype=np.float64)
     night_col = np.full(day_count, fill_value, dtype=np.float64)
     daily_col = np.full(day_count, fill_value, dtype=np.float64)
     if matched.any():
         target_idx = np.where(matched)[0]
         source_idx = source_pos[matched]
-        intra_col[target_idx, :] = arrays["intraday_returns"][source_idx]
+        intra_col[target_idx] = arrays["intraday_returns"][source_idx]
+        if "full_5min_returns" not in arrays:
+            raise KeyError(
+                f"{symbol} 缺少 full_5min_returns，请重新运行 preprocess_cn_data.py --refresh 生成新版逐股票缓存"
+            )
+        full_5min_col[target_idx, :] = arrays["full_5min_returns"][source_idx]
         night_col[target_idx] = arrays["overnight_returns"][source_idx]
         daily_col[target_idx] = arrays["daily_returns"][source_idx]
-    return symbol, intra_col.reshape(day_count * bar_count), night_col, daily_col
+    return symbol, intra_col, night_col, daily_col, full_5min_col.reshape(day_count * bar_count)
 
 
 def _write_panel(
@@ -691,7 +699,8 @@ def _write_panel(
     stock_count = len(tickers)
 
     fill_value = np.nan if allow_missing else 0.0
-    R_intra = np.full((day_count * bar_count, stock_count), fill_value, dtype=np.float64)
+    R_intra = np.full((day_count, stock_count), fill_value, dtype=np.float64)
+    R_5min_full = np.full((day_count * bar_count, stock_count), fill_value, dtype=np.float64)
     R_night = np.full((day_count, stock_count), fill_value, dtype=np.float64)
     R_daily = np.full((day_count, stock_count), fill_value, dtype=np.float64)
 
@@ -711,17 +720,22 @@ def _write_panel(
             for future in as_completed(futures):
                 aligned_columns.append(future.result())
 
-    column_lookup = {symbol: (intra, night, daily) for symbol, intra, night, daily in aligned_columns}
+    column_lookup = {
+        symbol: (intra, night, daily, full_5min)
+        for symbol, intra, night, daily, full_5min in aligned_columns
+    }
     for col_idx, symbol in enumerate(tickers):
-        intra_col, night_col, daily_col = column_lookup[symbol]
+        intra_col, night_col, daily_col, full_5min_col = column_lookup[symbol]
         R_intra[:, col_idx] = intra_col
+        R_5min_full[:, col_idx] = full_5min_col
         R_night[:, col_idx] = night_col
         R_daily[:, col_idx] = daily_col
 
     day_ids = np.repeat(np.arange(day_count), bar_count).astype(np.int32)
     sample_report = {
         "sample_mode": sample_mode,
-        "return_mode": return_mode,
+        "panel_return_scheme": PANEL_RETURN_SCHEME,
+        "requested_return_mode": return_mode,
         "panel_name": panel_name,
         "adjustment": "backward",
         "n_symbols_selected": int(stock_count),
@@ -730,7 +744,7 @@ def _write_panel(
         "selected_calendar_start": dates[0] if dates else None,
         "selected_calendar_end": dates[-1] if dates else None,
         "target_symbols": tickers,
-        "contains_nan": bool(np.isnan(R_intra).any()),
+        "contains_nan": bool(np.isnan(R_intra).any() or np.isnan(R_5min_full).any()),
         "panel_workers": int(panel_workers),
     }
 
@@ -738,18 +752,21 @@ def _write_panel(
     panel_array_dir.mkdir(parents=True, exist_ok=True)
     array_files = {
         "R_intra": str((panel_array_dir / "R_intra.npy").relative_to(proc_root)),
+        "R_5min_full": str((panel_array_dir / "R_5min_full.npy").relative_to(proc_root)),
         "R_night": str((panel_array_dir / "R_night.npy").relative_to(proc_root)),
         "R_daily": str((panel_array_dir / "R_daily.npy").relative_to(proc_root)),
         "day_ids": str((panel_array_dir / "day_ids.npy").relative_to(proc_root)),
     }
     np.save(panel_array_dir / "R_intra.npy", R_intra, allow_pickle=False)
+    np.save(panel_array_dir / "R_5min_full.npy", R_5min_full, allow_pickle=False)
     np.save(panel_array_dir / "R_night.npy", R_night, allow_pickle=False)
     np.save(panel_array_dir / "R_daily.npy", R_daily, allow_pickle=False)
     np.save(panel_array_dir / "day_ids.npy", day_ids, allow_pickle=False)
     panel_meta = {
         "version": PREPROCESS_VERSION,
         "sample_mode": sample_mode,
-        "return_mode": return_mode,
+        "panel_return_scheme": PANEL_RETURN_SCHEME,
+        "requested_return_mode": return_mode,
         "panel_name": panel_name,
         "dates": list(dates),
         "tickers": tickers,
@@ -798,12 +815,7 @@ def _select_preprocess_symbols(universe: pd.DataFrame, years: Optional[Sequence[
     if max_stocks is None:
         return universe.sort_values("symbol").copy()
 
-    strict = _select_sample_rows(universe, STRICT_BALANCED_SAMPLE, years=years, max_stocks=max_stocks)
-    near_parts = [_select_sample_rows(universe, NEAR_BALANCED_99_SAMPLE, years=[year], max_stocks=max_stocks) for year in (_normalize_years(years) or sorted(universe.attrs["summary"]["calendar_days_by_year"]))]
-    selected_symbols = set(strict["symbol"])
-    for part in near_parts:
-        selected_symbols.update(part["symbol"])
-    return universe.loc[universe["symbol"].isin(selected_symbols)].sort_values("symbol").copy()
+    return _select_sample_rows(universe, STRICT_BALANCED_SAMPLE, years=years, max_stocks=max_stocks)
 
 
 def preprocess_cn_data(
@@ -841,8 +853,8 @@ def preprocess_cn_data(
         "factor": _file_signature(factor_path),
         "years": years,
         "max_stocks": max_stocks,
-        "return_mode": return_mode,
         "adjustment": "backward",
+        "panel_return_scheme": PANEL_RETURN_SCHEME,
         "compress_symbol_returns": bool(compress_symbol_returns),
     }
     input_hash = _signature_hash(input_signature)
@@ -933,14 +945,6 @@ def preprocess_cn_data(
             if not strict_year.empty:
                 panel_outputs.append(_write_panel(proc_root, STRICT_BALANCED_SAMPLE, f"year_{year}", strict_year, year_dates, allow_missing=False, return_mode=return_mode, panel_workers=panel_workers))
 
-    near_full = _select_sample_rows(processed_universe, NEAR_BALANCED_99_SAMPLE, years=None)
-    if not near_full.empty:
-        panel_outputs.append(_write_panel(proc_root, NEAR_BALANCED_99_SAMPLE, "full", near_full, processed_summary["global_dates"], allow_missing=True, return_mode=return_mode, panel_workers=panel_workers))
-    for year, year_dates in processed_summary["global_dates_by_year"].items():
-        near_year = _select_sample_rows(processed_universe, NEAR_BALANCED_99_SAMPLE, years=[int(year)])
-        if not near_year.empty:
-            panel_outputs.append(_write_panel(proc_root, NEAR_BALANCED_99_SAMPLE, f"year_{year}", near_year, year_dates, allow_missing=True, return_mode=return_mode, panel_workers=panel_workers))
-
     manifest = {
         "version": PREPROCESS_VERSION,
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -950,7 +954,8 @@ def preprocess_cn_data(
         "factor_path": str(factor_path),
         "proc_root": str(proc_root),
         "adjustment": "backward",
-        "return_mode": return_mode,
+        "panel_return_scheme": PANEL_RETURN_SCHEME,
+        "requested_return_mode": return_mode,
         "years": years,
         "max_stocks": max_stocks,
         "raw_symbol_count": int(raw_symbol_count),
@@ -960,7 +965,8 @@ def preprocess_cn_data(
         "panel_workers": int(panel_workers),
         "symbol_return_storage": "npz_compressed" if compress_symbol_returns else "npz_uncompressed",
         "strict_balanced_symbols": int(processed_summary["strict_balanced_symbols"]),
-        "near_balanced_99_symbols": int(processed_summary["near_balanced_99_symbols"]),
+        "strict_balanced_symbols_full": int(processed_summary["strict_balanced_symbols_full"]),
+        "strict_balanced_symbols_by_year": processed_summary["strict_balanced_symbols_by_year"],
         "summary": processed_summary,
         "panel_outputs": panel_outputs,
         "metadata_files": {
@@ -981,7 +987,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--factor-path", default=str(DEFAULT_FACTOR_PATH), help="后复权因子 CSV，默认 Data/fact_Data/backward_factor.csv")
     parser.add_argument("--proc-root", default=str(DEFAULT_PROC_ROOT), help="预处理输出目录")
     parser.add_argument("--adjustment", default="backward", choices=["backward"], help="当前默认且唯一实现：后复权")
-    parser.add_argument("--return-mode", default="open_close", choices=["open_close", "close_close"], help="日内收益构造口径")
+    parser.add_argument("--return-mode", default="open_close", choices=["open_close", "close_close"], help="已弃用，仅保留兼容，不影响收益口径")
     parser.add_argument("--years", nargs="+", type=int, help="只预处理指定年份")
     parser.add_argument("--max-stocks", type=int, help="smoke run 用：限制每类样本股票数量")
     parser.add_argument("--refresh", action="store_true", help="忽略已有 manifest，强制重建")

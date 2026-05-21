@@ -1,0 +1,2 @@
+﻿adjustment,sample_mode,panel_return_scheme,requested_return_mode,years,n_symbols_selected,n_days_selected,bars_per_day,selected_calendar_start,selected_calendar_end,universe_total_symbols,strict_balanced_symbols,global_start,global_end
+backward,strict_balanced,daily_intra_night_total_plus_full_5min_v1,open_close,,115,3157,48,2013-01-04,2025-12-31,5465,115,2013-01-04,2025-12-31

@@ -3,9 +3,9 @@ __pycache__/
 /Data/kline_Data/
 /Data/fact_Data/
 /Data/proc_Data/
-/Result/
 .hf_cache/
 replication_output*/
 replay_pid*
 test/
 otherFile/
+/Result/pelger_cn_adjusted/diagnostics/universe_scan.csv

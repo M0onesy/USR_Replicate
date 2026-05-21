@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from scipy.linalg import eigh
 
 
+
 CN_5MIN_BAR_TIMES = [
     "09:30:00", "09:35:00", "09:40:00", "09:45:00", "09:50:00", "09:55:00",
     "10:00:00", "10:05:00", "10:10:00", "10:15:00", "10:20:00", "10:25:00",
@@ -38,7 +39,7 @@ CN_5MIN_BAR_CODES = np.array(
 )
 
 STRICT_BALANCED_SAMPLE = "strict_balanced"
-NEAR_BALANCED_99_SAMPLE = "near_balanced_99"
+PANEL_RETURN_SCHEME = "daily_intra_night_total_plus_full_5min_v1"
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PROC_ROOT = REPO_ROOT / "Data" / "proc_Data" / "pelger_cn_adjusted"
@@ -121,9 +122,11 @@ class HFPanel:
 
     字段:
         R_intra:
-            shape (M_total, N), 所有日内 5 分钟收益拼接后的矩阵.
+            shape (D, N), 日内总收益.
         R_night:
             shape (D, N), 日度隔夜收益.
+        R_5min_full:
+            shape (M_total, N), 以收盘价链构造的全量 5 分钟对数收益.
         day_ids:
             shape (M_total,), 每个日内观测所属交易日索引.
         tickers:
@@ -135,6 +138,7 @@ class HFPanel:
     R_intra: np.ndarray
     R_night: np.ndarray
     day_ids: np.ndarray
+    R_5min_full: np.ndarray
     tickers: List[str]
     dates: List[pd.Timestamp]
     R_daily: Optional[np.ndarray] = None
@@ -143,12 +147,14 @@ class HFPanel:
     bar_times: Optional[List[str]] = None
     sample_report: Optional[Dict[str, Any]] = None
     sample_mode: str = "custom"
-    return_mode: str = "open_close"
+    panel_return_scheme: str = PANEL_RETURN_SCHEME
+    requested_return_mode: Optional[str] = None
 
     def __post_init__(self) -> None:
         self.R_intra = np.asarray(self.R_intra, dtype=float)
         self.R_night = np.asarray(self.R_night, dtype=float)
         self.day_ids = np.asarray(self.day_ids, dtype=int)
+        self.R_5min_full = np.asarray(self.R_5min_full, dtype=float)
         self.dates = [pd.Timestamp(date) for date in self.dates]
         self.tickers = [str(ticker) for ticker in self.tickers]
         if self.bar_times is not None:
@@ -156,21 +162,23 @@ class HFPanel:
 
         assert self.R_intra.ndim == 2, "R_intra 必须是 2D"
         assert self.R_night.ndim == 2, "R_night 必须是 2D"
-        assert self.R_night.shape[0] == len(self.dates), "R_night 行数必须等于交易日数"
+        assert self.R_5min_full.ndim == 2, "R_5min_full 必须是 2D"
+        assert self.R_intra.shape[0] == self.R_night.shape[0] == len(self.dates), "日频行数必须等于交易日数"
         assert self.R_intra.shape[1] == self.R_night.shape[1] == len(self.tickers), "股票维度不一致"
-        assert self.day_ids.shape[0] == self.R_intra.shape[0], "day_ids 长度错误"
+        assert self.R_5min_full.shape[1] == len(self.tickers), "R_5min_full 股票维度不一致"
+        assert self.day_ids.shape[0] == self.R_5min_full.shape[0], "day_ids 长度错误"
 
         if self.bar_times is not None and len(self.bar_times) > 0:
-            inferred = self.R_intra.shape[0] / max(len(self.dates), 1)
-            assert int(round(inferred)) == len(self.bar_times), "bar_times 与 R_intra 行数不一致"
+            inferred = self.R_5min_full.shape[0] / max(len(self.dates), 1)
+            assert int(round(inferred)) == len(self.bar_times), "bar_times 与 R_5min_full 行数不一致"
 
         if self.R_daily is None:
-            D, N = self.D, self.N
-            R_intra_day_sum = np.zeros((D, N))
-            np.add.at(R_intra_day_sum, self.day_ids, np.nan_to_num(self.R_intra, nan=0.0))
-            self.R_daily = R_intra_day_sum + self.R_night
+            self.R_daily = self.R_intra + self.R_night
         else:
             self.R_daily = np.asarray(self.R_daily, dtype=float)
+        assert self.R_daily.shape == self.R_intra.shape, "R_daily 形状必须是 (D, N)"
+        if not np.allclose(self.R_daily, self.R_intra + self.R_night, equal_nan=True, atol=1e-12):
+            raise ValueError("R_daily 必须等于 R_intra + R_night")
 
         if self.rf_intra is None:
             self.rf_intra = np.zeros(self.D)
@@ -194,7 +202,7 @@ class HFPanel:
     def M_per_day(self) -> int:
         if self.bar_times:
             return len(self.bar_times)
-        return int(self.R_intra.shape[0] / max(self.D, 1))
+        return int(self.R_5min_full.shape[0] / max(self.D, 1))
 
 
 def load_proc_universe(proc_root: str | Path = DEFAULT_PROC_ROOT) -> pd.DataFrame:
@@ -243,6 +251,8 @@ def summarize_cn_universe(universe: pd.DataFrame) -> Dict[str, Any]:
     return stats
 
 def _proc_panel_paths(proc_root: Path, sample_mode: str, panel_name: str) -> Tuple[Path, Path]:
+    if sample_mode != STRICT_BALANCED_SAMPLE:
+        raise ValueError("当前数据政策仅保留 strict_balanced 面板")
     panel_dir = proc_root / "panels" / sample_mode
     return panel_dir / f"{panel_name}.npz", panel_dir / f"{panel_name}.json"
 
@@ -268,6 +278,7 @@ def _subset_panel_columns(panel: HFPanel, max_stocks: Optional[int]) -> HFPanel:
         R_intra=panel.R_intra[:, keep],
         R_night=panel.R_night[:, keep],
         day_ids=panel.day_ids.copy(),
+        R_5min_full=panel.R_5min_full[:, keep],
         tickers=list(panel.tickers[keep]),
         dates=list(panel.dates),
         R_daily=panel.R_daily[:, keep],
@@ -276,7 +287,8 @@ def _subset_panel_columns(panel: HFPanel, max_stocks: Optional[int]) -> HFPanel:
         bar_times=list(panel.bar_times or []),
         sample_report=sample_report,
         sample_mode=panel.sample_mode,
-        return_mode=panel.return_mode,
+        panel_return_scheme=panel.panel_return_scheme,
+        requested_return_mode=panel.requested_return_mode,
     )
 
 
@@ -298,17 +310,37 @@ def _load_proc_panel_file(proc_root: Path, sample_mode: str, panel_name: str) ->
         arrays_raw = np.load(npz_path, allow_pickle=False)
         arrays = {name: arrays_raw[name] for name in arrays_raw.files}
 
+    tickers = list(meta["tickers"])
+    dates = [pd.Timestamp(date) for date in meta["dates"]]
+    bar_times = list(meta.get("bar_times", []))
+    if "R_5min_full" not in arrays:
+        raise ValueError(
+            f"旧版面板缺少 R_5min_full: {meta_path}. 请先重新运行 Code/preprocess_cn_data.py --refresh 重建 proc_Data。"
+        )
+    if arrays["R_intra"].ndim != 2 or arrays["R_night"].ndim != 2 or arrays["R_daily"].ndim != 2:
+        raise ValueError(f"检测到旧版面板结构: {meta_path}. 请重新运行 Code/preprocess_cn_data.py --refresh。")
+    if arrays["R_intra"].shape != arrays["R_night"].shape or arrays["R_daily"].shape != arrays["R_intra"].shape:
+        raise ValueError(f"面板日频收益形状不一致: {meta_path}. 请重新运行 Code/preprocess_cn_data.py --refresh。")
+    if arrays["R_intra"].shape[0] != len(dates):
+        raise ValueError(f"面板日频行数与交易日数不一致: {meta_path}. 请重新运行 Code/preprocess_cn_data.py --refresh。")
+    if arrays["R_5min_full"].shape[1] != len(tickers):
+        raise ValueError(f"R_5min_full 列数与股票数不一致: {meta_path}.")
+    if bar_times and arrays["R_5min_full"].shape[0] != len(dates) * len(bar_times):
+        raise ValueError(f"R_5min_full 行数与日历不一致: {meta_path}.")
+
     return HFPanel(
         R_intra=arrays["R_intra"],
         R_night=arrays["R_night"],
         day_ids=arrays["day_ids"],
-        tickers=list(meta["tickers"]),
-        dates=[pd.Timestamp(date) for date in meta["dates"]],
+        R_5min_full=arrays["R_5min_full"],
+        tickers=tickers,
+        dates=dates,
         R_daily=arrays["R_daily"],
-        bar_times=list(meta["bar_times"]),
+        bar_times=bar_times,
         sample_report=dict(meta.get("sample_report", {})),
         sample_mode=meta["sample_mode"],
-        return_mode=meta.get("return_mode", "open_close"),
+        panel_return_scheme=meta.get("panel_return_scheme", PANEL_RETURN_SCHEME),
+        requested_return_mode=meta.get("requested_return_mode"),
     )
 
 def load_proc_hf_panel(
@@ -320,6 +352,8 @@ def load_proc_hf_panel(
 ) -> HFPanel:
     """从 Data/proc_Data 中读取预处理好的 HFPanel。"""
     proc_root = _ensure_path(proc_root)
+    if sample_mode != STRICT_BALANCED_SAMPLE:
+        raise ValueError("当前数据政策仅保留 strict_balanced 面板")
     panel_name = _proc_panel_name(years)
     if panel_name is not None:
         try:
@@ -329,10 +363,12 @@ def load_proc_hf_panel(
     else:
         panel = subset_panel_by_years(_load_proc_panel_file(proc_root, sample_mode, "full"), _normalize_years(years) or [])
 
-    panel.return_mode = return_mode
+    panel.requested_return_mode = return_mode
     panel.sample_report = dict(panel.sample_report or {})
     panel.sample_report["proc_root"] = str(proc_root)
     panel.sample_report["years"] = _normalize_years(years)
+    panel.sample_report["panel_return_scheme"] = panel.panel_return_scheme
+    panel.sample_report["requested_return_mode"] = return_mode
     return _subset_panel_columns(panel, max_stocks)
 
 
@@ -360,9 +396,10 @@ def subset_panel_by_years(panel: HFPanel, years: Sequence[int]) -> HFPanel:
     sample_report["selected_calendar_end"] = panel.dates[selected_day_idx[-1]].strftime("%Y-%m-%d")
 
     return HFPanel(
-        R_intra=panel.R_intra[row_mask],
+        R_intra=panel.R_intra[selected_day_idx],
         R_night=panel.R_night[selected_day_idx],
         day_ids=new_day_ids,
+        R_5min_full=panel.R_5min_full[row_mask],
         tickers=list(panel.tickers),
         dates=[panel.dates[idx] for idx in selected_day_idx],
         R_daily=panel.R_daily[selected_day_idx],
@@ -371,7 +408,8 @@ def subset_panel_by_years(panel: HFPanel, years: Sequence[int]) -> HFPanel:
         bar_times=list(panel.bar_times or []),
         sample_report=sample_report,
         sample_mode=panel.sample_mode,
-        return_mode=panel.return_mode,
+        panel_return_scheme=panel.panel_return_scheme,
+        requested_return_mode=panel.requested_return_mode,
     )
 
 
@@ -422,7 +460,7 @@ def detect_jumps(
         R_cont, R_jump
     若输入包含 NaN, 输出会在缺失位置保留 NaN.
     """
-    R = panel.R_intra
+    R = panel.R_5min_full
     D, M, N = panel.D, panel.M_per_day, panel.N
     delta_M = 1.0 / M
 
@@ -536,9 +574,9 @@ def pca_factors_pairwise(
     psd_fix: bool = True,
 ) -> PCAResult:
     """
-    对含缺失值的非平衡样本做 pairwise-covariance PCA.
+    对含缺失值的矩阵做 pairwise-covariance PCA。
 
-    该实现主要用于年度 99% 覆盖样本的稳健性分析。
+    这是备用实现，当前 strict-balanced 主流程不依赖它。
     """
     R = np.asarray(R, dtype=float)
     M, N = R.shape
@@ -783,6 +821,7 @@ def tangency_portfolio(
 def intraday_overnight_sharpes(
     F_intra: np.ndarray,
     F_night: np.ndarray,
+    F_daily: Optional[np.ndarray] = None,
     rf_intra: Optional[np.ndarray] = None,
     rf_night: Optional[np.ndarray] = None,
     annualize: int = 252,
@@ -797,8 +836,8 @@ def intraday_overnight_sharpes(
 
     _, sr_intra = tangency_portfolio(F_intra, rf_intra)
     _, sr_night = tangency_portfolio(F_night, rf_night)
-    F_daily = F_intra + F_night
-    _, sr_daily = tangency_portfolio(F_daily, np.asarray(rf_intra) + np.asarray(rf_night))
+    F_daily_use = F_intra + F_night if F_daily is None else np.asarray(F_daily, dtype=float)
+    _, sr_daily = tangency_portfolio(F_daily_use, np.asarray(rf_intra) + np.asarray(rf_night))
 
     scale = np.sqrt(annualize)
     return {
@@ -844,7 +883,7 @@ def time_series_pricing(
 
 
 def aggregate_intraday_to_daily(F_hf: np.ndarray, day_ids: np.ndarray) -> np.ndarray:
-    """把高频因子收益聚合成日频收益."""
+    """把高频因子收益按交易日聚合成日频收益."""
     D = int(day_ids.max()) + 1
     K = F_hf.shape[1]
     out = np.zeros((D, K))
@@ -877,6 +916,7 @@ class PelgerPipeline:
 
     F_cont_daily_intra: Optional[np.ndarray] = None
     F_cont_daily_night: Optional[np.ndarray] = None
+    F_cont_daily_total: Optional[np.ndarray] = None
     sharpes: Dict[str, float] = field(default_factory=dict)
 
     def step1_decompose(self) -> None:
@@ -885,7 +925,7 @@ class PelgerPipeline:
 
     def step2_determine_K(self) -> None:
         N = self.panel.N
-        r_hf = pca_factors(self.panel.R_intra, K=1, use_corr=self.use_corr)
+        r_hf = pca_factors(self.panel.R_5min_full, K=1, use_corr=self.use_corr)
         r_cont = pca_factors(self.R_cont, K=1, use_corr=self.use_corr)
         r_jump = pca_factors(self.R_jump, K=1, use_corr=self.use_corr)
         self.K_hf_hat, _ = perturbed_eigenvalue_ratio(r_hf.eigvals, g_fn=self.g_fn, N=N, gamma=self.gamma, K_max=self.K_max)
@@ -897,21 +937,25 @@ class PelgerPipeline:
         self.K_jump_hat = max(1, self.K_jump_hat)
 
     def step3_extract_factors(self) -> None:
-        self.pca_hf = pca_factors(self.panel.R_intra, K=self.K_hf_hat, use_corr=self.use_corr)
+        self.pca_hf = pca_factors(self.panel.R_5min_full, K=self.K_hf_hat, use_corr=self.use_corr)
         self.pca_cont = pca_factors(self.R_cont, K=self.K_cont_hat, use_corr=self.use_corr)
         self.pca_jump = pca_factors(self.R_jump, K=self.K_jump_hat, use_corr=self.use_corr)
 
     def step4_asset_pricing(self) -> None:
         W = factor_portfolio_weights(self.pca_cont)
-        F_intra_hf = self.panel.R_intra @ W
-        F_intra_daily = aggregate_intraday_to_daily(F_intra_hf, self.panel.day_ids)
+        F_intra_daily = self.panel.R_intra @ W
         F_night_daily = self.panel.R_night @ W
+        F_daily_total = self.panel.R_daily @ W
+        if not np.allclose(F_daily_total, F_intra_daily + F_night_daily, equal_nan=True, atol=1e-12):
+            raise ValueError("Daily factor returns must equal intraday plus overnight returns")
 
         self.F_cont_daily_intra = F_intra_daily
         self.F_cont_daily_night = F_night_daily
+        self.F_cont_daily_total = F_daily_total
         self.sharpes = intraday_overnight_sharpes(
             F_intra=F_intra_daily,
             F_night=F_night_daily,
+            F_daily=F_daily_total,
             rf_intra=self.panel.rf_intra,
             rf_night=self.panel.rf_night,
         )
@@ -931,7 +975,9 @@ def print_pipeline_summary(pipe: PelgerPipeline) -> None:
     print("Pelger (2020) China A-share High-Frequency Replication")
     print("=" * 78)
     print(f" Sample mode   : {pipe.panel.sample_mode}")
-    print(f" Return mode   : {pipe.panel.return_mode}")
+    print(f" Panel scheme  : {pipe.panel.panel_return_scheme}")
+    if pipe.panel.requested_return_mode is not None:
+        print(f" Requested mode : {pipe.panel.requested_return_mode} (deprecated no-op)")
     print(f" N stocks      : {pipe.panel.N}")
     print(f" D days        : {pipe.panel.D}")
     print(f" M per day     : {pipe.panel.M_per_day}")
@@ -952,88 +998,6 @@ def print_pipeline_summary(pipe: PelgerPipeline) -> None:
         print(f"   {name:15s}: {value:.3f}")
     print("=" * 78)
 
-
-def _near_balanced_year_task(
-    proc_root: str,
-    year: int,
-    K_compare: int,
-    return_mode: str,
-    jump_a: float,
-    max_near_symbols: Optional[int],
-) -> Optional[Dict[str, Any]]:
-    """年度稳健性 worker：读取当年 strict/near 面板并返回 GC 行。"""
-    try:
-        strict_panel = load_proc_hf_panel(
-            proc_root=proc_root,
-            sample_mode=STRICT_BALANCED_SAMPLE,
-            years=[year],
-            return_mode=return_mode,
-        )
-        near_panel = load_proc_hf_panel(
-            proc_root=proc_root,
-            sample_mode=NEAR_BALANCED_99_SAMPLE,
-            years=[year],
-            return_mode=return_mode,
-            max_stocks=max_near_symbols,
-        )
-    except FileNotFoundError:
-        return None
-
-    R_cont_strict, _ = detect_jumps(strict_panel, a=jump_a)
-    R_cont_near, _ = detect_jumps(near_panel, a=jump_a)
-    pca_strict = pca_factors(R_cont_strict, K=K_compare, use_corr=True)
-    pca_near = pca_factors_pairwise(R_cont_near, K=K_compare, use_corr=True, psd_fix=True)
-    gc = generalized_correlations(pca_strict.F, pca_near.F)
-
-    row = {
-        "year": int(year),
-        "n_strict_symbols": int(strict_panel.N),
-        "n_near_symbols": int(near_panel.N),
-        "n_days": int(near_panel.D),
-    }
-    for idx, value in enumerate(gc, start=1):
-        row[f"gc_{idx}"] = float(value)
-    return row
-
-
-def run_near_balanced_robustness(
-    proc_root: str | Path,
-    universe: pd.DataFrame,
-    years: Optional[Sequence[int]],
-    K_compare: int,
-    return_mode: str = "open_close",
-    jump_a: float = 3.0,
-    max_near_symbols: Optional[int] = None,
-    workers: int = 1,
-) -> pd.DataFrame:
-    """Compare yearly 99%-coverage panels with the strict-balanced factor space."""
-    proc_root = _ensure_path(proc_root)
-    if "summary" not in universe.attrs:
-        universe = load_proc_universe(proc_root)
-    summary = universe.attrs["summary"]
-    years = _normalize_years(years) or sorted(int(year) for year in summary["calendar_days_by_year"])
-
-    rows: List[Dict[str, Any]] = []
-    workers = max(1, int(workers))
-    if workers == 1 or len(years) <= 1:
-        for year in years:
-            row = _near_balanced_year_task(str(proc_root), int(year), K_compare, return_mode, jump_a, max_near_symbols)
-            if row is not None:
-                rows.append(row)
-    else:
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {
-                executor.submit(_near_balanced_year_task, str(proc_root), int(year), K_compare, return_mode, jump_a, max_near_symbols): int(year)
-                for year in years
-            }
-            for future in as_completed(futures):
-                row = future.result()
-                if row is not None:
-                    rows.append(row)
-
-    if not rows:
-        return pd.DataFrame(columns=["year", "n_strict_symbols", "n_near_symbols", "n_days"])
-    return pd.DataFrame(rows).sort_values("year").reset_index(drop=True)
 
 def load_external_factor_csv(
     path: str | Path,
@@ -1169,7 +1133,7 @@ def build_paper_factor_counts(
         year_panel = subset_panel_by_years(panel, [year])
         R_cont, R_jump = detect_jumps(year_panel, a=jump_a)
         series = {
-            "hf": pca_factors(year_panel.R_intra, K=1, use_corr=True).eigvals,
+            "hf": pca_factors(year_panel.R_5min_full, K=1, use_corr=True).eigvals,
             "continuous": pca_factors(R_cont, K=1, use_corr=True).eigvals,
             "jump": pca_factors(R_jump, K=1, use_corr=True).eigvals,
         }
@@ -1200,7 +1164,7 @@ def build_factor_sharpe_table(pipe: PelgerPipeline) -> pd.DataFrame:
     ]
     if pipe.F_cont_daily_intra is not None and pipe.F_cont_daily_night is not None:
         scale = np.sqrt(252)
-        F_daily = pipe.F_cont_daily_intra + pipe.F_cont_daily_night
+        F_daily = pipe.F_cont_daily_total if pipe.F_cont_daily_total is not None else pipe.F_cont_daily_intra + pipe.F_cont_daily_night
         for idx in range(pipe.F_cont_daily_intra.shape[1]):
             rows.append({
                 "portfolio": f"{idx + 1}. Continuous PCA Factor",
@@ -1215,12 +1179,12 @@ def build_replication_coverage_report() -> pd.DataFrame:
     """列出论文表图在当前 A 股 K 线数据条件下的复现状态。"""
     rows = [
         ("Table I", "Yearly jump and explained-variation statistics", "china_adapted", "已用 A 股 48 根 5 分钟后复权收益输出年度多阈值统计。"),
-        ("Table II", "Balanced/unbalanced factor-space comparison", "china_adapted", "已用 strict_balanced 与 near_balanced_99 年度 GC 做稳健性对照。"),
+        ("Table II", "Balanced/unbalanced factor-space comparison", "not_implemented_after_dataset_policy_change", "当前数据政策仅保留 strict_balanced，不再保留 near-balanced 对照面板。"),
         ("Table III", "Generalized correlations with industry and FFC factors", "external_data_required", "需要行业因子、Fama-French-Carhart 因子及相同频率收益。"),
         ("Table IV", "Time-variation decomposition across frequencies", "china_adapted", "已输出滚动 GC、解释度和可支持版结构分解。"),
         ("Table V", "Intraday/overnight/daily Sharpe ratios", "china_adapted", "已输出连续 PCA 因子可支持的 Sharpe；FFC 对照需要外部因子。"),
         ("Figure 1", "Perturbed eigenvalue ratio diagnostics for balanced panel", "china_adapted", "严格平衡 A 股样本，48 bars/day。"),
-        ("Figure 2", "Perturbed eigenvalue ratio diagnostics for unbalanced panel", "china_adapted", "用年度 99% 样本稳健性结果近似展示。"),
+        ("Figure 2", "Perturbed eigenvalue ratio diagnostics for unbalanced panel", "not_implemented_after_dataset_policy_change", "当前数据政策仅保留 strict_balanced，不再导出 near-balanced 图。"),
         ("Figure 3", "Proxy factor portfolio weights", "china_adapted", "用连续 PCA 权重构造 proxy factors。"),
         ("Figure 4", "Continuous PCA factor portfolio weights", "china_adapted", "输出前 4 个连续 PCA 因子权重。"),
         ("Figure 5", "Monthly PCA factor portfolio weights", "china_adapted", "由日度收益聚合到月频后做 PCA。"),
@@ -1299,7 +1263,7 @@ def build_factor_return_tables(pipe: PelgerPipeline, panel: HFPanel) -> Tuple[pd
     """生成连续 PCA 因子的均值和累计收益，支持论文 Figure 12-13。"""
     F_intra = pipe.F_cont_daily_intra
     F_night = pipe.F_cont_daily_night
-    F_daily = F_intra + F_night
+    F_daily = pipe.F_cont_daily_total if pipe.F_cont_daily_total is not None else F_intra + F_night
     rows: List[Dict[str, Any]] = []
     cum_rows: List[Dict[str, Any]] = []
     for k in range(F_intra.shape[1]):
@@ -1482,12 +1446,18 @@ def export_all_paper_figures(
     run_plot("Figure_01", "Figure_01_perturbed_er_balanced.png", "Figure 1. Perturbed Eigenvalue Ratios, Balanced Panel", "Table_09_paper_style_factor_count_diagnostics", er_plot("continuous", "Figure 1. Perturbed Eigenvalue Ratios, Balanced Panel"))
 
     def fig02(output_path: Path) -> None:
-        if result.robustness.empty:
-            _save_placeholder_figure(output_path, "Figure 2. Perturbed ER / Near-Balanced Robustness", "Near-balanced yearly robustness was not run or no near-balanced panel is available.")
+        if result.paper_factor_counts.empty:
+            _save_placeholder_figure(output_path, "Figure 2. Perturbed ER Diagnostics", "No factor-count diagnostics available.")
             return
-        gc_cols = [col for col in result.robustness.columns if col.startswith("gc_")]
-        _save_line_plot(result.robustness, "year", gc_cols, "Figure 2. Near-Balanced Factor-Space Robustness", output_path, ylabel="Generalized correlation")
-    run_plot("Figure_02", "Figure_02_perturbed_er_near_balanced.png", "Figure 2. Near-Balanced Diagnostics", "Table_07_robustness_yearly_gc", fig02)
+        df = result.paper_factor_counts.loc[result.paper_factor_counts["return_component"].eq("hf")].copy()
+        er_cols = [col for col in df.columns if col.startswith("er_")]
+        if df.empty or not er_cols:
+            _save_placeholder_figure(output_path, "Figure 2. Perturbed ER Diagnostics", "No perturbed eigenvalue-ratio data available.")
+            return
+        long_df = df[["year", *er_cols]].melt(id_vars="year", var_name="ratio_index", value_name="perturbed_er")
+        long_df["x_label"] = long_df["year"].astype(str) + ":" + long_df["ratio_index"].str.replace("er_", "k", regex=False)
+        _save_line_plot(long_df, "x_label", ["perturbed_er"], "Figure 2. Perturbed ER Diagnostics", output_path, ylabel="Perturbed ER")
+    run_plot("Figure_02", "Figure_02_perturbed_er_diagnostics.png", "Figure 2. Perturbed ER Diagnostics", "Table_09_paper_style_factor_count_diagnostics", fig02)
 
     def weight_heatmap(df: pd.DataFrame, title: str, output_path: Path) -> None:
         if df.empty:
@@ -1585,6 +1555,8 @@ def export_replication_outputs(
             "gamma": result.pipeline.gamma,
         },
         "sharpes": result.pipeline.sharpes,
+        "panel_return_scheme": result.panel.panel_return_scheme,
+        "requested_return_mode": result.panel.requested_return_mode,
     }
 
     universe_csv = diagnostics_dir / "universe_scan.csv"
@@ -1597,7 +1569,8 @@ def export_replication_outputs(
         {
             "adjustment": sample_report.get("adjustment", "raw_or_unknown"),
             "sample_mode": result.panel.sample_mode,
-            "return_mode": result.panel.return_mode,
+            "panel_return_scheme": result.panel.panel_return_scheme,
+            "requested_return_mode": result.panel.requested_return_mode,
             "years": sample_report.get("years"),
             "n_symbols_selected": result.panel.N,
             "n_days_selected": result.panel.D,
@@ -1606,7 +1579,6 @@ def export_replication_outputs(
             "selected_calendar_end": sample_report.get("selected_calendar_end"),
             "universe_total_symbols": universe_summary.get("total_symbols"),
             "strict_balanced_symbols": universe_summary.get("strict_balanced_symbols"),
-            "near_balanced_99_symbols": universe_summary.get("near_balanced_99_symbols"),
             "global_start": universe_summary.get("global_start"),
             "global_end": universe_summary.get("global_end"),
         }
@@ -1647,9 +1619,6 @@ def export_replication_outputs(
     rolling_gc_df.to_csv(rolling_gc_path, index=False, encoding="utf-8-sig")
     rolling_explained_df.to_csv(rolling_ev_path, index=False, encoding="utf-8-sig")
 
-    robustness_path = tables_dir / "Table_07_robustness_yearly_gc.csv"
-    result.robustness.to_csv(robustness_path, index=False, encoding="utf-8-sig")
-
     paper_jump_path = tables_dir / "Table_08_paper_style_yearly_jump_stats.csv"
     result.paper_jump_stats.to_csv(paper_jump_path, index=False, encoding="utf-8-sig")
     paper_factor_counts_path = tables_dir / "Table_09_paper_style_factor_count_diagnostics.csv"
@@ -1686,7 +1655,6 @@ def export_replication_outputs(
         "main_sample_symbols": str(sample_symbols_path),
         "rolling_gc": str(rolling_gc_path),
         "rolling_explained_variation": str(rolling_ev_path),
-        "robustness_yearly_gc": str(robustness_path),
         "paper_style_yearly_jump_stats": str(paper_jump_path),
         "paper_style_factor_count_diagnostics": str(paper_factor_counts_path),
         "paper_style_factor_sharpes": str(paper_sharpes_path),
@@ -1737,9 +1705,7 @@ def run_cn_replication(
     proc_root: str | Path = DEFAULT_PROC_ROOT,
     output_root: str | Path = DEFAULT_OUTPUT_ROOT,
     years: Optional[Sequence[int]] = None,
-    run_robustness: bool = True,
     return_mode: str = "open_close",
-    sample_mode: str = STRICT_BALANCED_SAMPLE,
     max_stocks: Optional[int] = None,
     jump_a: float = 3.0,
     k_max: int = 10,
@@ -1762,7 +1728,7 @@ def run_cn_replication(
     universe = load_proc_universe(proc_root) if universe is None else universe
     panel = load_proc_hf_panel(
         proc_root=proc_root,
-        sample_mode=sample_mode,
+        sample_mode=STRICT_BALANCED_SAMPLE,
         years=years,
         return_mode=return_mode,
         max_stocks=max_stocks,
@@ -1797,16 +1763,6 @@ def run_cn_replication(
     )
 
     robustness = pd.DataFrame()
-    if run_robustness:
-        robustness = run_near_balanced_robustness(
-            proc_root=proc_root,
-            universe=universe,
-            years=years,
-            K_compare=pipeline.K_cont_hat,
-            return_mode=return_mode,
-            jump_a=jump_a,
-            workers=workers,
-        )
 
     paper_jump_stats = build_paper_jump_stats(panel)
     paper_factor_counts = build_paper_factor_counts(panel, k_max=k_max, gamma=gamma, g_fn=g_fn, jump_a=jump_a)
@@ -1856,7 +1812,6 @@ def _print_scan_summary(universe: pd.DataFrame) -> None:
     print(f" Global calendar days   : {summary['global_calendar_days']}")
     print(f" Bars per day           : {summary['bars_per_day']}")
     print(f" Strict balanced sample : {summary['strict_balanced_symbols']}")
-    print(f" Near-balanced 99%      : {summary['near_balanced_99_symbols']}")
     print(f" Invalid-day symbols    : {summary['invalid_day_symbols']}")
     corp = summary.get("corp_action_risk_summary")
     if corp:
@@ -1872,11 +1827,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--proc-root", default=str(DEFAULT_PROC_ROOT), help="Preprocessed data directory")
     parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT), help="Result output directory")
-    parser.add_argument("--sample-mode", default=STRICT_BALANCED_SAMPLE, choices=[STRICT_BALANCED_SAMPLE, NEAR_BALANCED_99_SAMPLE])
-    parser.add_argument("--return-mode", default="open_close", choices=["open_close", "close_close"])
+    parser.add_argument("--return-mode", default="open_close", choices=["open_close", "close_close"], help="已弃用，仅保留兼容，不影响收益定义")
     parser.add_argument("--years", nargs="+", type=int, help="Run selected years, e.g. --years 2015 2016")
     parser.add_argument("--max-stocks", type=int, help="Use first N symbols for smoke tests")
-    parser.add_argument("--no-robustness", action="store_true", help="Skip yearly 99%%-coverage robustness")
     parser.add_argument("--no-plots", action="store_true", help="Do not export PNG figures")
     parser.add_argument("--jump-a", type=float, default=3.0, help="Jump threshold multiplier")
     parser.add_argument("--k-max", type=int, default=10, help="Maximum factor count search bound")
@@ -1903,9 +1856,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         proc_root=proc_root,
         output_root=output_root,
         years=args.years,
-        run_robustness=not args.no_robustness,
         return_mode=args.return_mode,
-        sample_mode=args.sample_mode,
         max_stocks=args.max_stocks,
         jump_a=args.jump_a,
         k_max=args.k_max,
