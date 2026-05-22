@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+import shutil
 from scipy.linalg import eigh
 
 
@@ -223,6 +224,151 @@ def load_proc_universe(proc_root: str | Path = DEFAULT_PROC_ROOT) -> pd.DataFram
         summary["global_dates_by_year"] = {int(k): list(v) for k, v in summary["global_dates_by_year"].items()}
     universe.attrs["summary"] = summary
     return universe
+
+
+def _symbol_npz_path(proc_root: Path, symbol: str) -> Path:
+    """单只股票预处理收益缓存的 `.npz` 路径。"""
+    return proc_root / "symbol_returns" / f"{symbol}.npz"
+
+
+def _load_symbol_arrays(proc_root: Path, symbol: str) -> Dict[str, np.ndarray]:
+    """读取单只股票的预处理收益缓存。"""
+    arrays_raw = np.load(_symbol_npz_path(proc_root, symbol), allow_pickle=False)
+    return {name: arrays_raw[name] for name in arrays_raw.files}
+
+
+def _align_symbol_arrays_to_dates(
+    arrays: Dict[str, np.ndarray],
+    date_codes: np.ndarray,
+    allow_missing: bool,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """把单股票收益对齐到目标交易日历。"""
+    source_codes = arrays["date_codes"].astype(np.int32, copy=False)
+    day_count = int(len(date_codes))
+    bar_count = int(arrays["full_5min_returns"].shape[1]) if arrays.get("full_5min_returns") is not None else len(CN_5MIN_BAR_TIMES)
+    fill_value = np.nan if allow_missing else 0.0
+
+    daily_intra = np.full(day_count, fill_value, dtype=np.float64)
+    daily_night = np.full(day_count, fill_value, dtype=np.float64)
+    daily_total = np.full(day_count, fill_value, dtype=np.float64)
+    full_5min = np.full(day_count * bar_count, fill_value, dtype=np.float64)
+
+    if len(source_codes) == 0:
+        if not allow_missing:
+            raise ValueError("目标股票没有任何有效交易日。")
+        return daily_intra, daily_night, daily_total, full_5min
+
+    source_pos = np.searchsorted(source_codes, date_codes)
+    clipped_pos = source_pos.clip(max=max(len(source_codes) - 1, 0))
+    matched = (source_pos < len(source_codes)) & (source_codes[clipped_pos] == date_codes)
+
+    if not bool(matched.all()) and not allow_missing:
+        missing_code = int(date_codes[np.where(~matched)[0][0]])
+        raise ValueError(f"缺少 {missing_code} 对应的完整收益缓存。")
+
+    if matched.any():
+        target_idx = np.where(matched)[0]
+        source_idx = source_pos[matched]
+        daily_intra[target_idx] = arrays["intraday_returns"][source_idx]
+        daily_night[target_idx] = arrays["overnight_returns"][source_idx]
+        daily_total[target_idx] = arrays["daily_returns"][source_idx]
+        if "full_5min_returns" not in arrays:
+            raise KeyError("symbol_returns 缓存缺少 full_5min_returns。")
+        full_5min.reshape(day_count, bar_count)[target_idx, :] = arrays["full_5min_returns"][source_idx]
+    return daily_intra, daily_night, daily_total, full_5min
+
+
+def _build_unbalanced_year_panel(
+    proc_root: Path,
+    universe: pd.DataFrame,
+    year: int,
+    max_stocks: Optional[int] = None,
+    workers: Optional[int] = None,
+) -> HFPanel:
+    """用逐股票缓存重建某一年的非平衡面板。"""
+    summary = summarize_cn_universe(universe)
+    year_dates = list(summary.get("global_dates_by_year", {}).get(int(year), []))
+    if not year_dates:
+        raise ValueError(f"找不到年份 {year} 的交易日历。")
+
+    year_col = f"valid_days_{int(year)}"
+    if year_col not in universe.columns:
+        raise ValueError(f"universe 中缺少 {year_col}。请先重新预处理。")
+
+    selected = universe.loc[universe[year_col] > 0, ["symbol"]].copy().sort_values("symbol")
+    if max_stocks is not None:
+        selected = selected.iloc[: int(max_stocks)].copy()
+    tickers = selected["symbol"].tolist()
+    if not tickers:
+        raise ValueError(f"{year} 年没有可用的非平衡样本。")
+
+    date_codes = np.array([int(date.replace("-", "")) for date in year_dates], dtype=np.int32)
+    fill_value = np.nan
+    day_count = len(year_dates)
+    bar_count = len(CN_5MIN_BAR_TIMES)
+    stock_count = len(tickers)
+    R_intra = np.full((day_count, stock_count), fill_value, dtype=np.float64)
+    R_night = np.full((day_count, stock_count), fill_value, dtype=np.float64)
+    R_daily = np.full((day_count, stock_count), fill_value, dtype=np.float64)
+    R_5min_full = np.full((day_count * bar_count, stock_count), fill_value, dtype=np.float64)
+
+    workers = _normalize_worker_count(workers)
+    tasks = [(proc_root, symbol, date_codes) for symbol in tickers]
+
+    def _one(task: Tuple[Path, str, np.ndarray]) -> Tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        task_proc_root, symbol, codes = task
+        arrays = _load_symbol_arrays(task_proc_root, symbol)
+        intra, night, daily, full_5min = _align_symbol_arrays_to_dates(arrays, codes, allow_missing=True)
+        return symbol, intra, night, daily, full_5min
+
+    if workers == 1 or len(tasks) <= 1:
+        aligned = [_one(task) for task in tasks]
+    else:
+        aligned = []
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_one, task): task[1] for task in tasks}
+            for future in as_completed(futures):
+                aligned.append(future.result())
+
+    aligned_map = {symbol: (intra, night, daily, full_5min) for symbol, intra, night, daily, full_5min in aligned}
+    for col_idx, symbol in enumerate(tickers):
+        intra, night, daily, full_5min = aligned_map[symbol]
+        R_intra[:, col_idx] = intra
+        R_night[:, col_idx] = night
+        R_daily[:, col_idx] = daily
+        R_5min_full[:, col_idx] = full_5min
+
+    day_ids = np.repeat(np.arange(day_count), bar_count).astype(np.int32)
+    sample_report = {
+        "sample_mode": "unbalanced_yearly",
+        "panel_return_scheme": PANEL_RETURN_SCHEME,
+        "requested_return_mode": "open_close",
+        "panel_name": f"unbalanced_year_{year}",
+        "adjustment": "backward",
+        "n_symbols_selected": int(stock_count),
+        "n_days_selected": int(day_count),
+        "bars_per_day": int(bar_count),
+        "selected_calendar_start": year_dates[0],
+        "selected_calendar_end": year_dates[-1],
+        "target_symbols": tickers,
+        "contains_nan": bool(np.isnan(R_intra).any() or np.isnan(R_5min_full).any()),
+        "panel_workers": int(workers),
+    }
+
+    return HFPanel(
+        R_intra=R_intra,
+        R_night=R_night,
+        day_ids=day_ids,
+        R_5min_full=R_5min_full,
+        tickers=tickers,
+        dates=[pd.Timestamp(date) for date in year_dates],
+        R_daily=R_daily,
+        bar_times=list(CN_5MIN_BAR_TIMES),
+        sample_report=sample_report,
+        sample_mode="unbalanced_yearly",
+        panel_return_scheme=PANEL_RETURN_SCHEME,
+        requested_return_mode="open_close",
+    )
 
 
 
@@ -1058,6 +1204,11 @@ class ReplicationResult:
     paper_jump_stats: pd.DataFrame = field(default_factory=pd.DataFrame)
     paper_factor_counts: pd.DataFrame = field(default_factory=pd.DataFrame)
     paper_factor_sharpes: pd.DataFrame = field(default_factory=pd.DataFrame)
+    paper_table_i: pd.DataFrame = field(default_factory=pd.DataFrame)
+    paper_table_ii: pd.DataFrame = field(default_factory=pd.DataFrame)
+    paper_table_iii: pd.DataFrame = field(default_factory=pd.DataFrame)
+    paper_table_iv: pd.DataFrame = field(default_factory=pd.DataFrame)
+    paper_table_v: pd.DataFrame = field(default_factory=pd.DataFrame)
     replication_coverage: pd.DataFrame = field(default_factory=pd.DataFrame)
     pca_weights: pd.DataFrame = field(default_factory=pd.DataFrame)
     proxy_weights: pd.DataFrame = field(default_factory=pd.DataFrame)
@@ -1119,6 +1270,140 @@ def build_paper_jump_stats(panel: HFPanel, thresholds: Sequence[float] = (3.0, 4
     return pd.DataFrame(rows)
 
 
+def build_paper_jump_stats_comparison(
+    balanced_panel: HFPanel,
+    proc_root: Path,
+    universe: pd.DataFrame,
+    thresholds: Sequence[float] = (3.0, 4.0, 4.5, 5.0),
+    workers: Optional[int] = None,
+    max_stocks: Optional[int] = None,
+) -> pd.DataFrame:
+    """把 balanced / unbalanced 两块 Table I 合并到一张论文式表里。"""
+    balanced = build_paper_jump_stats(balanced_panel, thresholds=thresholds).copy()
+    balanced.insert(0, "panel_block", "Balanced panel")
+
+    rows: List[pd.DataFrame] = [balanced]
+    years = sorted({date.year for date in balanced_panel.dates})
+    unbalanced_year_frames: List[pd.DataFrame] = []
+    for year in years:
+        year_panel = _build_unbalanced_year_panel(proc_root, universe, year, max_stocks=max_stocks, workers=workers)
+        year_rows: List[Dict[str, Any]] = []
+        for a in thresholds:
+            R_cont, R_jump = detect_jumps(year_panel, a=float(a))
+            stats = jump_summary_stats(R_cont, R_jump)
+            jump_res = _panel_pca(R_jump, K=1, use_corr=True)
+            cont_res = _panel_pca(R_cont, K=min(4, year_panel.N), use_corr=True)
+            year_rows.append({
+                "year": int(year),
+                "threshold_a": float(a),
+                "n_symbols": int(year_panel.N),
+                "n_days": int(year_panel.D),
+                "frac_jump_increments": stats["frac_jump_increments"],
+                "frac_qv_explained_by_jumps": stats["frac_qv_explained_by_jumps"],
+                "jump_corr_explained_by_first_factor": _explained_variation_from_pca(jump_res, K=1),
+                "continuous_corr_explained_by_first_four": _explained_variation_from_pca(cont_res, K=min(4, cont_res.eigvals.shape[0])),
+            })
+        unbalanced_year_frames.append(pd.DataFrame(year_rows))
+    if unbalanced_year_frames:
+        unbalanced = pd.concat(unbalanced_year_frames, ignore_index=True)
+        unbalanced.insert(0, "panel_block", "Unbalanced panel")
+        rows.append(unbalanced)
+
+    out = pd.concat(rows, ignore_index=True)
+    return out.sort_values(["panel_block", "year", "threshold_a"]).reset_index(drop=True)
+
+
+def _panel_pca(R: np.ndarray, K: int, use_corr: bool = True) -> PCAResult:
+    """按矩阵是否含缺失值，自动选择普通 PCA 或 pairwise PCA。"""
+    if np.isnan(R).any():
+        return pca_factors_pairwise(R, K=K, use_corr=use_corr, psd_fix=True)
+    return pca_factors(R, K=K, use_corr=use_corr)
+
+
+def build_paper_table_i(
+    balanced_panel: HFPanel,
+    proc_root: Path,
+    universe: pd.DataFrame,
+    thresholds: Sequence[float] = (3.0, 4.0, 4.5, 5.0),
+    workers: Optional[int] = None,
+    max_stocks: Optional[int] = None,
+) -> pd.DataFrame:
+    """Public wrapper for the canonical Table I construction path."""
+    return build_paper_jump_stats_comparison(
+        balanced_panel=balanced_panel,
+        proc_root=proc_root,
+        universe=universe,
+        thresholds=thresholds,
+        workers=workers,
+        max_stocks=max_stocks,
+    )
+
+
+def build_paper_table_ii(
+    balanced_panel: HFPanel,
+    proc_root: Path,
+    universe: pd.DataFrame,
+    jump_a: float = 3.0,
+    gamma: float = 0.08,
+    g_fn: str = "median_N",
+    k_max: int = 10,
+    workers: Optional[int] = None,
+    max_stocks: Optional[int] = None,
+) -> pd.DataFrame:
+    """构造论文 Table II：balanced vs unbalanced factor-space generalized correlation."""
+    rows: List[Dict[str, Any]] = []
+    years = sorted({date.year for date in balanced_panel.dates})
+    for year in years:
+        balanced_year = subset_panel_by_years(balanced_panel, [year])
+        unbalanced_year = _build_unbalanced_year_panel(proc_root, universe, year, max_stocks=max_stocks, workers=workers)
+        for component, bal_matrix, unb_matrix in [
+            ("hf", balanced_year.R_5min_full, unbalanced_year.R_5min_full),
+            ("continuous", detect_jumps(balanced_year, a=jump_a)[0], detect_jumps(unbalanced_year, a=jump_a)[0]),
+            ("jump", detect_jumps(balanced_year, a=jump_a)[1], detect_jumps(unbalanced_year, a=jump_a)[1]),
+        ]:
+            bal_res = _panel_pca(bal_matrix, K=1, use_corr=True)
+            unb_res = _panel_pca(unb_matrix, K=1, use_corr=True)
+            K_bal, _ = perturbed_eigenvalue_ratio(bal_res.eigvals, g_fn=g_fn, N=balanced_year.N, gamma=gamma, K_max=k_max)
+            K_unb, _ = perturbed_eigenvalue_ratio(unb_res.eigvals, g_fn=g_fn, N=unbalanced_year.N, gamma=gamma, K_max=k_max)
+            K_use = max(1, min(K_bal, K_unb, bal_res.F.shape[1], unb_res.F.shape[1]))
+            gc = generalized_correlations(bal_res.F[:, :K_use], unb_res.F[:, :K_use])
+            row = {
+                "year": int(year),
+                "return_component": component,
+                "balanced_n_symbols": int(balanced_year.N),
+                "unbalanced_n_symbols": int(unbalanced_year.N),
+                "K_balanced": int(max(1, K_bal)),
+                "K_unbalanced": int(max(1, K_unb)),
+                "gc_mean": float(np.nanmean(gc)) if len(gc) else np.nan,
+            }
+            for idx, value in enumerate(gc, start=1):
+                row[f"gc_{idx}"] = float(value)
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def build_paper_table_iii() -> pd.DataFrame:
+    """Document the inputs still missing for the paper's Table III."""
+    return pd.DataFrame(
+        [
+            {
+                "required_dataset": "industry_portfolios",
+                "status": "external_data_required",
+                "paper_role": "Industry portfolio returns used for generalized-correlation tests.",
+                "expected_loader": "load_test_asset_csv(...)",
+                "notes": "Current repository does not ship the paper's industry test-asset returns.",
+            },
+            {
+                "required_dataset": "ffc_factors",
+                "status": "external_data_required",
+                "paper_role": "Fama-French-Carhart factors used in the paper's factor-space comparison.",
+                "expected_loader": "load_external_factor_csv(..., freq='daily')",
+                "notes": "Provide daily factor CSV or Parquet with a documented schema to replace this placeholder.",
+            },
+        ]
+    )
+
+
 def build_paper_factor_counts(
     panel: HFPanel,
     k_max: int,
@@ -1152,6 +1437,55 @@ def build_paper_factor_counts(
     return pd.DataFrame(rows)
 
 
+def build_paper_factor_counts_comparison(
+    balanced_panel: HFPanel,
+    proc_root: Path,
+    universe: pd.DataFrame,
+    k_max: int,
+    gamma: float,
+    g_fn: str,
+    jump_a: float,
+    workers: Optional[int] = None,
+    max_stocks: Optional[int] = None,
+) -> pd.DataFrame:
+    """把 balanced / unbalanced 的 HF、continuous、jump 因子数诊断合并输出。"""
+    rows: List[pd.DataFrame] = []
+    component_order = {"hf": 0, "continuous": 1, "jump": 2}
+    block_order = {"Balanced panel": 0, "Unbalanced panel": 1}
+    years = sorted({date.year for date in balanced_panel.dates})
+    for panel_block, panel_builder in [
+        ("Balanced panel", lambda year: subset_panel_by_years(balanced_panel, [year])),
+        ("Unbalanced panel", lambda year: _build_unbalanced_year_panel(proc_root, universe, year, max_stocks=max_stocks, workers=workers)),
+    ]:
+        for year in years:
+            year_panel = panel_builder(year)
+            R_cont, R_jump = detect_jumps(year_panel, a=jump_a)
+            component_rows: List[Dict[str, Any]] = []
+            for return_component, eigvals in {
+                "hf": _panel_pca(year_panel.R_5min_full, K=1, use_corr=True).eigvals,
+                "continuous": _panel_pca(R_cont, K=1, use_corr=True).eigvals,
+                "jump": _panel_pca(R_jump, K=1, use_corr=True).eigvals,
+            }.items():
+                K_hat, er = perturbed_eigenvalue_ratio(eigvals, g_fn=g_fn, N=year_panel.N, gamma=gamma, K_max=k_max)
+                row = {
+                    "panel_block": panel_block,
+                    "year": int(year),
+                    "return_component": return_component,
+                    "K_hat": int(max(1, K_hat)),
+                    "g_fn": g_fn,
+                    "gamma": float(gamma),
+                }
+                for idx, value in enumerate(er[:k_max], start=1):
+                    row[f"er_{idx}"] = float(value)
+                component_rows.append(row)
+            rows.append(pd.DataFrame(component_rows))
+    out = pd.concat(rows, ignore_index=True)
+    out["_block_order"] = out["panel_block"].map(block_order).fillna(99)
+    out["_component_order"] = out["return_component"].map(component_order).fillna(99)
+    out = out.sort_values(["_block_order", "year", "_component_order"]).drop(columns=["_block_order", "_component_order"])
+    return out.reset_index(drop=True)
+
+
 def build_factor_sharpe_table(pipe: PelgerPipeline) -> pd.DataFrame:
     """输出连续 PCA 因子的切点组合和单因子 Sharpe，贴近论文 Table V 可由 K 线支持的部分。"""
     rows = [
@@ -1175,29 +1509,61 @@ def build_factor_sharpe_table(pipe: PelgerPipeline) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def build_paper_table_iv(rolling_gc_df: pd.DataFrame, rolling_explained_df: pd.DataFrame) -> pd.DataFrame:
+    """构造论文 Table IV 的时间变化分解汇总。"""
+    if rolling_gc_df.empty and rolling_explained_df.empty:
+        return pd.DataFrame(columns=["metric", "mean", "median", "min", "max"])
+
+    rows: List[Dict[str, Any]] = []
+    gc_cols = [col for col in rolling_gc_df.columns if col.startswith("gc_")]
+    for col in gc_cols:
+        rows.append({
+            "metric": col,
+            "mean": float(rolling_gc_df[col].mean()),
+            "median": float(rolling_gc_df[col].median()),
+            "min": float(rolling_gc_df[col].min()),
+            "max": float(rolling_gc_df[col].max()),
+        })
+    if not rolling_explained_df.empty and "explained_variation" in rolling_explained_df.columns:
+        series = rolling_explained_df["explained_variation"]
+        rows.append({
+            "metric": "explained_variation",
+            "mean": float(series.mean()),
+            "median": float(series.median()),
+            "min": float(series.min()),
+            "max": float(series.max()),
+        })
+    return pd.DataFrame(rows)
+
+
+def build_paper_table_v(pipe: PelgerPipeline) -> pd.DataFrame:
+    """构造论文 Table V 的 intraday / overnight / daily Sharpe 汇总。"""
+    return build_factor_sharpe_table(pipe)
+
+
 def build_replication_coverage_report() -> pd.DataFrame:
-    """列出论文表图在当前 A 股 K 线数据条件下的复现状态。"""
+    """列出论文表图在当前 A 股数据条件下的复现状态。"""
     rows = [
-        ("Table I", "Yearly jump and explained-variation statistics", "china_adapted", "已用 A 股 48 根 5 分钟后复权收益输出年度多阈值统计。"),
-        ("Table II", "Balanced/unbalanced factor-space comparison", "not_implemented_after_dataset_policy_change", "当前数据政策仅保留 strict_balanced，不再保留 near-balanced 对照面板。"),
-        ("Table III", "Generalized correlations with industry and FFC factors", "external_data_required", "需要行业因子、Fama-French-Carhart 因子及相同频率收益。"),
-        ("Table IV", "Time-variation decomposition across frequencies", "china_adapted", "已输出滚动 GC、解释度和可支持版结构分解。"),
-        ("Table V", "Intraday/overnight/daily Sharpe ratios", "china_adapted", "已输出连续 PCA 因子可支持的 Sharpe；FFC 对照需要外部因子。"),
-        ("Figure 1", "Perturbed eigenvalue ratio diagnostics for balanced panel", "china_adapted", "严格平衡 A 股样本，48 bars/day。"),
-        ("Figure 2", "Perturbed eigenvalue ratio diagnostics for unbalanced panel", "not_implemented_after_dataset_policy_change", "当前数据政策仅保留 strict_balanced，不再导出 near-balanced 图。"),
-        ("Figure 3", "Proxy factor portfolio weights", "china_adapted", "用连续 PCA 权重构造 proxy factors。"),
-        ("Figure 4", "Continuous PCA factor portfolio weights", "china_adapted", "输出前 4 个连续 PCA 因子权重。"),
-        ("Figure 5", "Monthly PCA factor portfolio weights", "china_adapted", "由日度收益聚合到月频后做 PCA。"),
-        ("Figure 6", "Time variation in loadings", "china_adapted", "用滚动 GC 展示局部载荷稳定性。"),
-        ("Figure 7", "Locally estimated continuous factors", "china_adapted", "用滚动局部连续因子与全局因子 GC 展示。"),
-        ("Figure 8", "Time-varying portfolio weights", "china_adapted", "展示滚动窗口下 top 权重股票的权重变化。"),
-        ("Figure 9", "Time-varying explained variation", "china_adapted", "输出滚动解释度。"),
-        ("Figure 10", "Factor-structure time variation decomposition", "china_adapted", "用 GC 和解释度构造可支持版分解图。"),
-        ("Figure 11", "Continuous factor-structure decomposition", "china_adapted", "连续因子滚动稳定性和解释度分解。"),
-        ("Figure 12", "Expected intraday and overnight returns", "china_adapted", "用连续 PCA 因子日内/隔夜/日度均值。"),
-        ("Figure 13", "Cumulative factor returns", "china_adapted", "用连续 PCA 因子累计收益。"),
-        ("Figure 14", "Asset pricing of industry portfolios", "external_data_required", "需要行业组合收益；当前输出占位图。"),
-        ("Figure 15", "Asset pricing of size/value portfolios", "external_data_required", "需要 size/value 测试资产组合；当前输出占位图。"),
+        ("Table I", "Summary Statistics for Continuous and Jump Returns", "implemented_adapted", "已按 balanced / unbalanced 两块输出年度跳跃与连续收益统计。"),
+        ("Table II", "Balanced and Unbalanced Panel Results", "implemented_adapted", "已按 balanced vs unbalanced 输出 factor-space generalized correlations。"),
+        ("Table III", "Generalized Correlations with Industry and FFC Factors", "external_data_required", "需要行业组合收益与 Fama-French-Carhart 因子 CSV。"),
+        ("Table IV", "Time-Variation Decomposition across Frequencies", "implemented_adapted", "已输出 rolling GC / explained variation 的时间变化汇总。"),
+        ("Table V", "Intraday / Overnight / Daily Sharpe Ratios", "implemented_adapted", "已输出连续 PCA 因子的日内、隔夜、日度 Sharpe。"),
+        ("Figure 1", "Number of HF Factors, Unbalanced Panel", "implemented_adapted", "已输出非平衡面板的 perturbed eigenvalue ratio 诊断图。"),
+        ("Figure 2", "Number of HF Factors, Balanced Panel", "implemented_adapted", "已输出严格平衡面板的 perturbed eigenvalue ratio 诊断图。"),
+        ("Figure 3", "Proxy Factor Portfolio Weights", "implemented_adapted", "已输出 proxy factors 权重热图。"),
+        ("Figure 4", "Continuous PCA Factor Portfolio Weights", "implemented_adapted", "已输出连续 PCA 因子权重热图。"),
+        ("Figure 5", "Monthly PCA Factor Portfolio Weights", "implemented_adapted", "已输出月频 PCA 因子权重热图。"),
+        ("Figure 6", "Time Variation in Loadings", "implemented_adapted", "已输出滚动 GC 稳定性曲线。"),
+        ("Figure 7", "Locally Estimated Continuous Factors", "implemented_adapted", "已输出局部连续因子与全局因子的 GC 曲线。"),
+        ("Figure 8", "Time-Varying Portfolio Weights", "implemented_adapted", "已输出滚动窗口下 top 权重股票变化。"),
+        ("Figure 9", "Time-Varying Explained Variation", "implemented_adapted", "已输出滚动解释度。"),
+        ("Figure 10", "Factor-Structure Time Variation Decomposition", "implemented_adapted", "已输出 GC 与解释度的结构分解图。"),
+        ("Figure 11", "Continuous Factor-Structure Decomposition", "implemented_adapted", "已输出连续因子的结构分解图。"),
+        ("Figure 12", "Expected Intraday and Overnight Returns", "implemented_adapted", "已输出连续 PCA 因子的日内/隔夜/日度平均收益。"),
+        ("Figure 13", "Cumulative Factor Returns", "implemented_adapted", "已输出连续 PCA 因子的累计收益。"),
+        ("Figure 14", "Asset Pricing of Industry Portfolios", "external_data_required", "需要行业组合收益；当前仅输出占位图。"),
+        ("Figure 15", "Asset Pricing of Size- and Value-Sorted Portfolios", "external_data_required", "需要 size/value 测试资产组合；当前仅输出占位图。"),
     ]
     return pd.DataFrame(rows, columns=["paper_item", "paper_content", "status", "notes"])
 
@@ -1313,7 +1679,12 @@ def _maybe_save_plot(
 
 
 def _plot_status_row(figure_id: str, title: str, output_path: Path, status: str, data_source: str, notes: str) -> Dict[str, str]:
+    try:
+        figure_number = int(str(figure_id).split("_")[-1])
+    except Exception:
+        figure_number = -1
     return {
+        "figure_number": figure_number,
         "figure_id": figure_id,
         "title": title,
         "file_path": str(output_path),
@@ -1321,6 +1692,22 @@ def _plot_status_row(figure_id: str, title: str, output_path: Path, status: str,
         "data_source": data_source,
         "notes": notes,
     }
+
+
+def _copy_alias_files(source_path: Path, alias_paths: Sequence[Path]) -> None:
+    """Copy one exported file to one or more compatibility alias paths."""
+    for alias_path in alias_paths:
+        if source_path.resolve() == alias_path.resolve():
+            continue
+        alias_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source_path, alias_path)
+
+
+def _write_csv_with_aliases(df: pd.DataFrame, canonical_path: Path, alias_paths: Optional[Sequence[Path]] = None) -> None:
+    """Write one canonical CSV and then mirror it to compatibility aliases."""
+    canonical_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(canonical_path, index=False, encoding="utf-8-sig")
+    _copy_alias_files(canonical_path, alias_paths or [])
 
 
 def _save_placeholder_figure(output_path: Path, title: str, message: str) -> None:
@@ -1402,137 +1789,152 @@ def export_all_paper_figures(
     rolling_gc_df: pd.DataFrame,
     rolling_explained_df: pd.DataFrame,
 ) -> Tuple[pd.DataFrame, Dict[str, str]]:
-    """按论文 Figure 1-15 生成真实图或明确占位图。"""
+    """Export canonical paper-numbered figures and record generation status."""
     exported: Dict[str, str] = {}
     status_rows: List[Dict[str, str]] = []
     figures_dir.mkdir(parents=True, exist_ok=True)
 
-    try:
-        import matplotlib  # noqa: F401
-    except Exception as exc:
-        for idx in range(1, 16):
-            figure_id = f"Figure_{idx:02d}"
-            output_path = figures_dir / f"{figure_id}_matplotlib_missing.png"
-            status_rows.append(_plot_status_row(figure_id, figure_id, output_path, "error", "matplotlib", repr(exc)))
-        return pd.DataFrame(status_rows), exported
+    figure_specs = {
+        1: ("Figure_1", "Figure_1_number_of_hf_factors_unbalanced.png", "Figure 1. Number of High-Frequency Factors, Unbalanced Panel"),
+        2: ("Figure_2", "Figure_2_number_of_hf_factors_balanced.png", "Figure 2. Number of High-Frequency Factors, Balanced Panel"),
+        3: ("Figure_3", "Figure_3_proxy_factor_portfolio_weights.png", "Figure 3. Proxy Factor Portfolio Weights"),
+        4: ("Figure_4", "Figure_4_continuous_pca_factor_portfolio_weights.png", "Figure 4. Continuous PCA Factor Portfolio Weights"),
+        5: ("Figure_5", "Figure_5_monthly_pca_factor_portfolio_weights.png", "Figure 5. Monthly PCA Factor Portfolio Weights"),
+        6: ("Figure_6", "Figure_6_time_variation_in_loadings.png", "Figure 6. Time Variation in Loadings"),
+        7: ("Figure_7", "Figure_7_locally_estimated_continuous_factors.png", "Figure 7. Locally Estimated Continuous Factors"),
+        8: ("Figure_8", "Figure_8_time_varying_portfolio_weights.png", "Figure 8. Time-Varying Portfolio Weights"),
+        9: ("Figure_9", "Figure_9_time_varying_explained_variation.png", "Figure 9. Time-Varying Explained Variation"),
+        10: ("Figure_10", "Figure_10_factor_structure_time_variation_decomposition.png", "Figure 10. Factor-Structure Time Variation Decomposition"),
+        11: ("Figure_11", "Figure_11_continuous_factor_structure_decomposition.png", "Figure 11. Continuous Factor-Structure Decomposition"),
+        12: ("Figure_12", "Figure_12_expected_intraday_and_overnight_returns.png", "Figure 12. Expected Intraday and Overnight Returns"),
+        13: ("Figure_13", "Figure_13_cumulative_factor_returns.png", "Figure 13. Cumulative Factor Returns"),
+        14: ("Figure_14", "Figure_14_asset_pricing_of_industry_portfolios.png", "Figure 14. Asset Pricing of Industry Portfolios"),
+        15: ("Figure_15", "Figure_15_asset_pricing_of_size_and_value_sorted_portfolios.png", "Figure 15. Asset Pricing of Size- and Value-Sorted Portfolios"),
+    }
 
-    def run_plot(figure_id: str, file_name: str, title: str, data_source: str, plot_func, notes: str = "") -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        for _, (figure_id, file_name, title) in figure_specs.items():
+            output_path = figures_dir / file_name
+            status_rows.append(_plot_status_row(figure_id, title, output_path, "error", "matplotlib", repr(exc)))
+        return pd.DataFrame(status_rows).sort_values("figure_number").reset_index(drop=True), exported
+
+    def run_plot(figure_number: int, data_source: str, plot_func, notes: str = "") -> None:
+        figure_id, file_name, title = figure_specs[figure_number]
         output_path = figures_dir / file_name
         try:
             plot_func(output_path)
-            status = "placeholder" if "External data required" in notes else "generated"
+            status = "placeholder" if "external data required" in notes.lower() else "generated"
             status_rows.append(_plot_status_row(figure_id, title, output_path, status, data_source, notes))
             exported[figure_id] = str(output_path)
         except Exception as exc:
-            try:
-                _save_placeholder_figure(output_path, title, f"Plot generation failed: {exc!r}")
-                status_rows.append(_plot_status_row(figure_id, title, output_path, "error", data_source, repr(exc)))
-                exported[figure_id] = str(output_path)
-            except Exception:
-                status_rows.append(_plot_status_row(figure_id, title, output_path, "error", data_source, repr(exc)))
+            _save_placeholder_figure(output_path, title, f"Plot generation failed: {exc!r}")
+            status_rows.append(_plot_status_row(figure_id, title, output_path, "error", data_source, repr(exc)))
+            exported[figure_id] = str(output_path)
 
-    def er_plot(component: str, title: str):
-        def _plot(output_path: Path) -> None:
-            df = result.paper_factor_counts.loc[result.paper_factor_counts["return_component"].eq(component)].copy()
-            er_cols = [col for col in df.columns if col.startswith("er_")]
-            if df.empty or not er_cols:
-                _save_placeholder_figure(output_path, title, "No perturbed eigenvalue-ratio data available.")
-                return
-            long_df = df[["year", *er_cols]].melt(id_vars="year", var_name="ratio_index", value_name="perturbed_er")
-            long_df["x_label"] = long_df["year"].astype(str) + ":" + long_df["ratio_index"].str.replace("er_", "k", regex=False)
-            _save_line_plot(long_df, "x_label", ["perturbed_er"], title, output_path, ylabel="Perturbed ER")
-        return _plot
-
-    run_plot("Figure_01", "Figure_01_perturbed_er_balanced.png", "Figure 1. Perturbed Eigenvalue Ratios, Balanced Panel", "Table_09_paper_style_factor_count_diagnostics", er_plot("continuous", "Figure 1. Perturbed Eigenvalue Ratios, Balanced Panel"))
-
-    def fig02(output_path: Path) -> None:
-        if result.paper_factor_counts.empty:
-            _save_placeholder_figure(output_path, "Figure 2. Perturbed ER Diagnostics", "No factor-count diagnostics available.")
+    def _save_er_panel(output_path: Path, panel_block: str, title: str) -> None:
+        df = result.paper_factor_counts.copy()
+        if df.empty:
+            _save_placeholder_figure(output_path, title, "No factor-count diagnostics are available.")
             return
-        df = result.paper_factor_counts.loc[result.paper_factor_counts["return_component"].eq("hf")].copy()
+        df = df.loc[df["panel_block"].eq(panel_block) & df["return_component"].eq("hf")].copy()
         er_cols = [col for col in df.columns if col.startswith("er_")]
         if df.empty or not er_cols:
-            _save_placeholder_figure(output_path, "Figure 2. Perturbed ER Diagnostics", "No perturbed eigenvalue-ratio data available.")
+            _save_placeholder_figure(output_path, title, f"No HF perturbed eigenvalue-ratio data are available for {panel_block.lower()}.")
             return
-        long_df = df[["year", *er_cols]].melt(id_vars="year", var_name="ratio_index", value_name="perturbed_er")
-        long_df["x_label"] = long_df["year"].astype(str) + ":" + long_df["ratio_index"].str.replace("er_", "k", regex=False)
-        _save_line_plot(long_df, "x_label", ["perturbed_er"], "Figure 2. Perturbed ER Diagnostics", output_path, ylabel="Perturbed ER")
-    run_plot("Figure_02", "Figure_02_perturbed_er_diagnostics.png", "Figure 2. Perturbed ER Diagnostics", "Table_09_paper_style_factor_count_diagnostics", fig02)
+        x = np.arange(1, len(er_cols) + 1)
+        fig, ax = plt.subplots(figsize=(9.5, 5.0))
+        for _, row in df.sort_values("year").iterrows():
+            y = [float(row[col]) for col in er_cols]
+            label = f"{int(row['year'])} (K={int(row['K_hat'])})"
+            ax.plot(x, y, marker="o", linewidth=1.4, label=label)
+        ax.set_title(title)
+        ax.set_xlabel("k")
+        ax.set_ylabel("Perturbed eigenvalue ratio")
+        ax.set_xticks(x)
+        ax.grid(True, alpha=0.25)
+        ax.legend(loc="best", fontsize=8, ncol=2)
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=160)
+        plt.close(fig)
 
     def weight_heatmap(df: pd.DataFrame, title: str, output_path: Path) -> None:
         if df.empty:
-            _save_placeholder_figure(output_path, title, "No PCA weight data available for this sample.")
+            _save_placeholder_figure(output_path, title, "No portfolio-weight data are available.")
             return
         pivot = df.pivot_table(index="factor", columns="symbol", values="weight", aggfunc="first").fillna(0.0)
         _save_heatmap(pivot.to_numpy(), pivot.columns.tolist(), [f"Factor {idx}" for idx in pivot.index], title, output_path)
 
-    run_plot("Figure_03", "Figure_03_proxy_factor_weights.png", "Figure 3. Proxy Factor Portfolio Weights", "proxy_weights", lambda path: weight_heatmap(result.proxy_weights, "Figure 3. Proxy Factor Portfolio Weights", path))
-    run_plot("Figure_04", "Figure_04_continuous_pca_weights.png", "Figure 4. Continuous PCA Factor Weights", "pca_weights", lambda path: weight_heatmap(result.pca_weights, "Figure 4. Continuous PCA Factor Weights", path))
-    run_plot("Figure_05", "Figure_05_monthly_pca_weights.png", "Figure 5. Monthly PCA Factor Weights", "monthly_pca_weights", lambda path: weight_heatmap(result.monthly_pca_weights, "Figure 5. Monthly PCA Factor Weights", path))
+    run_plot(1, "paper_factor_count_diagnostics", lambda path: _save_er_panel(path, "Unbalanced panel", figure_specs[1][2]))
+    run_plot(2, "paper_factor_count_diagnostics", lambda path: _save_er_panel(path, "Balanced panel", figure_specs[2][2]))
+    run_plot(3, "proxy_weights", lambda path: weight_heatmap(result.proxy_weights, figure_specs[3][2], path))
+    run_plot(4, "pca_weights", lambda path: weight_heatmap(result.pca_weights, figure_specs[4][2], path))
+    run_plot(5, "monthly_pca_weights", lambda path: weight_heatmap(result.monthly_pca_weights, figure_specs[5][2], path))
 
     gc_cols = [col for col in rolling_gc_df.columns if col.startswith("gc_")]
-    run_plot("Figure_06", "Figure_06_time_variation_loadings_gc.png", "Figure 6. Time Variation in Loadings", "Table_05_rolling_gc", lambda path: _save_line_plot(rolling_gc_df, "window_index", gc_cols, "Figure 6. Time Variation in Loadings", path, ylabel="Generalized correlation"))
-    run_plot("Figure_07", "Figure_07_local_continuous_factor_gc.png", "Figure 7. Locally Estimated Continuous Factors", "Table_05_rolling_gc", lambda path: _save_line_plot(rolling_gc_df, "window_index", gc_cols[: min(4, len(gc_cols))], "Figure 7. Locally Estimated Continuous Factors", path, ylabel="Generalized correlation"))
+    run_plot(6, "rolling_gc", lambda path: _save_line_plot(rolling_gc_df, "window_index", gc_cols, figure_specs[6][2], path, ylabel="Generalized correlation"))
+    run_plot(7, "rolling_gc", lambda path: _save_line_plot(rolling_gc_df, "window_index", gc_cols[: min(4, len(gc_cols))], figure_specs[7][2], path, ylabel="Generalized correlation"))
 
     def fig08(output_path: Path) -> None:
         if result.rolling_weight_summary.empty:
-            _save_placeholder_figure(output_path, "Figure 8. Time-Varying Portfolio Weights", "No rolling weight summary available.")
+            _save_placeholder_figure(output_path, figure_specs[8][2], "No rolling weight summary is available.")
             return
         pivot = result.rolling_weight_summary.pivot_table(index="start_day", columns="symbol", values="weight_factor_1", aggfunc="first").reset_index()
         y_cols = [col for col in pivot.columns if col != "start_day"]
-        _save_line_plot(pivot, "start_day", y_cols, "Figure 8. Time-Varying Portfolio Weights", output_path, ylabel="Factor 1 weight")
-    run_plot("Figure_08", "Figure_08_time_varying_portfolio_weights.png", "Figure 8. Time-Varying Portfolio Weights", "rolling_weight_summary", fig08)
-
-    run_plot("Figure_09", "Figure_09_time_varying_explained_variation.png", "Figure 9. Time-Varying Explained Variation", "Table_06_rolling_explained_variation", lambda path: _save_line_plot(rolling_explained_df, "window_index", ["explained_variation"], "Figure 9. Time-Varying Explained Variation", path, ylabel="Explained variation"))
+        _save_line_plot(pivot, "start_day", y_cols, figure_specs[8][2], output_path, ylabel="Factor 1 weight")
 
     def fig10(output_path: Path) -> None:
-        df = rolling_gc_df.copy()
-        if df.empty:
-            _save_placeholder_figure(output_path, "Figure 10. Factor-Structure Decomposition", "No rolling GC data available.")
+        if rolling_gc_df.empty:
+            _save_placeholder_figure(output_path, figure_specs[10][2], "No rolling generalized-correlation data are available.")
             return
+        df = rolling_gc_df.copy()
         df["avg_gc"] = df[gc_cols].mean(axis=1) if gc_cols else np.nan
         if not rolling_explained_df.empty:
             df = df.merge(rolling_explained_df, on="window_index", how="left")
-        _save_line_plot(df, "window_index", [col for col in ["avg_gc", "explained_variation"] if col in df.columns], "Figure 10. Factor-Structure Decomposition", output_path)
-    run_plot("Figure_10", "Figure_10_factor_structure_decomposition.png", "Figure 10. Factor-Structure Decomposition", "rolling_gc_and_explained_variation", fig10)
+        _save_line_plot(df, "window_index", [col for col in ["avg_gc", "explained_variation"] if col in df.columns], figure_specs[10][2], output_path)
 
     def fig11(output_path: Path) -> None:
-        df = rolling_gc_df.copy()
-        if df.empty:
-            _save_placeholder_figure(output_path, "Figure 11. Continuous Factor-Structure Decomposition", "No rolling GC data available.")
+        if rolling_gc_df.empty:
+            _save_placeholder_figure(output_path, figure_specs[11][2], "No rolling generalized-correlation data are available.")
             return
+        df = rolling_gc_df.copy()
         df["min_gc"] = df[gc_cols].min(axis=1) if gc_cols else np.nan
         df["mean_gc"] = df[gc_cols].mean(axis=1) if gc_cols else np.nan
-        _save_line_plot(df, "window_index", ["min_gc", "mean_gc"], "Figure 11. Continuous Factor-Structure Decomposition", output_path, ylabel="Generalized correlation")
-    run_plot("Figure_11", "Figure_11_continuous_factor_structure_decomposition.png", "Figure 11. Continuous Factor-Structure Decomposition", "rolling_gc", fig11)
+        _save_line_plot(df, "window_index", ["min_gc", "mean_gc"], figure_specs[11][2], output_path, ylabel="Generalized correlation")
 
     def fig12(output_path: Path) -> None:
         if result.factor_return_summary.empty:
-            _save_placeholder_figure(output_path, "Figure 12. Expected Intraday and Overnight Returns", "No factor return summary available.")
+            _save_placeholder_figure(output_path, figure_specs[12][2], "No factor return summary is available.")
             return
         long_df = result.factor_return_summary.melt(id_vars="factor", var_name="segment", value_name="mean_return")
-        _save_bar_plot(long_df, "factor", "mean_return", "Figure 12. Expected Intraday and Overnight Returns", output_path, group_col="segment", ylabel="Mean return")
-    run_plot("Figure_12", "Figure_12_expected_intraday_overnight_returns.png", "Figure 12. Expected Intraday and Overnight Returns", "factor_return_summary", fig12)
+        _save_bar_plot(long_df, "factor", "mean_return", figure_specs[12][2], output_path, group_col="segment", ylabel="Mean return")
 
     def fig13(output_path: Path) -> None:
         if result.cumulative_factor_returns.empty:
-            _save_placeholder_figure(output_path, "Figure 13. Cumulative Factor Returns", "No cumulative factor return data available.")
+            _save_placeholder_figure(output_path, figure_specs[13][2], "No cumulative factor return data are available.")
             return
         df = result.cumulative_factor_returns.loc[result.cumulative_factor_returns["factor"].eq(1)].copy()
-        _save_line_plot(df, "date", ["cum_intraday", "cum_overnight", "cum_daily"], "Figure 13. Cumulative Factor Returns, Factor 1", output_path, ylabel="Cumulative log return")
-    run_plot("Figure_13", "Figure_13_cumulative_factor_returns.png", "Figure 13. Cumulative Factor Returns", "cumulative_factor_returns", fig13)
+        _save_line_plot(df, "date", ["cum_intraday", "cum_overnight", "cum_daily"], f"{figure_specs[13][2]}, Factor 1", output_path, ylabel="Cumulative log return")
 
-    run_plot("Figure_14", "Figure_14_asset_pricing_industry_portfolios.png", "Figure 14. Asset Pricing of Industry Portfolios", "external_test_assets", lambda path: _save_placeholder_figure(path, "Figure 14. Asset Pricing of Industry Portfolios", "Industry portfolio returns are not available in the current repository. Provide external test-asset CSV files to replace this placeholder."), notes="External data required: industry portfolio returns")
-    run_plot("Figure_15", "Figure_15_asset_pricing_size_value_portfolios.png", "Figure 15. Asset Pricing of Size- and Value-Sorted Portfolios", "external_test_assets", lambda path: _save_placeholder_figure(path, "Figure 15. Asset Pricing of Size- and Value-Sorted Portfolios", "Size/value sorted portfolio returns are not available in the current repository. Provide external test-asset CSV files to replace this placeholder."), notes="External data required: size/value portfolio returns")
+    run_plot(8, "rolling_weight_summary", fig08)
+    run_plot(9, "rolling_explained_variation", lambda path: _save_line_plot(rolling_explained_df, "window_index", ["explained_variation"], figure_specs[9][2], path, ylabel="Explained variation"))
+    run_plot(10, "rolling_gc_and_explained_variation", fig10)
+    run_plot(11, "rolling_gc", fig11)
+    run_plot(12, "factor_return_summary", fig12)
+    run_plot(13, "cumulative_factor_returns", fig13)
+    run_plot(14, "external_test_assets", lambda path: _save_placeholder_figure(path, figure_specs[14][2], "Industry portfolio returns are not available in the current repository. Provide external test-asset CSV files to replace this placeholder."), notes="External data required: industry portfolio returns")
+    run_plot(15, "external_test_assets", lambda path: _save_placeholder_figure(path, figure_specs[15][2], "Size/value sorted portfolio returns are not available in the current repository. Provide external test-asset CSV files to replace this placeholder."), notes="External data required: size/value portfolio returns")
 
-    return pd.DataFrame(status_rows).sort_values("figure_id").reset_index(drop=True), exported
+    plot_status = pd.DataFrame(status_rows).sort_values("figure_number").reset_index(drop=True)
+    return plot_status, exported
 
 
 def export_replication_outputs(
     result: ReplicationResult,
     save_plots: bool = True,
 ) -> Dict[str, str]:
-    """导出核心表格、摘要和可选图形."""
+    """Export canonical paper-numbered tables/figures plus compatibility aliases."""
     output_root = result.output_root
     output_root.mkdir(parents=True, exist_ok=True)
     tables_dir = output_root / "tables"
@@ -1565,66 +1967,73 @@ def export_replication_outputs(
     _write_json(diagnostics_dir / "main_summary.json", main_summary)
 
     sample_summary_path = tables_dir / "Table_01_sample_summary.csv"
-    pd.DataFrame([
-        {
-            "adjustment": sample_report.get("adjustment", "raw_or_unknown"),
-            "sample_mode": result.panel.sample_mode,
-            "panel_return_scheme": result.panel.panel_return_scheme,
-            "requested_return_mode": result.panel.requested_return_mode,
-            "years": sample_report.get("years"),
-            "n_symbols_selected": result.panel.N,
-            "n_days_selected": result.panel.D,
-            "bars_per_day": result.panel.M_per_day,
-            "selected_calendar_start": sample_report.get("selected_calendar_start"),
-            "selected_calendar_end": sample_report.get("selected_calendar_end"),
-            "universe_total_symbols": universe_summary.get("total_symbols"),
-            "strict_balanced_symbols": universe_summary.get("strict_balanced_symbols"),
-            "global_start": universe_summary.get("global_start"),
-            "global_end": universe_summary.get("global_end"),
-        }
-    ]).to_csv(sample_summary_path, index=False, encoding="utf-8-sig")
+    pd.DataFrame(
+        [
+            {
+                "adjustment": sample_report.get("adjustment", "raw_or_unknown"),
+                "sample_mode": result.panel.sample_mode,
+                "panel_return_scheme": result.panel.panel_return_scheme,
+                "requested_return_mode": result.panel.requested_return_mode,
+                "years": sample_report.get("years"),
+                "n_symbols_selected": result.panel.N,
+                "n_days_selected": result.panel.D,
+                "bars_per_day": result.panel.M_per_day,
+                "selected_calendar_start": sample_report.get("selected_calendar_start"),
+                "selected_calendar_end": sample_report.get("selected_calendar_end"),
+                "universe_total_symbols": universe_summary.get("total_symbols"),
+                "strict_balanced_symbols": universe_summary.get("strict_balanced_symbols"),
+                "global_start": universe_summary.get("global_start"),
+                "global_end": universe_summary.get("global_end"),
+            }
+        ]
+    ).to_csv(sample_summary_path, index=False, encoding="utf-8-sig")
 
     jump_stats_path = tables_dir / "Table_02_jump_stats.csv"
-    pd.DataFrame([result.pipeline.jump_stats]).to_csv(
-        jump_stats_path, index=False, encoding="utf-8-sig"
-    )
+    pd.DataFrame([result.pipeline.jump_stats]).to_csv(jump_stats_path, index=False, encoding="utf-8-sig")
     factor_counts_path = tables_dir / "Table_03_factor_counts.csv"
     pd.DataFrame(
-        [{
-            "K_hf_hat": result.pipeline.K_hf_hat,
-            "K_cont_hat": result.pipeline.K_cont_hat,
-            "K_jump_hat": result.pipeline.K_jump_hat,
-            "g_fn": result.pipeline.g_fn,
-            "gamma": result.pipeline.gamma,
-        }]
+        [
+            {
+                "K_hf_hat": result.pipeline.K_hf_hat,
+                "K_cont_hat": result.pipeline.K_cont_hat,
+                "K_jump_hat": result.pipeline.K_jump_hat,
+                "g_fn": result.pipeline.g_fn,
+                "gamma": result.pipeline.gamma,
+            }
+        ]
     ).to_csv(factor_counts_path, index=False, encoding="utf-8-sig")
     sharpes_path = tables_dir / "Table_04_sharpes.csv"
-    pd.DataFrame([result.pipeline.sharpes]).to_csv(
-        sharpes_path, index=False, encoding="utf-8-sig"
-    )
+    pd.DataFrame([result.pipeline.sharpes]).to_csv(sharpes_path, index=False, encoding="utf-8-sig")
 
     sample_symbols_path = diagnostics_dir / "main_sample_symbols.csv"
-    pd.DataFrame({"symbol": result.panel.tickers}).to_csv(
-        sample_symbols_path,
-        index=False,
-        encoding="utf-8-sig",
-    )
+    pd.DataFrame({"symbol": result.panel.tickers}).to_csv(sample_symbols_path, index=False, encoding="utf-8-sig")
 
-    rolling_gc_df, rolling_explained_df = _rolling_output_frames(
-        result.rolling_gc,
-        result.rolling_explained_variation,
-    )
+    rolling_gc_df, rolling_explained_df = _rolling_output_frames(result.rolling_gc, result.rolling_explained_variation)
     rolling_gc_path = tables_dir / "Table_05_rolling_gc.csv"
     rolling_ev_path = tables_dir / "Table_06_rolling_explained_variation.csv"
     rolling_gc_df.to_csv(rolling_gc_path, index=False, encoding="utf-8-sig")
     rolling_explained_df.to_csv(rolling_ev_path, index=False, encoding="utf-8-sig")
 
-    paper_jump_path = tables_dir / "Table_08_paper_style_yearly_jump_stats.csv"
-    result.paper_jump_stats.to_csv(paper_jump_path, index=False, encoding="utf-8-sig")
-    paper_factor_counts_path = tables_dir / "Table_09_paper_style_factor_count_diagnostics.csv"
-    result.paper_factor_counts.to_csv(paper_factor_counts_path, index=False, encoding="utf-8-sig")
-    paper_sharpes_path = tables_dir / "Table_10_paper_style_factor_sharpes.csv"
-    result.paper_factor_sharpes.to_csv(paper_sharpes_path, index=False, encoding="utf-8-sig")
+    canonical_table_paths = {
+        "Table_I": tables_dir / "Table_I_summary_statistics_for_continuous_and_jump_returns.csv",
+        "Table_II": tables_dir / "Table_II_balanced_and_unbalanced_panel_results.csv",
+        "Table_III": tables_dir / "Table_III_generalized_correlations_with_industry_and_ffc_factors.csv",
+        "Table_IV": tables_dir / "Table_IV_time_variation_decomposition.csv",
+        "Table_V": tables_dir / "Table_V_intraday_overnight_daily_sharpe_ratios.csv",
+    }
+    legacy_table_aliases = {
+        "Table_I": [tables_dir / "Table_08_paper_style_yearly_jump_stats.csv"],
+        "Table_V": [tables_dir / "Table_10_paper_style_factor_sharpes.csv"],
+    }
+
+    _write_csv_with_aliases(result.paper_table_i, canonical_table_paths["Table_I"], legacy_table_aliases.get("Table_I"))
+    _write_csv_with_aliases(result.paper_table_ii, canonical_table_paths["Table_II"])
+    _write_csv_with_aliases(result.paper_table_iii, canonical_table_paths["Table_III"])
+    _write_csv_with_aliases(result.paper_table_iv, canonical_table_paths["Table_IV"])
+    _write_csv_with_aliases(result.paper_table_v, canonical_table_paths["Table_V"], legacy_table_aliases.get("Table_V"))
+
+    factor_count_diag_path = diagnostics_dir / "paper_factor_count_diagnostics.csv"
+    _write_csv_with_aliases(result.paper_factor_counts, factor_count_diag_path, [tables_dir / "Table_09_paper_style_factor_count_diagnostics.csv"])
 
     pca_weights_path = tables_dir / "Table_11_continuous_pca_weights.csv"
     result.pca_weights.to_csv(pca_weights_path, index=False, encoding="utf-8-sig")
@@ -1655,9 +2064,12 @@ def export_replication_outputs(
         "main_sample_symbols": str(sample_symbols_path),
         "rolling_gc": str(rolling_gc_path),
         "rolling_explained_variation": str(rolling_ev_path),
-        "paper_style_yearly_jump_stats": str(paper_jump_path),
-        "paper_style_factor_count_diagnostics": str(paper_factor_counts_path),
-        "paper_style_factor_sharpes": str(paper_sharpes_path),
+        "Table_I": str(canonical_table_paths["Table_I"]),
+        "Table_II": str(canonical_table_paths["Table_II"]),
+        "Table_III": str(canonical_table_paths["Table_III"]),
+        "Table_IV": str(canonical_table_paths["Table_IV"]),
+        "Table_V": str(canonical_table_paths["Table_V"]),
+        "paper_factor_count_diagnostics": str(factor_count_diag_path),
         "continuous_pca_weights": str(pca_weights_path),
         "proxy_factor_weights": str(proxy_weights_path),
         "monthly_pca_weights": str(monthly_weights_path),
@@ -1666,26 +2078,67 @@ def export_replication_outputs(
         "cumulative_factor_returns": str(cumulative_returns_path),
         "corp_action_risk": str(corp_action_path),
         "replication_coverage_report": str(coverage_path),
+        "Table_08": str(tables_dir / "Table_08_paper_style_yearly_jump_stats.csv"),
+        "Table_09": str(tables_dir / "Table_09_paper_style_factor_count_diagnostics.csv"),
+        "Table_10": str(tables_dir / "Table_10_paper_style_factor_sharpes.csv"),
+    }
+
+    legacy_figure_aliases = {
+        "Figure_1": [figures_dir / "Figure_01_number_of_hf_factors_unbalanced.png"],
+        "Figure_2": [figures_dir / "Figure_02_number_of_hf_factors_balanced.png"],
+        "Figure_3": [figures_dir / "Figure_03_proxy_factor_weights.png"],
+        "Figure_4": [figures_dir / "Figure_04_continuous_pca_weights.png"],
+        "Figure_5": [figures_dir / "Figure_05_monthly_pca_weights.png"],
+        "Figure_6": [figures_dir / "Figure_06_time_variation_loadings_gc.png"],
+        "Figure_7": [figures_dir / "Figure_07_local_continuous_factor_gc.png"],
+        "Figure_8": [figures_dir / "Figure_08_time_varying_portfolio_weights.png"],
+        "Figure_9": [figures_dir / "Figure_09_time_varying_explained_variation.png"],
+        "Figure_10": [figures_dir / "Figure_10_factor_structure_decomposition.png"],
+        "Figure_11": [figures_dir / "Figure_11_continuous_factor_structure_decomposition.png"],
+        "Figure_12": [figures_dir / "Figure_12_expected_intraday_overnight_returns.png"],
+        "Figure_13": [figures_dir / "Figure_13_cumulative_factor_returns.png"],
+        "Figure_14": [figures_dir / "Figure_14_asset_pricing_industry_portfolios.png"],
+        "Figure_15": [figures_dir / "Figure_15_asset_pricing_size_value_portfolios.png"],
     }
 
     if save_plots:
         plot_status, figure_files = export_all_paper_figures(result, figures_dir, rolling_gc_df, rolling_explained_df)
+        for figure_id, path in figure_files.items():
+            alias_paths = legacy_figure_aliases.get(figure_id, [])
+            _copy_alias_files(Path(path), alias_paths)
     else:
-        plot_status = pd.DataFrame([
-            {
-                "figure_id": f"Figure_{idx:02d}",
-                "title": f"Figure {idx}",
-                "file_path": "",
-                "status": "skipped",
-                "data_source": "--no-plots",
-                "notes": "Plot export skipped because --no-plots was used.",
-            }
-            for idx in range(1, 16)
-        ])
+        plot_status = pd.DataFrame(
+            [
+                {
+                    "figure_number": idx,
+                    "figure_id": f"Figure_{idx}",
+                    "title": f"Figure {idx}",
+                    "file_path": "",
+                    "status": "skipped",
+                    "data_source": "--no-plots",
+                    "notes": "Plot export skipped because --no-plots was used.",
+                }
+                for idx in range(1, 16)
+            ]
+        )
         figure_files = {}
+
+    plot_status = plot_status.copy()
+    plot_status["legacy_alias_path"] = plot_status["figure_id"].map(
+        lambda figure_id: ";".join(str(path) for path in legacy_figure_aliases.get(figure_id, []))
+    )
     result.plot_status = plot_status
+
     for figure_id, path in figure_files.items():
         exported_files[figure_id] = path
+        alias_paths = legacy_figure_aliases.get(figure_id, [])
+        for alias_path in alias_paths:
+            try:
+                alias_key = alias_path.stem.split("_")[0] + "_" + alias_path.stem.split("_")[1]
+            except Exception:
+                alias_key = alias_path.stem
+            exported_files[alias_key] = str(alias_path)
+
     plot_status_path = diagnostics_dir / "plot_export_status.csv"
     plot_status.to_csv(plot_status_path, index=False, encoding="utf-8-sig")
     exported_files["plot_export_status"] = str(plot_status_path)
@@ -1764,9 +2217,36 @@ def run_cn_replication(
 
     robustness = pd.DataFrame()
 
-    paper_jump_stats = build_paper_jump_stats(panel)
-    paper_factor_counts = build_paper_factor_counts(panel, k_max=k_max, gamma=gamma, g_fn=g_fn, jump_a=jump_a)
-    paper_factor_sharpes = build_factor_sharpe_table(pipeline)
+    paper_table_i = build_paper_jump_stats_comparison(
+        balanced_panel=panel,
+        proc_root=proc_root,
+        universe=universe,
+        workers=workers,
+        max_stocks=max_stocks,
+    )
+    paper_table_ii = build_paper_table_ii(
+        balanced_panel=panel,
+        proc_root=proc_root,
+        universe=universe,
+        jump_a=jump_a,
+        gamma=gamma,
+        g_fn=g_fn,
+        k_max=k_max,
+        workers=workers,
+        max_stocks=max_stocks,
+    )
+    paper_table_iii = build_paper_table_iii()
+    paper_factor_counts = build_paper_factor_counts_comparison(
+        balanced_panel=panel,
+        proc_root=proc_root,
+        universe=universe,
+        k_max=k_max,
+        gamma=gamma,
+        g_fn=g_fn,
+        jump_a=jump_a,
+        workers=workers,
+        max_stocks=max_stocks,
+    )
     replication_coverage = build_replication_coverage_report()
     pca_weights, proxy_weights = build_weight_tables(pipeline, panel)
     monthly_pca_weights = build_monthly_pca_weights(panel)
@@ -1777,6 +2257,9 @@ def run_cn_replication(
         window_days=max(rolling_window, 2),
     )
     factor_return_summary, cumulative_factor_returns = build_factor_return_tables(pipeline, panel)
+    rolling_gc_df, rolling_explained_df = _rolling_output_frames(rolling_gc, rolling_ev)
+    paper_table_iv = build_paper_table_iv(rolling_gc_df, rolling_explained_df)
+    paper_table_v = build_paper_table_v(pipeline)
 
     result = ReplicationResult(
         universe=universe,
@@ -1787,9 +2270,14 @@ def run_cn_replication(
         robustness=robustness,
         output_root=output_root,
         corp_action_risk=corp_action_risk,
-        paper_jump_stats=paper_jump_stats,
+        paper_jump_stats=paper_table_i,
         paper_factor_counts=paper_factor_counts,
-        paper_factor_sharpes=paper_factor_sharpes,
+        paper_factor_sharpes=paper_table_v,
+        paper_table_i=paper_table_i,
+        paper_table_ii=paper_table_ii,
+        paper_table_iii=paper_table_iii,
+        paper_table_iv=paper_table_iv,
+        paper_table_v=paper_table_v,
         replication_coverage=replication_coverage,
         pca_weights=pca_weights,
         proxy_weights=proxy_weights,
