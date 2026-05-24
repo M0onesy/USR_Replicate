@@ -1,0 +1,21 @@
+﻿paper_item,paper_content,status,notes
+Table I,Summary Statistics for Continuous and Jump Returns,implemented_adapted,已按 balanced / unbalanced 两块输出年度跳跃与连续收益统计。
+Table II,Balanced and Unbalanced Panel Results,implemented_adapted,已按 balanced vs unbalanced 输出 factor-space generalized correlations。
+Table III,Generalized Correlations with Industry and FFC Factors,external_data_required,需要行业组合收益与 Fama-French-Carhart 因子 CSV。
+Table IV,Time-Variation Decomposition across Frequencies,implemented_adapted,已输出 rolling GC / explained variation 的时间变化汇总。
+Table V,Intraday / Overnight / Daily Sharpe Ratios,implemented_adapted,已输出连续 PCA 因子的日内、隔夜、日度 Sharpe。
+Figure 1,"Number of HF Factors, Unbalanced Panel",implemented_adapted,已输出非平衡面板的 perturbed eigenvalue ratio 诊断图。
+Figure 2,"Number of HF Factors, Balanced Panel",implemented_adapted,已输出严格平衡面板的 perturbed eigenvalue ratio 诊断图。
+Figure 3,Proxy Factor Portfolio Weights,implemented_adapted,已输出 proxy factors 权重热图。
+Figure 4,Continuous PCA Factor Portfolio Weights,implemented_adapted,已输出连续 PCA 因子权重热图。
+Figure 5,Monthly PCA Factor Portfolio Weights,implemented_adapted,已输出月频 PCA 因子权重热图。
+Figure 6,Time Variation in Loadings,implemented_adapted,已输出滚动 GC 稳定性曲线。
+Figure 7,Locally Estimated Continuous Factors,implemented_adapted,已输出局部连续因子与全局因子的 GC 曲线。
+Figure 8,Time-Varying Portfolio Weights,implemented_adapted,已输出滚动窗口下 top 权重股票变化。
+Figure 9,Time-Varying Explained Variation,implemented_adapted,已输出滚动解释度。
+Figure 10,Factor-Structure Time Variation Decomposition,implemented_adapted,已输出 GC 与解释度的结构分解图。
+Figure 11,Continuous Factor-Structure Decomposition,implemented_adapted,已输出连续因子的结构分解图。
+Figure 12,Expected Intraday and Overnight Returns,implemented_adapted,已输出连续 PCA 因子的日内/隔夜/日度平均收益。
+Figure 13,Cumulative Factor Returns,implemented_adapted,已输出连续 PCA 因子的累计收益。
+Figure 14,Asset Pricing of Industry Portfolios,external_data_required,需要行业组合收益；当前仅输出占位图。
+Figure 15,Asset Pricing of Size- and Value-Sorted Portfolios,external_data_required,需要 size/value 测试资产组合；当前仅输出占位图。

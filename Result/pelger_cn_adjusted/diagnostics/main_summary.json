@@ -1,0 +1,63 @@
+{
+  "sample_report": {
+    "sample_mode": "strict_balanced",
+    "panel_return_scheme": "daily_intra_night_total_plus_full_5min_v1",
+    "requested_return_mode": "open_close",
+    "panel_name": "year_2013",
+    "adjustment": "backward",
+    "n_symbols_selected": 10,
+    "n_days_selected": 238,
+    "bars_per_day": 48,
+    "selected_calendar_start": "2013-01-04",
+    "selected_calendar_end": "2013-12-31",
+    "target_symbols": [
+      "000006.SZ",
+      "000011.SZ",
+      "000014.SZ",
+      "000016.SZ",
+      "000020.SZ",
+      "000025.SZ",
+      "000026.SZ",
+      "000027.SZ",
+      "000029.SZ",
+      "000031.SZ"
+    ],
+    "contains_nan": false,
+    "panel_workers": 8,
+    "proc_root": "D:\\Courses\\机器学习\\Reposit\\Data\\proc_Data\\pelger_cn_adjusted",
+    "years": [
+      2013
+    ]
+  },
+  "jump_stats": {
+    "frac_jump_increments": 0.01832107843137255,
+    "frac_qv_explained_by_jumps": 0.25179151381706577
+  },
+  "factor_counts": {
+    "K_hf_hat": 1,
+    "K_cont_hat": 1,
+    "K_jump_hat": 1,
+    "g_fn": "median_N",
+    "gamma": 0.08
+  },
+  "sharpes": {
+    "SR_intraday": 1.0480721750358797,
+    "SR_overnight": 3.235355846250024,
+    "SR_daily": 0.1273621104365612
+  },
+  "panel_return_scheme": "daily_intra_night_total_plus_full_5min_v1",
+  "requested_return_mode": "open_close",
+  "stage_timings": {
+    "load_proc_universe_sec": 2.00001522898674e-07,
+    "load_panel_sec": 0.03757380000024568,
+    "pipeline_core_sec": 0.06297349999658763,
+    "rolling_sec": 0.5027694000018528,
+    "paper_tables_sec": 0.14561990000220248,
+    "export_sec": 4.217974899998808,
+    "total_sec": 4.987620099993364
+  },
+  "plots_generated_count": 13,
+  "plots_placeholder_count": 2,
+  "plots_failed_count": 0,
+  "plots_skipped_count": 0
+}

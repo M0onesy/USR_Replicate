@@ -1,0 +1,9 @@
+{
+  "load_proc_universe_sec": 2.00001522898674e-07,
+  "load_panel_sec": 0.03757380000024568,
+  "pipeline_core_sec": 0.06297349999658763,
+  "rolling_sec": 0.5027694000018528,
+  "paper_tables_sec": 0.14561990000220248,
+  "export_sec": 4.217974899998808,
+  "total_sec": 4.987620099993364
+}

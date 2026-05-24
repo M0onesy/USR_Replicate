@@ -11,12 +11,16 @@ stability analysis, and exports results to `Result/`.
 
 from __future__ import annotations
 import argparse
+import contextlib
 import json
 import os
+import tempfile
+import time
 import numpy as np
 import pandas as pd
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from multiprocessing import get_context
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 import shutil
@@ -45,6 +49,12 @@ PANEL_RETURN_SCHEME = "daily_intra_night_total_plus_full_5min_v1"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PROC_ROOT = REPO_ROOT / "Data" / "proc_Data" / "pelger_cn_adjusted"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "Result" / "pelger_cn_adjusted"
+BLAS_THREAD_ENV_KEYS = (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+)
 
 
 def _default_worker_count() -> int:
@@ -57,6 +67,52 @@ def _normalize_worker_count(workers: Optional[int]) -> int:
     if workers is None:
         return _default_worker_count()
     return max(1, int(workers))
+
+
+def _resolve_stage_workers(
+    workers: Optional[int],
+    stage_workers: Optional[int],
+) -> int:
+    if stage_workers is not None:
+        return _normalize_worker_count(stage_workers)
+    return _normalize_worker_count(workers)
+
+
+@contextlib.contextmanager
+def _temporary_blas_thread_env(num_threads: int = 1):
+    previous = {key: os.environ.get(key) for key in BLAS_THREAD_ENV_KEYS}
+    value = str(max(1, int(num_threads)))
+    try:
+        for key in BLAS_THREAD_ENV_KEYS:
+            os.environ[key] = value
+        yield
+    finally:
+        for key, old_value in previous.items():
+            if old_value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old_value
+
+
+def _spawn_process_pool(max_workers: int) -> ProcessPoolExecutor:
+    return ProcessPoolExecutor(
+        max_workers=max(1, int(max_workers)),
+        mp_context=get_context("spawn"),
+    )
+
+
+def _chunk_sequence(values: Sequence[int], n_chunks: int) -> List[List[int]]:
+    if not values:
+        return []
+    chunk_count = max(1, min(int(n_chunks), len(values)))
+    chunk_size = (len(values) + chunk_count - 1) // chunk_count
+    return [list(values[i : i + chunk_size]) for i in range(0, len(values), chunk_size)]
+
+
+def _universe_attr_summary(universe: pd.DataFrame) -> Dict[str, Any]:
+    if "summary" not in universe.attrs:
+        raise ValueError("Processed universe is missing attrs['summary']; reload it with load_proc_universe().")
+    return dict(universe.attrs["summary"])
 
 
 def _safe_inv(mat: np.ndarray, eps: float = 1e-10) -> np.ndarray:
@@ -278,31 +334,48 @@ def _align_symbol_arrays_to_dates(
     return daily_intra, daily_night, daily_total, full_5min
 
 
-def _build_unbalanced_year_panel(
-    proc_root: Path,
+def _load_and_align_symbol_task(task: Tuple[Path, str, np.ndarray]) -> Tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    task_proc_root, symbol, codes = task
+    arrays = _load_symbol_arrays(task_proc_root, symbol)
+    intra, night, daily, full_5min = _align_symbol_arrays_to_dates(arrays, codes, allow_missing=True)
+    return symbol, intra, night, daily, full_5min
+
+
+def _year_dates_from_universe_summary(summary: Dict[str, Any], year: int) -> List[str]:
+    global_dates_by_year = summary.get("global_dates_by_year", {})
+    if isinstance(global_dates_by_year, dict):
+        return list(global_dates_by_year.get(int(year), global_dates_by_year.get(str(int(year)), [])))
+    return []
+
+
+def _select_unbalanced_symbols_for_year(
     universe: pd.DataFrame,
     year: int,
     max_stocks: Optional[int] = None,
-    workers: Optional[int] = None,
-) -> HFPanel:
-    """用逐股票缓存重建某一年的非平衡面板。"""
-    summary = summarize_cn_universe(universe)
-    year_dates = list(summary.get("global_dates_by_year", {}).get(int(year), []))
-    if not year_dates:
-        raise ValueError(f"找不到年份 {year} 的交易日历。")
-
+) -> List[str]:
     year_col = f"valid_days_{int(year)}"
     if year_col not in universe.columns:
         raise ValueError(f"universe 中缺少 {year_col}。请先重新预处理。")
-
     selected = universe.loc[universe[year_col] > 0, ["symbol"]].copy().sort_values("symbol")
     if max_stocks is not None:
         selected = selected.iloc[: int(max_stocks)].copy()
-    tickers = selected["symbol"].tolist()
+    return selected["symbol"].tolist()
+
+
+def _build_unbalanced_year_panel_from_dates_and_tickers(
+    proc_root: Path,
+    year: int,
+    year_dates: Sequence[str],
+    tickers: Sequence[str],
+    panel_workers: Optional[int] = None,
+) -> HFPanel:
+    tickers = [str(ticker) for ticker in tickers]
+    if not year_dates:
+        raise ValueError(f"找不到年份 {year} 的交易日历。")
     if not tickers:
         raise ValueError(f"{year} 年没有可用的非平衡样本。")
 
-    date_codes = np.array([int(date.replace("-", "")) for date in year_dates], dtype=np.int32)
+    date_codes = np.array([int(str(date).replace("-", "")) for date in year_dates], dtype=np.int32)
     fill_value = np.nan
     day_count = len(year_dates)
     bar_count = len(CN_5MIN_BAR_TIMES)
@@ -312,21 +385,14 @@ def _build_unbalanced_year_panel(
     R_daily = np.full((day_count, stock_count), fill_value, dtype=np.float64)
     R_5min_full = np.full((day_count * bar_count, stock_count), fill_value, dtype=np.float64)
 
-    workers = _normalize_worker_count(workers)
+    panel_workers = _normalize_worker_count(panel_workers)
     tasks = [(proc_root, symbol, date_codes) for symbol in tickers]
-
-    def _one(task: Tuple[Path, str, np.ndarray]) -> Tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        task_proc_root, symbol, codes = task
-        arrays = _load_symbol_arrays(task_proc_root, symbol)
-        intra, night, daily, full_5min = _align_symbol_arrays_to_dates(arrays, codes, allow_missing=True)
-        return symbol, intra, night, daily, full_5min
-
-    if workers == 1 or len(tasks) <= 1:
-        aligned = [_one(task) for task in tasks]
+    if panel_workers == 1 or len(tasks) <= 1:
+        aligned = [_load_and_align_symbol_task(task) for task in tasks]
     else:
         aligned = []
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(_one, task): task[1] for task in tasks}
+        with ThreadPoolExecutor(max_workers=panel_workers) as executor:
+            futures = {executor.submit(_load_and_align_symbol_task, task): task[1] for task in tasks}
             for future in as_completed(futures):
                 aligned.append(future.result())
 
@@ -348,11 +414,11 @@ def _build_unbalanced_year_panel(
         "n_symbols_selected": int(stock_count),
         "n_days_selected": int(day_count),
         "bars_per_day": int(bar_count),
-        "selected_calendar_start": year_dates[0],
-        "selected_calendar_end": year_dates[-1],
+        "selected_calendar_start": str(year_dates[0]),
+        "selected_calendar_end": str(year_dates[-1]),
         "target_symbols": tickers,
         "contains_nan": bool(np.isnan(R_intra).any() or np.isnan(R_5min_full).any()),
-        "panel_workers": int(workers),
+        "panel_workers": int(panel_workers),
     }
 
     return HFPanel(
@@ -371,12 +437,30 @@ def _build_unbalanced_year_panel(
     )
 
 
+def _build_unbalanced_year_panel(
+    proc_root: Path,
+    universe: pd.DataFrame,
+    year: int,
+    max_stocks: Optional[int] = None,
+    workers: Optional[int] = None,
+) -> HFPanel:
+    """用逐股票缓存重建某一年的非平衡面板。"""
+    summary = _universe_attr_summary(universe)
+    year_dates = _year_dates_from_universe_summary(summary, year)
+    tickers = _select_unbalanced_symbols_for_year(universe, year, max_stocks=max_stocks)
+    return _build_unbalanced_year_panel_from_dates_and_tickers(
+        proc_root=proc_root,
+        year=year,
+        year_dates=year_dates,
+        tickers=tickers,
+        panel_workers=workers,
+    )
+
+
 
 def summarize_cn_universe(universe: pd.DataFrame) -> Dict[str, Any]:
     """Summarize the already-preprocessed universe table."""
-    if "summary" not in universe.attrs:
-        raise ValueError("Processed universe is missing attrs['summary']; reload it with load_proc_universe().")
-    summary = dict(universe.attrs["summary"])
+    summary = _universe_attr_summary(universe)
     stats = dict(summary)
     if "coverage_ratio" in universe.columns and not universe.empty:
         stats["coverage_ratio_quantiles"] = {
@@ -838,6 +922,67 @@ def build_proxy_factors(
     return W_proxy, F_proxy
 
 
+def _day_offsets_from_day_ids(day_ids: np.ndarray) -> np.ndarray:
+    day_ids = np.asarray(day_ids, dtype=np.int64)
+    day_count = int(day_ids.max()) + 1 if day_ids.size else 0
+    counts = np.bincount(day_ids, minlength=day_count).astype(np.int64, copy=False)
+    offsets = np.zeros(day_count + 1, dtype=np.int64)
+    offsets[1:] = np.cumsum(counts)
+    return offsets
+
+
+def _rolling_local_pca_result(
+    R: np.ndarray,
+    day_offsets: np.ndarray,
+    start_day: int,
+    window_days: int,
+    K: int,
+    use_corr: bool,
+) -> Optional[Dict[str, Any]]:
+    end_day = int(start_day + window_days)
+    row_start = int(day_offsets[start_day])
+    row_end = int(day_offsets[end_day])
+    R_win = R[row_start:row_end]
+    if R_win.shape[0] < 2 * K:
+        return None
+    res = pca_factors(R_win, K=K, use_corr=use_corr)
+    return {
+        "start_day": int(start_day),
+        "end_day": int(end_day),
+        "Lambda": res.Lambda,
+        "eigvals": res.eigvals,
+        "scales": res.scales,
+    }
+
+
+def _save_array_for_memmap(path: Path, array: np.ndarray) -> Path:
+    np.save(path, np.asarray(array), allow_pickle=False)
+    return path
+
+
+def rolling_window_chunk_worker(task: Dict[str, Any]) -> List[Dict[str, Any]]:
+    R = np.load(task["R_path"], mmap_mode="r", allow_pickle=False)
+    day_offsets = np.asarray(task["day_offsets"], dtype=np.int64)
+    window_days = int(task["window_days"])
+    K = int(task["K"])
+    use_corr = bool(task["use_corr"])
+    out: List[Dict[str, Any]] = []
+    for window_index, start_day in task["window_specs"]:
+        result = _rolling_local_pca_result(
+            R=R,
+            day_offsets=day_offsets,
+            start_day=int(start_day),
+            window_days=window_days,
+            K=K,
+            use_corr=use_corr,
+        )
+        if result is None:
+            continue
+        result["window_index"] = int(window_index)
+        out.append(result)
+    return out
+
+
 def rolling_local_pca(
     R: np.ndarray,
     day_ids: np.ndarray,
@@ -847,34 +992,51 @@ def rolling_local_pca(
     use_corr: bool = True,
     workers: int = 1,
 ) -> List[Dict[str, Any]]:
-    """按滚动交易日窗口做局部 PCA."""
-    D = int(day_ids.max()) + 1
-
-    def _one_window(start: int) -> Optional[Dict[str, Any]]:
-        end = start + window_days
-        mask = (day_ids >= start) & (day_ids < end)
-        R_win = R[mask]
-        if R_win.shape[0] < 2 * K:
-            return None
-        res = pca_factors(R_win, K=K, use_corr=use_corr)
-        return {
-            "start_day": start,
-            "end_day": end,
-            "Lambda": res.Lambda,
-            "F": res.F,
-            "eigvals": res.eigvals,
-        }
-
-    starts = list(range(0, D - window_days + 1, step_days))
+    """按滚动交易日窗口做局部 PCA；多进程模式使用只读 memmap 共享输入矩阵。"""
+    D = int(day_ids.max()) + 1 if len(day_ids) else 0
+    starts = list(range(0, max(D - window_days + 1, 0), step_days))
     workers = max(1, int(workers))
+    day_offsets = _day_offsets_from_day_ids(day_ids)
+
     if workers == 1 or len(starts) <= 1:
-        results = [_one_window(start) for start in starts]
+        results = [
+            _rolling_local_pca_result(
+                R=R,
+                day_offsets=day_offsets,
+                start_day=start,
+                window_days=window_days,
+                K=K,
+                use_corr=use_corr,
+            )
+            for start in starts
+        ]
     else:
-        results = []
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(_one_window, start): start for start in starts}
-            for future in as_completed(futures):
-                results.append(future.result())
+        window_specs = list(enumerate(starts))
+        chunks = _chunk_sequence(window_specs, workers)
+        with tempfile.TemporaryDirectory(prefix="pelger_cn_roll_") as tmpdir, _temporary_blas_thread_env(1):
+            tmpdir_path = Path(tmpdir)
+            R_path = _save_array_for_memmap(tmpdir_path / "R.npy", np.asarray(R, dtype=np.float64))
+            tasks = [
+                {
+                    "R_path": str(R_path),
+                    "day_offsets": day_offsets.tolist(),
+                    "window_days": int(window_days),
+                    "K": int(K),
+                    "use_corr": bool(use_corr),
+                    "window_specs": [(int(window_index), int(start_day)) for window_index, start_day in chunk],
+                }
+                for chunk in chunks
+            ]
+            results = []
+            with _spawn_process_pool(workers) as executor:
+                futures = [executor.submit(rolling_window_chunk_worker, task) for task in tasks]
+                for future in as_completed(futures):
+                    results.extend(future.result())
+            results.sort(key=lambda item: int(item["window_index"]))
+            for item in results:
+                item.pop("window_index", None)
+            return results
+
     results = [result for result in results if result is not None]
     results.sort(key=lambda item: int(item["start_day"]))
     return results
@@ -916,6 +1078,53 @@ def rolling_explained_variation(
         total = float(eigvals.sum())
         ratios.append(float(eigvals[:K].sum() / total) if total > 0 else 0.0)
     return np.asarray(ratios, dtype=float)
+
+
+def rolling_gc_and_explained_variation_from_results(
+    rolling_results: Sequence[Dict[str, Any]],
+    global_Lambda: np.ndarray,
+    K: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """从已计算好的 rolling PCA 结果一次性拼出 GC 和 explained variation。"""
+    if not rolling_results:
+        return np.zeros((0, K)), np.zeros(0, dtype=float)
+
+    GC = np.zeros((len(rolling_results), K))
+    ratios: List[float] = []
+    for i, result in enumerate(rolling_results):
+        gc = generalized_correlations(global_Lambda, result["Lambda"])
+        GC[i, : len(gc)] = gc
+        eigvals = np.asarray(result["eigvals"], dtype=float)
+        total = float(eigvals.sum())
+        ratios.append(float(eigvals[:K].sum() / total) if total > 0 else 0.0)
+    return GC, np.asarray(ratios, dtype=float)
+
+
+def _rolling_weight_summary_from_results(
+    panel: HFPanel,
+    R_cont: np.ndarray,
+    K: int,
+    rolling_results: Sequence[Dict[str, Any]],
+    step_days: int = 21,
+    top_n: int = 8,
+) -> pd.DataFrame:
+    """Reuse rolling PCA outputs to avoid recomputing local PCA windows."""
+    W_global = factor_portfolio_weights(pca_factors(R_cont, K=K, use_corr=True))
+    selected_idx = np.argsort(-np.abs(W_global[:, 0]))[: min(top_n, panel.N)]
+    rows: List[Dict[str, Any]] = []
+    for result in rolling_results:
+        tmp = type("_RollingPCA", (), {})()
+        tmp.Lambda = result["Lambda"]
+        tmp.scales = result["scales"]
+        W_local = factor_portfolio_weights(tmp)  # type: ignore[arg-type]
+        for idx in selected_idx:
+            rows.append({
+                "start_day": int(result["start_day"]),
+                "end_day": int(result["end_day"]),
+                "symbol": panel.tickers[idx],
+                "weight_factor_1": float(W_local[idx, 0]),
+            })
+    return pd.DataFrame(rows)
 
 
 def rolling_gc_and_explained_variation(
@@ -1194,6 +1403,7 @@ def load_test_asset_csv(
 @dataclass
 class ReplicationResult:
     universe: pd.DataFrame
+    universe_summary: Dict[str, Any]
     panel: HFPanel
     pipeline: PelgerPipeline
     rolling_gc: np.ndarray
@@ -1218,6 +1428,7 @@ class ReplicationResult:
     cumulative_factor_returns: pd.DataFrame = field(default_factory=pd.DataFrame)
     plot_status: pd.DataFrame = field(default_factory=pd.DataFrame)
     exported_files: Dict[str, str] = field(default_factory=dict)
+    stage_timings: Dict[str, float] = field(default_factory=dict)
 
 
 def _rolling_output_frames(
@@ -1318,6 +1529,235 @@ def _panel_pca(R: np.ndarray, K: int, use_corr: bool = True) -> PCAResult:
     if np.isnan(R).any():
         return pca_factors_pairwise(R, K=K, use_corr=use_corr, psd_fix=True)
     return pca_factors(R, K=K, use_corr=use_corr)
+
+
+def _table_i_rows_for_panel(
+    panel: HFPanel,
+    panel_block: str,
+    thresholds: Sequence[float],
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    year = int(panel.dates[0].year) if panel.dates else -1
+    for a in thresholds:
+        R_cont, R_jump = detect_jumps(panel, a=float(a))
+        stats = jump_summary_stats(R_cont, R_jump)
+        jump_res = _panel_pca(R_jump, K=1, use_corr=True)
+        cont_res = _panel_pca(R_cont, K=min(4, panel.N), use_corr=True)
+        rows.append(
+            {
+                "panel_block": panel_block,
+                "year": year,
+                "threshold_a": float(a),
+                "n_symbols": int(panel.N),
+                "n_days": int(panel.D),
+                "frac_jump_increments": stats["frac_jump_increments"],
+                "frac_qv_explained_by_jumps": stats["frac_qv_explained_by_jumps"],
+                "jump_corr_explained_by_first_factor": _explained_variation_from_pca(jump_res, K=1),
+                "continuous_corr_explained_by_first_four": _explained_variation_from_pca(cont_res, K=min(4, cont_res.eigvals.shape[0])),
+            }
+        )
+    return rows
+
+
+def _factor_count_rows_for_panel(
+    panel: HFPanel,
+    panel_block: str,
+    jump_a: float,
+    k_max: int,
+    gamma: float,
+    g_fn: str,
+) -> List[Dict[str, Any]]:
+    year = int(panel.dates[0].year) if panel.dates else -1
+    R_cont, R_jump = detect_jumps(panel, a=jump_a)
+    rows: List[Dict[str, Any]] = []
+    for return_component, eigvals in {
+        "hf": _panel_pca(panel.R_5min_full, K=1, use_corr=True).eigvals,
+        "continuous": _panel_pca(R_cont, K=1, use_corr=True).eigvals,
+        "jump": _panel_pca(R_jump, K=1, use_corr=True).eigvals,
+    }.items():
+        K_hat, er = perturbed_eigenvalue_ratio(eigvals, g_fn=g_fn, N=panel.N, gamma=gamma, K_max=k_max)
+        row = {
+            "panel_block": panel_block,
+            "year": year,
+            "return_component": return_component,
+            "K_hat": int(max(1, K_hat)),
+            "g_fn": g_fn,
+            "gamma": float(gamma),
+        }
+        for idx, value in enumerate(er[:k_max], start=1):
+            row[f"er_{idx}"] = float(value)
+        rows.append(row)
+    return rows
+
+
+def _table_ii_rows_for_year(
+    year: int,
+    balanced_year: HFPanel,
+    unbalanced_year: HFPanel,
+    balanced_cont: np.ndarray,
+    balanced_jump: np.ndarray,
+    unbalanced_cont: np.ndarray,
+    unbalanced_jump: np.ndarray,
+    gamma: float,
+    g_fn: str,
+    k_max: int,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for component, bal_matrix, unb_matrix in [
+        ("hf", balanced_year.R_5min_full, unbalanced_year.R_5min_full),
+        ("continuous", balanced_cont, unbalanced_cont),
+        ("jump", balanced_jump, unbalanced_jump),
+    ]:
+        bal_res = _panel_pca(bal_matrix, K=1, use_corr=True)
+        unb_res = _panel_pca(unb_matrix, K=1, use_corr=True)
+        K_bal, _ = perturbed_eigenvalue_ratio(bal_res.eigvals, g_fn=g_fn, N=balanced_year.N, gamma=gamma, K_max=k_max)
+        K_unb, _ = perturbed_eigenvalue_ratio(unb_res.eigvals, g_fn=g_fn, N=unbalanced_year.N, gamma=gamma, K_max=k_max)
+        K_use = max(1, min(K_bal, K_unb, bal_res.F.shape[1], unb_res.F.shape[1]))
+        gc = generalized_correlations(bal_res.F[:, :K_use], unb_res.F[:, :K_use])
+        row = {
+            "year": int(year),
+            "return_component": component,
+            "balanced_n_symbols": int(balanced_year.N),
+            "unbalanced_n_symbols": int(unbalanced_year.N),
+            "K_balanced": int(max(1, K_bal)),
+            "K_unbalanced": int(max(1, K_unb)),
+            "gc_mean": float(np.nanmean(gc)) if len(gc) else np.nan,
+        }
+        for idx, value in enumerate(gc, start=1):
+            row[f"gc_{idx}"] = float(value)
+        rows.append(row)
+    return rows
+
+
+def yearly_paper_metrics_worker(task: Dict[str, Any]) -> Dict[str, Any]:
+    proc_root = Path(task["proc_root"])
+    year = int(task["year"])
+    thresholds = tuple(float(value) for value in task["thresholds"])
+    jump_a = float(task["jump_a"])
+    k_max = int(task["k_max"])
+    gamma = float(task["gamma"])
+    g_fn = str(task["g_fn"])
+    max_stocks = task.get("max_stocks")
+    year_dates = list(task["year_dates"])
+    tickers = list(task["tickers"])
+
+    balanced_year = load_proc_hf_panel(
+        proc_root=proc_root,
+        sample_mode=STRICT_BALANCED_SAMPLE,
+        years=[year],
+        return_mode="open_close",
+        max_stocks=max_stocks,
+    )
+    unbalanced_year = _build_unbalanced_year_panel_from_dates_and_tickers(
+        proc_root=proc_root,
+        year=year,
+        year_dates=year_dates,
+        tickers=tickers,
+        panel_workers=1,
+    )
+    balanced_cont, balanced_jump = detect_jumps(balanced_year, a=jump_a)
+    unbalanced_cont, unbalanced_jump = detect_jumps(unbalanced_year, a=jump_a)
+
+    return {
+        "year": year,
+        "table_i_rows": _table_i_rows_for_panel(balanced_year, "Balanced panel", thresholds)
+        + _table_i_rows_for_panel(unbalanced_year, "Unbalanced panel", thresholds),
+        "table_ii_rows": _table_ii_rows_for_year(
+            year=year,
+            balanced_year=balanced_year,
+            unbalanced_year=unbalanced_year,
+            balanced_cont=balanced_cont,
+            balanced_jump=balanced_jump,
+            unbalanced_cont=unbalanced_cont,
+            unbalanced_jump=unbalanced_jump,
+            gamma=gamma,
+            g_fn=g_fn,
+            k_max=k_max,
+        ),
+        "factor_count_rows": _factor_count_rows_for_panel(
+            balanced_year,
+            "Balanced panel",
+            jump_a=jump_a,
+            k_max=k_max,
+            gamma=gamma,
+            g_fn=g_fn,
+        )
+        + _factor_count_rows_for_panel(
+            unbalanced_year,
+            "Unbalanced panel",
+            jump_a=jump_a,
+            k_max=k_max,
+            gamma=gamma,
+            g_fn=g_fn,
+        ),
+    }
+
+
+def build_yearly_paper_outputs(
+    balanced_panel: HFPanel,
+    proc_root: Path,
+    universe: pd.DataFrame,
+    thresholds: Sequence[float] = (3.0, 4.0, 4.5, 5.0),
+    jump_a: float = 3.0,
+    gamma: float = 0.08,
+    g_fn: str = "median_N",
+    k_max: int = 10,
+    workers: Optional[int] = None,
+    max_stocks: Optional[int] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    years = sorted({date.year for date in balanced_panel.dates})
+    summary = _universe_attr_summary(universe)
+    tasks = [
+        {
+            "proc_root": str(proc_root),
+            "year": int(year),
+            "year_dates": _year_dates_from_universe_summary(summary, year),
+            "tickers": _select_unbalanced_symbols_for_year(universe, year, max_stocks=max_stocks),
+            "thresholds": [float(value) for value in thresholds],
+            "jump_a": float(jump_a),
+            "k_max": int(k_max),
+            "gamma": float(gamma),
+            "g_fn": str(g_fn),
+            "max_stocks": None if max_stocks is None else int(max_stocks),
+        }
+        for year in years
+    ]
+
+    worker_count = _normalize_worker_count(workers)
+    if worker_count == 1 or len(tasks) <= 1:
+        yearly_results = [yearly_paper_metrics_worker(task) for task in tasks]
+    else:
+        yearly_results = []
+        with _temporary_blas_thread_env(1):
+            with _spawn_process_pool(worker_count) as executor:
+                futures = [executor.submit(yearly_paper_metrics_worker, task) for task in tasks]
+                for future in as_completed(futures):
+                    yearly_results.append(future.result())
+    yearly_results.sort(key=lambda item: int(item["year"]))
+
+    table_i_rows = [row for item in yearly_results for row in item["table_i_rows"]]
+    table_ii_rows = [row for item in yearly_results for row in item["table_ii_rows"]]
+    factor_count_rows = [row for item in yearly_results for row in item["factor_count_rows"]]
+
+    table_i_df = pd.DataFrame(table_i_rows)
+    if not table_i_df.empty:
+        table_i_df = table_i_df.sort_values(["panel_block", "year", "threshold_a"]).reset_index(drop=True)
+
+    table_ii_df = pd.DataFrame(table_ii_rows)
+    if not table_ii_df.empty:
+        component_order = {"hf": 0, "continuous": 1, "jump": 2}
+        table_ii_df["_component_order"] = table_ii_df["return_component"].map(component_order).fillna(99)
+        table_ii_df = table_ii_df.sort_values(["year", "_component_order"]).drop(columns=["_component_order"]).reset_index(drop=True)
+
+    factor_count_df = pd.DataFrame(factor_count_rows)
+    if not factor_count_df.empty:
+        component_order = {"hf": 0, "continuous": 1, "jump": 2}
+        block_order = {"Balanced panel": 0, "Unbalanced panel": 1}
+        factor_count_df["_block_order"] = factor_count_df["panel_block"].map(block_order).fillna(99)
+        factor_count_df["_component_order"] = factor_count_df["return_component"].map(component_order).fillna(99)
+        factor_count_df = factor_count_df.sort_values(["_block_order", "year", "_component_order"]).drop(columns=["_block_order", "_component_order"]).reset_index(drop=True)
+
+    return table_i_df, table_ii_df, factor_count_df
 
 
 def build_paper_table_i(
@@ -1944,7 +2384,7 @@ def export_replication_outputs(
     figures_dir.mkdir(parents=True, exist_ok=True)
     diagnostics_dir.mkdir(parents=True, exist_ok=True)
 
-    universe_summary = summarize_cn_universe(result.universe)
+    universe_summary = result.universe_summary or summarize_cn_universe(result.universe)
     sample_report = result.panel.sample_report or {}
     main_summary = {
         "sample_report": sample_report,
@@ -1959,12 +2399,15 @@ def export_replication_outputs(
         "sharpes": result.pipeline.sharpes,
         "panel_return_scheme": result.panel.panel_return_scheme,
         "requested_return_mode": result.panel.requested_return_mode,
+        "stage_timings": result.stage_timings,
     }
 
     universe_csv = diagnostics_dir / "universe_scan.csv"
     result.universe.to_csv(universe_csv, index=False, encoding="utf-8-sig")
     _write_json(diagnostics_dir / "universe_summary.json", universe_summary)
     _write_json(diagnostics_dir / "main_summary.json", main_summary)
+    stage_timings_path = diagnostics_dir / "stage_timings.json"
+    _write_json(stage_timings_path, result.stage_timings)
 
     sample_summary_path = tables_dir / "Table_01_sample_summary.csv"
     pd.DataFrame(
@@ -2057,6 +2500,7 @@ def export_replication_outputs(
         "universe_scan": str(universe_csv),
         "universe_summary": str(diagnostics_dir / "universe_summary.json"),
         "main_summary": str(diagnostics_dir / "main_summary.json"),
+        "stage_timings": str(stage_timings_path),
         "sample_summary": str(sample_summary_path),
         "jump_stats": str(jump_stats_path),
         "factor_counts": str(factor_counts_path),
@@ -2167,18 +2611,30 @@ def run_cn_replication(
     save_plots: bool = True,
     universe: Optional[pd.DataFrame] = None,
     workers: Optional[int] = None,
+    paper_workers: Optional[int] = None,
+    rolling_workers: Optional[int] = None,
 ) -> ReplicationResult:
     """Run the China A-share replication from preprocessed proc_Data panels only."""
     proc_root = _ensure_path(proc_root)
     output_root = _ensure_path(output_root)
     workers = _normalize_worker_count(workers)
+    paper_workers = _resolve_stage_workers(workers, paper_workers)
+    rolling_workers = _resolve_stage_workers(workers, rolling_workers)
+    timings: Dict[str, float] = {}
+    t_total = time.perf_counter()
     manifest_path = proc_root / "manifest.json"
     if not manifest_path.exists():
         raise FileNotFoundError(
             f"Processed data manifest not found: {manifest_path}. Run Code/preprocess_cn_data.py first."
         )
 
-    universe = load_proc_universe(proc_root) if universe is None else universe
+    t = time.perf_counter()
+    if universe is None:
+        universe = load_proc_universe(proc_root)
+    timings["load_proc_universe_sec"] = time.perf_counter() - t if universe is not None else 0.0
+    universe_summary = summarize_cn_universe(universe)
+
+    t = time.perf_counter()
     panel = load_proc_hf_panel(
         proc_root=proc_root,
         sample_mode=STRICT_BALANCED_SAMPLE,
@@ -2186,7 +2642,9 @@ def run_cn_replication(
         return_mode=return_mode,
         max_stocks=max_stocks,
     )
+    timings["load_panel_sec"] = time.perf_counter() - t
 
+    t = time.perf_counter()
     corp_action_rows = []
     for ticker in panel.tickers:
         row = universe.loc[universe["symbol"] == ticker]
@@ -2204,65 +2662,66 @@ def run_cn_replication(
     corp_action_risk = pd.DataFrame(corp_action_rows)
 
     pipeline = PelgerPipeline(panel=panel, jump_a=jump_a, K_max=k_max, gamma=gamma, g_fn=g_fn).run_full()
+    timings["pipeline_core_sec"] = time.perf_counter() - t
+
     rolling_window = 21 if panel.D >= 21 else max(5, panel.D // 3)
-    rolling_gc, rolling_ev = rolling_gc_and_explained_variation(
+    t = time.perf_counter()
+    rolling_results = rolling_local_pca(
         R=pipeline.R_cont,
         day_ids=panel.day_ids,
         window_days=max(rolling_window, 2),
         K=pipeline.K_cont_hat,
-        global_Lambda=pipeline.pca_cont.Lambda,
         step_days=1,
-        workers=workers,
+        use_corr=True,
+        workers=rolling_workers,
     )
-
-    robustness = pd.DataFrame()
-
-    paper_table_i = build_paper_jump_stats_comparison(
-        balanced_panel=panel,
-        proc_root=proc_root,
-        universe=universe,
-        workers=workers,
-        max_stocks=max_stocks,
+    rolling_gc, rolling_ev = rolling_gc_and_explained_variation_from_results(
+        rolling_results=rolling_results,
+        global_Lambda=pipeline.pca_cont.Lambda,
+        K=pipeline.K_cont_hat,
     )
-    paper_table_ii = build_paper_table_ii(
-        balanced_panel=panel,
-        proc_root=proc_root,
-        universe=universe,
-        jump_a=jump_a,
-        gamma=gamma,
-        g_fn=g_fn,
-        k_max=k_max,
-        workers=workers,
-        max_stocks=max_stocks,
-    )
-    paper_table_iii = build_paper_table_iii()
-    paper_factor_counts = build_paper_factor_counts_comparison(
-        balanced_panel=panel,
-        proc_root=proc_root,
-        universe=universe,
-        k_max=k_max,
-        gamma=gamma,
-        g_fn=g_fn,
-        jump_a=jump_a,
-        workers=workers,
-        max_stocks=max_stocks,
-    )
-    replication_coverage = build_replication_coverage_report()
-    pca_weights, proxy_weights = build_weight_tables(pipeline, panel)
-    monthly_pca_weights = build_monthly_pca_weights(panel)
-    rolling_weight_summary = build_rolling_weight_summary(
+    rolling_weight_results = [
+        result
+        for result in rolling_results
+        if int(result.get("start_day", -1)) % 21 == 0
+    ]
+    rolling_weight_summary = _rolling_weight_summary_from_results(
         panel=panel,
         R_cont=pipeline.R_cont,
         K=pipeline.K_cont_hat,
-        window_days=max(rolling_window, 2),
+        rolling_results=rolling_weight_results,
+        step_days=21,
     )
+    timings["rolling_sec"] = time.perf_counter() - t
+
+    robustness = pd.DataFrame()
+
+    t = time.perf_counter()
+    paper_table_i, paper_table_ii, paper_factor_counts = build_yearly_paper_outputs(
+        balanced_panel=panel,
+        proc_root=proc_root,
+        universe=universe,
+        thresholds=(3.0, 4.0, 4.5, 5.0),
+        jump_a=jump_a,
+        gamma=gamma,
+        g_fn=g_fn,
+        k_max=k_max,
+        workers=paper_workers,
+        max_stocks=max_stocks,
+    )
+    paper_table_iii = build_paper_table_iii()
+    replication_coverage = build_replication_coverage_report()
+    pca_weights, proxy_weights = build_weight_tables(pipeline, panel)
+    monthly_pca_weights = build_monthly_pca_weights(panel)
     factor_return_summary, cumulative_factor_returns = build_factor_return_tables(pipeline, panel)
     rolling_gc_df, rolling_explained_df = _rolling_output_frames(rolling_gc, rolling_ev)
     paper_table_iv = build_paper_table_iv(rolling_gc_df, rolling_explained_df)
     paper_table_v = build_paper_table_v(pipeline)
+    timings["paper_tables_sec"] = time.perf_counter() - t
 
     result = ReplicationResult(
         universe=universe,
+        universe_summary=universe_summary,
         panel=panel,
         pipeline=pipeline,
         rolling_gc=rolling_gc,
@@ -2285,8 +2744,36 @@ def run_cn_replication(
         rolling_weight_summary=rolling_weight_summary,
         factor_return_summary=factor_return_summary,
         cumulative_factor_returns=cumulative_factor_returns,
+        stage_timings=dict(timings),
     )
+    t = time.perf_counter()
     export_replication_outputs(result, save_plots=save_plots)
+    timings["export_sec"] = time.perf_counter() - t
+    timings["total_sec"] = time.perf_counter() - t_total
+    result.stage_timings = dict(timings)
+    diagnostics_dir = output_root / "diagnostics"
+    _write_json(diagnostics_dir / "stage_timings.json", timings)
+    counts = result.plot_status["status"].value_counts().to_dict() if not result.plot_status.empty else {}
+    main_summary = {
+        "sample_report": result.panel.sample_report or {},
+        "jump_stats": result.pipeline.jump_stats,
+        "factor_counts": {
+            "K_hf_hat": result.pipeline.K_hf_hat,
+            "K_cont_hat": result.pipeline.K_cont_hat,
+            "K_jump_hat": result.pipeline.K_jump_hat,
+            "g_fn": result.pipeline.g_fn,
+            "gamma": result.pipeline.gamma,
+        },
+        "sharpes": result.pipeline.sharpes,
+        "panel_return_scheme": result.panel.panel_return_scheme,
+        "requested_return_mode": result.panel.requested_return_mode,
+        "stage_timings": timings,
+        "plots_generated_count": int(counts.get("generated", 0)),
+        "plots_placeholder_count": int(counts.get("placeholder", 0)),
+        "plots_failed_count": int(counts.get("error", 0)),
+        "plots_skipped_count": int(counts.get("skipped", 0)),
+    }
+    _write_json(diagnostics_dir / "main_summary.json", main_summary)
     return result
 
 def _print_scan_summary(universe: pd.DataFrame) -> None:
@@ -2315,7 +2802,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--proc-root", default=str(DEFAULT_PROC_ROOT), help="Preprocessed data directory")
     parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT), help="Result output directory")
-    parser.add_argument("--return-mode", default="open_close", choices=["open_close", "close_close"], help="已弃用，仅保留兼容，不影响收益定义")
+    parser.add_argument("--return-mode", default="open_close", choices=["open_close", "close_close"], help="Deprecated compatibility flag; panel return scheme is fixed by preprocess_cn_data.py.")
     parser.add_argument("--years", nargs="+", type=int, help="Run selected years, e.g. --years 2015 2016")
     parser.add_argument("--max-stocks", type=int, help="Use first N symbols for smoke tests")
     parser.add_argument("--no-plots", action="store_true", help="Do not export PNG figures")
@@ -2324,6 +2811,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gamma", type=float, default=0.08, help="Eigenvalue-ratio perturbation threshold")
     parser.add_argument("--g-fn", default="median_N", choices=["median_N", "median_sqrtN", "logN", "none"], help="Perturbed eigenvalue shift; median_N matches the paper default")
     parser.add_argument("--workers", type=int, help="Parallel workers for rolling PCA and robustness; default min(cpu_count - 1, 8)")
+    parser.add_argument("--paper-workers", type=int, help="Parallel workers for yearly paper tables; defaults to --workers")
+    parser.add_argument("--rolling-workers", type=int, help="Parallel workers for rolling PCA; defaults to --workers")
     return parser
 
 
@@ -2353,6 +2842,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         save_plots=not args.no_plots,
         universe=universe,
         workers=args.workers,
+        paper_workers=args.paper_workers,
+        rolling_workers=args.rolling_workers,
     )
     print_pipeline_summary(result.pipeline)
     print("Exported files:")
