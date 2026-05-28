@@ -1,3 +1,0 @@
-﻿required_dataset,status,paper_role,expected_loader,notes
-industry_portfolios,external_data_required,Industry portfolio returns used for generalized-correlation tests.,load_test_asset_csv(...),Current repository does not ship the paper's industry test-asset returns.
-ffc_factors,external_data_required,Fama-French-Carhart factors used in the paper's factor-space comparison.,"load_external_factor_csv(..., freq='daily')",Provide daily factor CSV or Parquet with a documented schema to replace this placeholder.
