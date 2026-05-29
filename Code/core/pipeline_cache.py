@@ -155,8 +155,9 @@ def get_existing_result(cfg: RunConfig, *, allow_fallback: bool = True) -> Repli
     raise RuntimeError(
         "当前没有可复用的 ReplicationResult。"
         f" 预期目录: {_cache_root(cfg)}。"
-        f"{details} 若需重建上游，请在 Code/ 目录运行 `python main.py --only all --rebuild-result --restart`，"
-        "或在仓库根目录运行 `python Code/main.py --only all --rebuild-result --restart`。"
+        f"{details} 若这是 main.py 的配置式运行，请去 Code/core/config.py 切换到重建 profile，"
+        "或把当前 ACTIVE_MAIN_PROFILE 对应配置改成 rebuild_result=True、restart=True 后重新运行 main.py。"
+        " 若这是单图/单表脚本独立运行，请显式加上 --allow-build。"
     )
 
 

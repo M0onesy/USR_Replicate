@@ -1,173 +1,154 @@
-# allcode_Need.py 拆分版 —— 论文图表生成总控台
+# `allcode_Need.py` 拆分版说明
 
-本目录是把原始单文件 `allcode_Need.py`（4900+ 行）按"每张图、每张表一篇独立脚本 +
-一个总控台"重构后的版本。重构遵循 **Option A：上游昂贵计算只跑一次，所有图表复用**。
+本目录是把原先的大型单文件流程拆成“核心引擎 + 图表脚本 + 表格脚本 + 总控入口”的版本，目标是让结果复用、调试和维护更清晰。
 
-> 核心承诺：`core/engine.py` 里的计算逻辑是从 `allcode_Need.py` **逐字节迁移** 的，
-> 没有改动任何数学，因此数值结果与原脚本完全一致。本次重构只做"拆分、编排、日志、
-> 缓存"这些外围工程化工作。
+当前有两个关键约定：
 
----
+1. `main.py` 现在是 **纯配置驱动入口**。
+2. 单图/单表脚本仍然保留各自的独立 CLI，用于局部调试。
 
 ## 目录结构
 
-```
+```text
 Code/
-├─ main.py                  总控台：调度全部 / 单个图表，持续心跳，运行汇总
-├─ core/                    共享层
-│  ├─ engine.py             ★ 全部重活（迁移自 allcode_Need.py，数学不变）
-│  ├─ config.py             RunConfig：单次运行参数
-│  ├─ pipeline_cache.py     一次计算多处复用的缓存（内存 + 磁盘 pickle）
-│  ├─ logging_utils.py      每脚本日志 + 后台心跳线程
-│  ├─ io_utils.py           输出目录 / 权威文件名 / 滚动结果切片 / 底层绘图复用
-│  ├─ runner.py             图表脚本统一运行脚手架
-│  └─ registry.py           所有图/表任务的总目录（新增任务在此登记）
-├─ figcode/                 每张图一篇（figure_01.py ... figure_15.py）
-└─ tablecode/               每张表一篇（table_i ... table_v + 配套表）
+├─ main.py                  总控入口：读取 core/config.py 中的主运行配置后执行
+├─ core/
+│  ├─ engine.py             核心复现引擎与重型计算流程
+│  ├─ config.py             运行参数 RunConfig + main.py 集中式 profile 配置
+│  ├─ pipeline_cache.py     ReplicationResult 的内存/磁盘缓存复用
+│  ├─ logging_utils.py      控制台日志与心跳
+│  ├─ io_utils.py           输出路径与通用 I/O 工具
+│  ├─ runner.py             单图/单表脚本统一执行器
+│  └─ registry.py           全部图表任务注册表
+├─ figcode/                 每张图一个脚本
+└─ tablecode/               每张表一个脚本
 ```
 
-把本 `Code/` 直接覆盖到原仓库的 `Code/` 位置即可，路径（`Data/proc_Data`、
-`Result/`）与原脚本完全兼容。
+## `main.py` 现在怎么运行
 
----
+`main.py` 不再接受 `--only`、`--restart`、`--rebuild-result` 之类命令行参数。
 
-## 为什么这样拆（Option A 设计说明）
+现在的用法是：
 
-原脚本的真实结构是"**先算后导**"：
-`run_cn_replication()` 做完所有重活（载入面板、跳跃分解、PCA、滚动 PCA、逐年论文表），
-产出一个 `ReplicationResult` 对象；之后每张图 / 表只是从这个对象里**取字段**画图或落表，
-本身非常便宜。
-
-因此如果让每个图表脚本各自重跑一遍 pipeline，"全部运行"就会把几小时的 PCA 重复二十多次。
-Option A 的做法：
-
-1. `main.py` 先通过 `pipeline_cache.get_result()` 把 `ReplicationResult` 准备好
-   （命中缓存秒回，否则构建一次并落盘）。
-2. 再把同一个 result 依次喂给每个图表脚本，**零重算**。
-3. 单独运行某一篇脚本时，它会自动命中磁盘缓存；没有缓存才触发一次构建。
-
-这样既满足"单独跑某一篇方便调试"，又不牺牲"全部运行"的速度。
-
----
-
-## 快速开始
-
-### 1. 列出所有可用任务
+1. 打开 [core/config.py](/d:/Courses/机器学习/Reposit/Code/core/config.py:1)
+2. 修改 `ACTIVE_MAIN_PROFILE`
+3. 如有需要，调整 `MAIN_RUN_PROFILES` 中对应 profile 的常量
+4. 在 PyCharm 里直接点运行 `main.py`，或在终端执行：
 
 ```bash
-python main.py --list
+python main.py
 ```
 
-### 2. 全部运行（15 图 + 9 表）
+如果你在仓库根目录运行，则使用：
 
 ```bash
-python main.py --only all
+python Code/main.py
 ```
 
-首次会构建一次 `ReplicationResult`（最耗时的一步），随后所有图表复用它。
+## 主运行配置在哪里改
 
-### 3. 只跑图 / 只跑表 / 单独一篇
+`core/config.py` 里现在有三层关键内容：
+
+1. `RunConfig`
+   底层运行参数容器，给 pipeline、缓存、图表导出共用。
+
+2. `MAIN_RUN_PROFILES`
+   `main.py` 的预设运行方案字典。
+
+3. `ACTIVE_MAIN_PROFILE`
+   当前真正生效的主入口 profile 名称。你在 PyCharm 点运行时，程序就按它执行。
+
+默认内置了这些 profile：
+
+- `export_all`
+  优先复用已有 `ReplicationResult`，导出全部图和表。
+- `figures_only`
+  只导出全部图。
+- `tables_only`
+  只导出全部表。
+- `fig13_only`
+  只跑 `fig13`，适合局部调试。
+- `rebuild_all`
+  显式重建上游 `ReplicationResult`，然后再导出全部结果。
+
+## 推荐工作流
+
+### 1. 平时重导结果
+
+把 `ACTIVE_MAIN_PROFILE` 设为：
+
+```python
+ACTIVE_MAIN_PROFILE = "export_all"
+```
+
+这会优先复用已有 `ReplicationResult`，不会默认重新跑 20 小时级上游计算。
+
+### 2. 只看某一张图
+
+把 `ACTIVE_MAIN_PROFILE` 设为：
+
+```python
+ACTIVE_MAIN_PROFILE = "fig13_only"
+```
+
+然后直接运行 `main.py`。
+
+### 3. 真的需要重建上游
+
+把 `ACTIVE_MAIN_PROFILE` 切到：
+
+```python
+ACTIVE_MAIN_PROFILE = "rebuild_all"
+```
+
+或者在 `MAIN_RUN_PROFILES` 里把当前 profile 改成：
+
+- `rebuild_result=True`
+- `restart=True`
+
+然后再运行 `main.py`。
+
+## 结果复用逻辑
+
+`main.py` 会先尝试从：
+
+- `Result/.../checkpoints/replication_result_*.pkl`
+
+复用已有 `ReplicationResult`。
+
+如果存在精确签名缓存，就直接命中。
+如果精确签名没命中，但当前是导出模式，程序还会回退尝试最近一次已完成的缓存结果。
+
+只有在 profile 明确要求 `rebuild_result=True` 时，才会进入重型 pipeline。
+
+## 心跳与进度
+
+`main.py` 的心跳现在也由 `core/config.py` 控制：
+
+- `enable_heartbeat`
+- `heartbeat_sec`
+
+适合在 PyCharm 中直接看控制台进度，不必再传 `--heartbeat-sec` 或 `--no-heartbeat`。
+
+## 单图 / 单表脚本
+
+这次集中配置只收口 `main.py`。
+
+因此下面这些入口仍然保持原有 CLI：
 
 ```bash
-python main.py --only figures        # 所有图
-python main.py --only tables         # 所有表
-python main.py --only fig8           # 只跑 Figure 8
-python main.py --only fig8 table_i   # Figure 8 + Table I
+python figcode/figure_13.py
+python tablecode/table_i.py --years 2024
 ```
 
-### 4. 小样本快速跑通（强烈建议先用它验证环境）
+如果单脚本运行时没有可复用缓存，而你又允许它显式构建上游，可以继续使用：
 
 ```bash
-python main.py --only all --years 2016 --max-stocks 10
+python figcode/figure_13.py --allow-build
 ```
 
-### 5. 单独运行某个脚本（不经过 main）
+## 注意事项
 
-每个图表脚本都能独立执行，会自动走缓存：
-
-```bash
-python figcode/figure_08.py
-python tablecode/table_i.py --years 2016 --max-stocks 10
-```
-
----
-
-## 心跳与调试
-
-- **持续心跳**：`main.py` 后台每隔 `--heartbeat-sec` 秒（默认 10s）报告
-  "已运行多久 / 当前任务 / 已完成几项"，长任务卡住时一眼看出停在哪。
-  关闭用 `--no-heartbeat`。
-- **每脚本日志**：每篇图表脚本被运行到时都会打印
-  `[开始] / [数据处理] / [图表输出] / [完成(含耗时)]`。
-  其中 **[数据处理] 与 [图表输出] 明确分段**，方便判断"是数据处理重还是绘图重、卡在哪一步"。
-- **容错**：默认 `--keep-going`，单个任务报错不影响其余任务，最后给出成功/失败汇总；
-  想一遇错就停加 `--fail-fast`。
-
----
-
-## 常用参数
-
-| 参数 | 含义 |
-| --- | --- |
-| `--only` | 任务选择：`all` / `figures` / `tables` / 具体短名（见 `--list`） |
-| `--list` | 列出所有任务后退出 |
-| `--proc-root` | 预处理数据目录（默认 `Data/proc_Data/pelger_cn_adjusted`） |
-| `--output-root` | 结果输出目录（默认 `Result/pelger_cn_adjusted`） |
-| `--years` | 指定年份，如 `--years 2016 2017` |
-| `--max-stocks` | 只用前 N 只股票（smoke test） |
-| `--jump-a` / `--k-max` / `--gamma` / `--g-fn` | 论文方法参数（影响数值，会进入缓存键） |
-| `--workers` / `--paper-workers` / `--rolling-workers` | 并行 worker 数 |
-| `--memory-budget-gb` | 自适应内存预算 |
-| `--heartbeat-sec` | 心跳间隔秒数 |
-| `--fail-fast` / `--no-heartbeat` | 容错与心跳开关 |
-| `--restart` | 丢弃兼容 checkpoint 重跑上游 pipeline |
-
-> 改变 `--years / --max-stocks / --jump-a / --k-max / --gamma / --g-fn / --proc-root`
-> 会改变缓存键，从而自动失效旧缓存、触发重算；纯性能参数（worker / 心跳）不影响缓存。
-
----
-
-## 图表清单
-
-**图（figcode/，对应论文 Figure 1-15）**
-
-| 短名 | 图 | 说明 |
-| --- | --- | --- |
-| fig1 / fig2 | Figure 1 / 2 | HF 因子个数（非平衡 / 平衡面板的扰动特征值比折线） |
-| fig3 / fig4 / fig5 | Figure 3 / 4 / 5 | 代理 / 连续 PCA / 月频 PCA 因子组合权重热图 |
-| fig6 / fig7 | Figure 6 / 7 | 载荷时间变化（全部 GC / 前 4 个主因子 GC） |
-| fig8 / fig9 | Figure 8 / 9 | 随时间变化的组合权重 / 解释方差 |
-| fig10 / fig11 | Figure 10 / 11 | 因子结构时间变化分解 / 连续因子结构分解 |
-| fig12 / fig13 | Figure 12 / 13 | 预期日内与隔夜收益 / 因子累计收益 |
-| fig14 / fig15 | Figure 14 / 15 | 行业 / size-value 组合资产定价（**需外部数据，当前占位图**） |
-
-**表（tablecode/，对应论文 Table I-V + 配套）**
-
-| 短名 | 表 | 说明 |
-| --- | --- | --- |
-| table_i | Table I | 连续 / 跳跃收益汇总统计 |
-| table_ii | Table II | 平衡 / 非平衡面板因子空间广义相关性 |
-| table_iii | Table III | 行业 / FFC 因子 GC（**需外部数据，当前占位说明**） |
-| table_iv | Table IV | 时间变化分解汇总 |
-| table_v | Table V | 日内 / 隔夜 / 日度夏普 |
-| table_fc | — | 扰动特征值比诊断表（Figure 1-2 的数值底座） |
-| table_w | — | 连续 / 代理 / 月频因子权重表（Figure 3-5 的底座） |
-| table_fr | — | 因子收益摘要（Figure 12-13 的底座） |
-| table_cov | — | 复现覆盖度报告 |
-
-> 外部数据缺口（Table III、Figure 14/15）按原脚本策略输出**明确占位**，
-> 保持论文编号完整、不静默缺失。要补全请提供相应测试资产 / 因子 CSV，
-> 并接入 `engine.load_test_asset_csv` / `engine.load_external_factor_csv`。
-
----
-
-## 与原脚本的等价性 / 一键全量
-
-- 计算逻辑（`core/engine.py`）与 `allcode_Need.py` 数学等价。
-- 如果你想用原脚本式的"一次性全量复现"（含 checkpoint 续跑等），`engine.py` 内仍保留
-  `run_cn_replication / export_replication_outputs / export_all_paper_figures`，可直接调用。
-- 本拆分版的 `main.py` 是更适合**维护调试**的入口：可单跑、可分组、有心跳、有分段日志。
-
-## 依赖
-
-`numpy`、`pandas`、`scipy`、`matplotlib`（与原项目一致）。
+- `main.py` 若收到任何命令行参数，会直接报错，并提示去修改 `core/config.py`。
+- `restart=True` 只能和 `rebuild_result=True` 一起使用；配置写错会在启动前直接报错。
+- 如果只是展示层修改，优先使用已有 `ReplicationResult` 重导，不要轻易切到 `rebuild_all`。
