@@ -87,6 +87,7 @@ CHECKPOINT_FORMAT_VERSION = 1
 ROLLING_CHECKPOINT_WINDOW_COUNT = 64
 PAPER_PANEL_THREAD_CAP = 4
 PAPER_MEMORY_SAFETY_MULTIPLIER = 1.35
+DISPLAY_CONTINUOUS_FACTOR_COUNT = 4
 
 
 def _default_worker_count() -> int:
@@ -1580,6 +1581,20 @@ class PCAResult:
     counts: Optional[np.ndarray] = None
 
 
+def _truncate_pca_result(res: PCAResult, K: int) -> PCAResult:
+    """Keep the first K factors while preserving the original eigen-spectrum metadata."""
+    K_eff = min(max(int(K), 1), int(res.Lambda.shape[1]))
+    return PCAResult(
+        Lambda=res.Lambda[:, :K_eff],
+        F=res.F[:, :K_eff],
+        eigvals=res.eigvals,
+        scales=res.scales,
+        use_corr=res.use_corr,
+        covariance=res.covariance,
+        counts=res.counts,
+    )
+
+
 @dataclass
 class YearJumpDecomposition:
     threshold: float
@@ -2744,14 +2759,19 @@ class PelgerPipeline:
     K_hf_hat: int = 0
     K_cont_hat: int = 0
     K_jump_hat: int = 0
+    display_factor_count: int = DISPLAY_CONTINUOUS_FACTOR_COUNT
 
     pca_hf: Optional[PCAResult] = None
     pca_cont: Optional[PCAResult] = None
     pca_jump: Optional[PCAResult] = None
+    pca_cont_display: Optional[PCAResult] = None
 
     F_cont_daily_intra: Optional[np.ndarray] = None
     F_cont_daily_night: Optional[np.ndarray] = None
     F_cont_daily_total: Optional[np.ndarray] = None
+    F_cont_display_daily_intra: Optional[np.ndarray] = None
+    F_cont_display_daily_night: Optional[np.ndarray] = None
+    F_cont_display_daily_total: Optional[np.ndarray] = None
     sharpes: Dict[str, float] = field(default_factory=dict)
 
     def step1_decompose(self) -> None:
@@ -2776,6 +2796,11 @@ class PelgerPipeline:
         self.pca_hf = pca_factors(self.panel.R_5min_full, K=self.K_hf_hat, use_corr=self.use_corr)
         self.pca_cont = pca_factors(self.R_cont, K=self.K_cont_hat, use_corr=self.use_corr)
         self.pca_jump = pca_factors(self.R_jump, K=self.K_jump_hat, use_corr=self.use_corr)
+        display_k = min(max(1, int(self.display_factor_count)), self.panel.N)
+        if self.pca_cont.Lambda.shape[1] >= display_k:
+            self.pca_cont_display = _truncate_pca_result(self.pca_cont, display_k)
+        else:
+            self.pca_cont_display = pca_factors(self.R_cont, K=display_k, use_corr=self.use_corr)
 
     def step4_asset_pricing(self) -> None:
         W = factor_portfolio_weights(self.pca_cont)
@@ -2795,6 +2820,23 @@ class PelgerPipeline:
             rf_intra=self.panel.rf_intra,
             rf_night=self.panel.rf_night,
         )
+
+        display_pca = self.pca_cont_display if self.pca_cont_display is not None else self.pca_cont
+        W_display = factor_portfolio_weights(display_pca)
+        F_display_intra_daily = self.panel.R_intra @ W_display
+        F_display_night_daily = self.panel.R_night @ W_display
+        F_display_daily_total = self.panel.R_daily @ W_display
+        if not np.allclose(
+            F_display_daily_total,
+            F_display_intra_daily + F_display_night_daily,
+            equal_nan=True,
+            atol=1e-12,
+        ):
+            raise ValueError("Display factor daily returns must equal intraday plus overnight returns")
+
+        self.F_cont_display_daily_intra = F_display_intra_daily
+        self.F_cont_display_daily_night = F_display_night_daily
+        self.F_cont_display_daily_total = F_display_daily_total
 
     def run_full(self) -> "PelgerPipeline":
         self.step1_decompose()
@@ -3972,9 +4014,10 @@ def build_replication_coverage_report() -> pd.DataFrame:
 
 def build_weight_tables(pipe: PelgerPipeline, panel: HFPanel, top_n: int = 30) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """导出连续 PCA 权重和 proxy 权重，支持论文 Figure 3-4。"""
-    W = factor_portfolio_weights(pipe.pca_cont)
+    pca_display = pipe.pca_cont_display if pipe.pca_cont_display is not None else pipe.pca_cont
+    W = factor_portfolio_weights(pca_display)
     W_proxy, _ = build_proxy_factors(W, pipe.R_cont)
-    k_count = min(W.shape[1], 4)
+    k_count = min(W.shape[1], DISPLAY_CONTINUOUS_FACTOR_COUNT)
     rows: List[Dict[str, Any]] = []
     proxy_rows: List[Dict[str, Any]] = []
     for k in range(k_count):
@@ -4029,9 +4072,13 @@ def build_rolling_weight_summary(panel: HFPanel, R_cont: np.ndarray, K: int, win
 
 def build_factor_return_tables(pipe: PelgerPipeline, panel: HFPanel) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """生成连续 PCA 因子的均值和累计收益，支持论文 Figure 12-13。"""
-    F_intra = pipe.F_cont_daily_intra
-    F_night = pipe.F_cont_daily_night
-    F_daily = pipe.F_cont_daily_total if pipe.F_cont_daily_total is not None else F_intra + F_night
+    F_intra = pipe.F_cont_display_daily_intra if pipe.F_cont_display_daily_intra is not None else pipe.F_cont_daily_intra
+    F_night = pipe.F_cont_display_daily_night if pipe.F_cont_display_daily_night is not None else pipe.F_cont_daily_night
+    F_daily = (
+        pipe.F_cont_display_daily_total
+        if pipe.F_cont_display_daily_total is not None
+        else (pipe.F_cont_daily_total if pipe.F_cont_daily_total is not None else F_intra + F_night)
+    )
     rows: List[Dict[str, Any]] = []
     cum_rows: List[Dict[str, Any]] = []
     for k in range(F_intra.shape[1]):
@@ -4053,6 +4100,37 @@ def build_factor_return_tables(pipe: PelgerPipeline, panel: HFPanel) -> Tuple[pd
                 "cum_daily": float(cum_daily[day_idx]),
             })
     return pd.DataFrame(rows), pd.DataFrame(cum_rows)
+
+
+def refresh_replication_result_views(result: ReplicationResult) -> ReplicationResult:
+    """Refresh lightweight presentation-layer tables from an existing ReplicationResult.
+
+    This is intentionally cheap: it only recomputes display-facing derivatives from the
+    already-loaded balanced panel and continuous-return decomposition.
+    """
+    pipe = result.pipeline
+    panel = result.panel
+    if getattr(pipe, "R_cont", None) is None or getattr(pipe, "pca_cont", None) is None:
+        return result
+
+    display_k = min(max(1, int(DISPLAY_CONTINUOUS_FACTOR_COUNT)), int(panel.N))
+    current_display = getattr(pipe, "pca_cont_display", None)
+    if current_display is None or int(current_display.Lambda.shape[1]) != display_k:
+        if int(pipe.pca_cont.Lambda.shape[1]) >= display_k:
+            pipe.pca_cont_display = _truncate_pca_result(pipe.pca_cont, display_k)
+        else:
+            pipe.pca_cont_display = pca_factors(pipe.R_cont, K=display_k, use_corr=pipe.use_corr)
+
+    W_display = factor_portfolio_weights(pipe.pca_cont_display)
+    pipe.F_cont_display_daily_intra = panel.R_intra @ W_display
+    pipe.F_cont_display_daily_night = panel.R_night @ W_display
+    pipe.F_cont_display_daily_total = panel.R_daily @ W_display
+
+    result.pca_weights, result.proxy_weights = build_weight_tables(pipe, panel)
+    result.factor_return_summary, result.cumulative_factor_returns = build_factor_return_tables(pipe, panel)
+    if result.monthly_pca_weights.empty:
+        result.monthly_pca_weights = build_monthly_pca_weights(panel)
+    return result
 
 
 def _maybe_save_plot(
@@ -4142,6 +4220,52 @@ def _save_line_plot(df: pd.DataFrame, x_col: str, y_cols: Sequence[str], title: 
     ax.grid(True, alpha=0.25)
     fig.autofmt_xdate(rotation=30)
     fig.tight_layout()
+    _atomic_save_figure(fig, output_path, dpi=160)
+    plt.close(fig)
+
+
+def _save_cumulative_factor_grid_plot(
+    df: pd.DataFrame,
+    title: str,
+    output_path: Path,
+    ylabel: str = "Cumulative log return",
+) -> None:
+    import matplotlib.pyplot as plt
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plot_df = df.copy()
+    plot_df["date"] = pd.to_datetime(plot_df["date"])
+    factors = sorted(int(value) for value in plot_df["factor"].dropna().unique().tolist())
+    ncols = 1 if len(factors) <= 1 else 2
+    nrows = max(1, (len(factors) + ncols - 1) // ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(12, 3.4 * nrows), sharex=True)
+    axes_arr = np.atleast_1d(axes).ravel()
+    line_specs = [
+        ("cum_intraday", "Intraday"),
+        ("cum_overnight", "Overnight"),
+        ("cum_daily", "Daily"),
+    ]
+
+    for ax, factor in zip(axes_arr, factors):
+        factor_df = plot_df.loc[plot_df["factor"].eq(factor)].sort_values("date")
+        for column, label in line_specs:
+            if column in factor_df.columns:
+                ax.plot(factor_df["date"], factor_df[column], label=label, linewidth=1.3)
+        ax.set_title(f"Factor {factor}")
+        if ylabel:
+            ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.25)
+
+    for ax in axes_arr[len(factors):]:
+        ax.set_visible(False)
+
+    if factors:
+        axes_arr[0].legend(loc="best", fontsize=8)
+    for ax in axes_arr[: len(factors)]:
+        ax.set_xlabel("date")
+    fig.suptitle(title)
+    fig.autofmt_xdate(rotation=30)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
     _atomic_save_figure(fig, output_path, dpi=160)
     plt.close(fig)
 
@@ -4314,8 +4438,12 @@ def export_all_paper_figures(
         if result.cumulative_factor_returns.empty:
             _save_placeholder_figure(output_path, figure_specs[13][2], "No cumulative factor return data are available.")
             return
-        df = result.cumulative_factor_returns.loc[result.cumulative_factor_returns["factor"].eq(1)].copy()
-        _save_line_plot(df, "date", ["cum_intraday", "cum_overnight", "cum_daily"], f"{figure_specs[13][2]}, Factor 1", output_path, ylabel="Cumulative log return")
+        _save_cumulative_factor_grid_plot(
+            result.cumulative_factor_returns,
+            figure_specs[13][2],
+            output_path,
+            ylabel="Cumulative log return",
+        )
 
     run_plot(8, "rolling_weight_summary", fig08)
     run_plot(9, "rolling_explained_variation", lambda path: _save_line_plot(rolling_explained_df, "window_index", ["explained_variation"], figure_specs[9][2], path, ylabel="Explained variation"))
@@ -4353,6 +4481,9 @@ def export_replication_outputs(
             "K_hf_hat": result.pipeline.K_hf_hat,
             "K_cont_hat": result.pipeline.K_cont_hat,
             "K_jump_hat": result.pipeline.K_jump_hat,
+            "display_cont_factor_count": int(
+                result.pipeline.pca_cont_display.Lambda.shape[1]
+            ) if result.pipeline.pca_cont_display is not None else 0,
             "g_fn": result.pipeline.g_fn,
             "gamma": result.pipeline.gamma,
         },
@@ -4810,6 +4941,9 @@ def run_cn_replication(
                 "K_hf_hat": result.pipeline.K_hf_hat,
                 "K_cont_hat": result.pipeline.K_cont_hat,
                 "K_jump_hat": result.pipeline.K_jump_hat,
+                "display_cont_factor_count": int(
+                    result.pipeline.pca_cont_display.Lambda.shape[1]
+                ) if result.pipeline.pca_cont_display is not None else 0,
                 "g_fn": result.pipeline.g_fn,
                 "gamma": result.pipeline.gamma,
             },
@@ -4861,4 +4995,3 @@ def _print_scan_summary(universe: pd.DataFrame) -> None:
         print(f" Suspicious overnight>20% symbols : {corp['symbols_with_suspicious_overnight_020']}")
         print(f" Max abs overnight                : {corp['max_abs_overnight_overall']:.4f}")
     print("=" * 78)
-

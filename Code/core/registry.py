@@ -52,7 +52,7 @@ _FIGURE_TASKS: List[Task] = [
     Task("fig10", "figure", "figcode.figure_10", "Figure 10 因子结构时间变化分解（avg GC + 解释度）"),
     Task("fig11", "figure", "figcode.figure_11", "Figure 11 连续因子结构分解（min/mean GC）"),
     Task("fig12", "figure", "figcode.figure_12", "Figure 12 预期日内与隔夜收益（分段柱状）"),
-    Task("fig13", "figure", "figcode.figure_13", "Figure 13 因子累计收益（Factor 1）"),
+    Task("fig13", "figure", "figcode.figure_13", "Figure 13 因子累计收益"),
     Task("fig14", "figure", "figcode.figure_14", "Figure 14 行业组合资产定价（外部数据/占位）"),
     Task("fig15", "figure", "figcode.figure_15", "Figure 15 size/value 组合资产定价（外部数据/占位）"),
 ]

@@ -10,7 +10,7 @@ Figure 13 —— Cumulative Factor Returns（因子累计收益）
 
 数据来源：
   result.cumulative_factor_returns（列：date, factor, cum_intraday, cum_overnight,
-  cum_daily），仅取 factor == 1。
+  cum_daily），按论文展示前 4 个连续因子。
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from pathlib import Path
 
 from core.config import RunConfig
 from core.engine import ReplicationResult
-from core.io_utils import figure_path, figure_title, _save_line_plot, _save_placeholder_figure
+from core.io_utils import figure_path, figure_title, _save_cumulative_factor_grid_plot, _save_placeholder_figure
 from core.logging_utils import log_step, log_render
 from core.runner import run_standalone
 
@@ -36,20 +36,17 @@ def generate(result: ReplicationResult, cfg: RunConfig) -> Path:
     output_path = figure_path(result, FIGURE_NUMBER)
 
     # ---------------- 数据处理 ----------------
-    log_step(TAG, f"读取 cumulative_factor_returns（{len(result.cumulative_factor_returns)} 行），筛选 Factor 1")
+    log_step(TAG, f"读取 cumulative_factor_returns（{len(result.cumulative_factor_returns)} 行）")
     if result.cumulative_factor_returns.empty:
         log_render(TAG, "无累计收益数据，输出占位图")
         _save_placeholder_figure(output_path, base_title, "No cumulative factor return data are available.")
         return output_path
-    df = result.cumulative_factor_returns.loc[result.cumulative_factor_returns["factor"].eq(1)].copy()
-    log_step(TAG, f"Factor 1 累计收益序列长度: {len(df)}")
+    df = result.cumulative_factor_returns.copy()
+    log_step(TAG, f"累计收益覆盖 {df['factor'].nunique()} 个因子、{len(df)} 行")
 
     # ---------------- 图表输出 ----------------
-    log_render(TAG, "绘制 Factor 1 的累计日内/隔夜/日度收益曲线")
-    _save_line_plot(
-        df, "date", ["cum_intraday", "cum_overnight", "cum_daily"],
-        f"{base_title}, Factor 1", output_path, ylabel="Cumulative log return",
-    )
+    log_render(TAG, "绘制多因子累计日内/隔夜/日度收益曲线")
+    _save_cumulative_factor_grid_plot(df, base_title, output_path, ylabel="Cumulative log return")
     return output_path
 
 

@@ -27,6 +27,7 @@ from core.engine import (
     _rolling_output_frames,
     _atomic_to_csv,
     _save_line_plot,
+    _save_cumulative_factor_grid_plot,
     _save_bar_plot,
     _save_heatmap,
     _save_placeholder_figure,
@@ -127,6 +128,7 @@ __all__ = [
     # re-exported engine helpers
     "_atomic_to_csv",
     "_save_line_plot",
+    "_save_cumulative_factor_grid_plot",
     "_save_bar_plot",
     "_save_heatmap",
     "_save_placeholder_figure",
