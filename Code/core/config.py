@@ -8,6 +8,8 @@ from core.engine import DEFAULT_OUTPUT_ROOT, DEFAULT_PROC_ROOT
 
 
 CACHE_SCHEMA_VERSION = 3
+DEFAULT_EXTERNAL_DATA_ROOT = Path(DEFAULT_PROC_ROOT).parents[1] / "external_Data" / "pelger_tail"
+DEFAULT_PAPER_TAIL_ROOT = Path(DEFAULT_PROC_ROOT) / "paper_tail"
 
 
 @dataclass
@@ -29,6 +31,10 @@ class RunConfig:
     rolling_workers: Optional[int] = None
     memory_budget_gb: Optional[float] = None
     progress_interval_sec: float = 10.0
+    external_data_root: Path = field(default_factory=lambda: Path(DEFAULT_EXTERNAL_DATA_ROOT))
+    paper_tail_root: Path = field(default_factory=lambda: Path(DEFAULT_PAPER_TAIL_ROOT))
+    paper_tail_weighting: str = "value_weighted"
+    refresh_paper_tail: bool = True
 
     save_plots: bool = True
     restart: bool = False
@@ -50,6 +56,10 @@ class RunConfig:
             "rolling_workers": self.rolling_workers,
             "memory_budget_gb": self.memory_budget_gb,
             "progress_interval_sec": self.progress_interval_sec,
+            "external_data_root": str(self.external_data_root),
+            "paper_tail_root": str(self.paper_tail_root),
+            "paper_tail_weighting": self.paper_tail_weighting,
+            "refresh_paper_tail": self.refresh_paper_tail,
             "restart": self.restart,
         }
 
@@ -70,6 +80,8 @@ class RunConfig:
         data = asdict(self)
         data["proc_root"] = str(self.proc_root)
         data["output_root"] = str(self.output_root)
+        data["external_data_root"] = str(self.external_data_root)
+        data["paper_tail_root"] = str(self.paper_tail_root)
         return data
 
 
@@ -104,6 +116,10 @@ class MainLaunchProfile:
     paper_workers: Optional[int] = None
     rolling_workers: Optional[int] = None
     memory_budget_gb: Optional[float] = None
+    external_data_root: Path = field(default_factory=lambda: Path(DEFAULT_EXTERNAL_DATA_ROOT))
+    paper_tail_root: Path = field(default_factory=lambda: Path(DEFAULT_PAPER_TAIL_ROOT))
+    paper_tail_weighting: str = "value_weighted"
+    refresh_paper_tail: bool = True
 
 
 MAIN_RUN_PROFILES: Dict[str, MainLaunchProfile] = {
@@ -193,6 +209,20 @@ def validate_main_profile(profile_name: str, profile: MainLaunchProfile) -> None
     if not isinstance(profile.output_root, Path):
         raise TypeError(f"profile {profile_name!r} 的 output_root 必须是 pathlib.Path。")
 
+    if not isinstance(profile.external_data_root, Path):
+        raise TypeError(f"profile {profile_name!r} 的 external_data_root 必须是 pathlib.Path。")
+
+    if not isinstance(profile.paper_tail_root, Path):
+        raise TypeError(f"profile {profile_name!r} 的 paper_tail_root 必须是 pathlib.Path。")
+
+    if profile.paper_tail_weighting not in {"value_weighted", "equal_weighted"}:
+        raise ValueError(
+            f"profile {profile_name!r} 的 paper_tail_weighting 必须是 value_weighted 或 equal_weighted。"
+        )
+
+    if not isinstance(profile.refresh_paper_tail, bool):
+        raise TypeError(f"profile {profile_name!r} 的 refresh_paper_tail 必须是 bool。")
+
     if profile.years is not None:
         if len(profile.years) == 0:
             raise ValueError(f"profile {profile_name!r} 的 years 不能为空元组。")
@@ -239,6 +269,10 @@ def profile_to_run_config(profile: MainLaunchProfile, *, save_plots: bool) -> Ru
         rolling_workers=profile.rolling_workers,
         memory_budget_gb=profile.memory_budget_gb,
         progress_interval_sec=profile.heartbeat_sec,
+        external_data_root=Path(profile.external_data_root),
+        paper_tail_root=Path(profile.paper_tail_root),
+        paper_tail_weighting=profile.paper_tail_weighting,
+        refresh_paper_tail=profile.refresh_paper_tail,
         save_plots=save_plots,
         restart=bool(profile.restart and profile.rebuild_result),
     )

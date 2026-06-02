@@ -3,6 +3,7 @@ __pycache__/
 /Data/kline_Data/
 /Data/fact_Data/
 /Data/proc_Data/
+/Data/external_Data/
 .hf_cache/
 replication_output*/
 replay_pid*
@@ -11,3 +12,4 @@ otherFile/
 /Result/pelger_cn_adjusted/diagnostics/universe_scan.csv
 Result/
 论文解析/
+补充数据及代码/

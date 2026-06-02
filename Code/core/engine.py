@@ -2949,6 +2949,7 @@ class ReplicationResult:
     rolling_weight_summary: pd.DataFrame = field(default_factory=pd.DataFrame)
     factor_return_summary: pd.DataFrame = field(default_factory=pd.DataFrame)
     cumulative_factor_returns: pd.DataFrame = field(default_factory=pd.DataFrame)
+    paper_tail: Dict[str, Any] = field(default_factory=dict)
     plot_status: pd.DataFrame = field(default_factory=pd.DataFrame)
     exported_files: Dict[str, str] = field(default_factory=dict)
     stage_timings: Dict[str, float] = field(default_factory=dict)
@@ -3987,29 +3988,9 @@ def build_paper_table_v(pipe: PelgerPipeline) -> pd.DataFrame:
 
 def build_replication_coverage_report() -> pd.DataFrame:
     """列出论文表图在当前 A 股数据条件下的复现状态。"""
-    rows = [
-        ("Table I", "Summary Statistics for Continuous and Jump Returns", "implemented_adapted", "已按 balanced / unbalanced 两块输出年度跳跃与连续收益统计。"),
-        ("Table II", "Balanced and Unbalanced Panel Results", "implemented_adapted", "已按 balanced vs unbalanced 输出 factor-space generalized correlations。"),
-        ("Table III", "Generalized Correlations with Industry and FFC Factors", "external_data_required", "需要行业组合收益与 Fama-French-Carhart 因子 CSV。"),
-        ("Table IV", "Time-Variation Decomposition across Frequencies", "implemented_adapted", "已输出 rolling GC / explained variation 的时间变化汇总。"),
-        ("Table V", "Intraday / Overnight / Daily Sharpe Ratios", "implemented_adapted", "已输出连续 PCA 因子的日内、隔夜、日度 Sharpe。"),
-        ("Figure 1", "Number of HF Factors, Unbalanced Panel", "implemented_adapted", "已输出非平衡面板的 perturbed eigenvalue ratio 诊断图。"),
-        ("Figure 2", "Number of HF Factors, Balanced Panel", "implemented_adapted", "已输出严格平衡面板的 perturbed eigenvalue ratio 诊断图。"),
-        ("Figure 3", "Proxy Factor Portfolio Weights", "implemented_adapted", "已输出 proxy factors 权重热图。"),
-        ("Figure 4", "Continuous PCA Factor Portfolio Weights", "implemented_adapted", "已输出连续 PCA 因子权重热图。"),
-        ("Figure 5", "Monthly PCA Factor Portfolio Weights", "implemented_adapted", "已输出月频 PCA 因子权重热图。"),
-        ("Figure 6", "Time Variation in Loadings", "implemented_adapted", "已输出滚动 GC 稳定性曲线。"),
-        ("Figure 7", "Locally Estimated Continuous Factors", "implemented_adapted", "已输出局部连续因子与全局因子的 GC 曲线。"),
-        ("Figure 8", "Time-Varying Portfolio Weights", "implemented_adapted", "已输出滚动窗口下 top 权重股票变化。"),
-        ("Figure 9", "Time-Varying Explained Variation", "implemented_adapted", "已输出滚动解释度。"),
-        ("Figure 10", "Factor-Structure Time Variation Decomposition", "implemented_adapted", "已输出 GC 与解释度的结构分解图。"),
-        ("Figure 11", "Continuous Factor-Structure Decomposition", "implemented_adapted", "已输出连续因子的结构分解图。"),
-        ("Figure 12", "Expected Intraday and Overnight Returns", "implemented_adapted", "已输出连续 PCA 因子的日内/隔夜/日度平均收益。"),
-        ("Figure 13", "Cumulative Factor Returns", "implemented_adapted", "已输出连续 PCA 因子的累计收益。"),
-        ("Figure 14", "Asset Pricing of Industry Portfolios", "external_data_required", "需要行业组合收益；当前仅输出占位图。"),
-        ("Figure 15", "Asset Pricing of Size- and Value-Sorted Portfolios", "external_data_required", "需要 size/value 测试资产组合；当前仅输出占位图。"),
-    ]
-    return pd.DataFrame(rows, columns=["paper_item", "paper_content", "status", "notes"])
+    from core.paper_tail import build_replication_coverage_report as build_tail_coverage_report
+
+    return build_tail_coverage_report()
 
 
 def build_weight_tables(pipe: PelgerPipeline, panel: HFPanel, top_n: int = 30) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -4102,11 +4083,19 @@ def build_factor_return_tables(pipe: PelgerPipeline, panel: HFPanel) -> Tuple[pd
     return pd.DataFrame(rows), pd.DataFrame(cum_rows)
 
 
-def refresh_replication_result_views(result: ReplicationResult) -> ReplicationResult:
+def refresh_replication_result_views(
+    result: ReplicationResult,
+    *,
+    proc_root: str | Path | None = None,
+    external_data_root: str | Path | None = None,
+    paper_tail_root: str | Path | None = None,
+    paper_tail_weighting: str = "value_weighted",
+    refresh_paper_tail: bool = True,
+) -> ReplicationResult:
     """Refresh lightweight presentation-layer tables from an existing ReplicationResult.
 
-    This is intentionally cheap: it only recomputes display-facing derivatives from the
-    already-loaded balanced panel and continuous-return decomposition.
+    This remains cheap for the legacy display layer, and now also refreshes the
+    supplement-backed paper-tail outputs without forcing a full pipeline rebuild.
     """
     pipe = result.pipeline
     panel = result.panel
@@ -4130,6 +4119,29 @@ def refresh_replication_result_views(result: ReplicationResult) -> ReplicationRe
     result.factor_return_summary, result.cumulative_factor_returns = build_factor_return_tables(pipe, panel)
     if result.monthly_pca_weights.empty:
         result.monthly_pca_weights = build_monthly_pca_weights(panel)
+
+    if not hasattr(result, "paper_tail") or result.paper_tail is None:
+        result.paper_tail = {}
+
+    if refresh_paper_tail:
+        from core.paper_tail import build_replication_coverage_report as build_tail_coverage_report
+        from core.paper_tail import refresh_paper_tail_views
+
+        payload = refresh_paper_tail_views(
+            result,
+            proc_root=proc_root,
+            external_data_root=external_data_root,
+            paper_tail_root=paper_tail_root,
+            paper_tail_weighting=paper_tail_weighting,
+            refresh_paper_tail=refresh_paper_tail,
+        )
+        result.paper_tail = payload
+        if isinstance(payload.get("table_iii"), pd.DataFrame):
+            result.paper_table_iii = payload["table_iii"].copy()
+        if isinstance(payload.get("table_v"), pd.DataFrame):
+            result.paper_table_v = payload["table_v"].copy()
+            result.paper_factor_sharpes = payload["table_v"].copy()
+        result.replication_coverage = build_tail_coverage_report()
     return result
 
 
@@ -4428,31 +4440,33 @@ def export_all_paper_figures(
         _save_line_plot(df, "window_index", ["min_gc", "mean_gc"], figure_specs[11][2], output_path, ylabel="Generalized correlation")
 
     def fig12(output_path: Path) -> None:
-        if result.factor_return_summary.empty:
-            _save_placeholder_figure(output_path, figure_specs[12][2], "No factor return summary is available.")
-            return
-        long_df = result.factor_return_summary.melt(id_vars="factor", var_name="segment", value_name="mean_return")
-        _save_bar_plot(long_df, "factor", "mean_return", figure_specs[12][2], output_path, group_col="segment", ylabel="Mean return")
+        from core.paper_tail import render_figure_12
+
+        render_figure_12(result, output_path, figure_specs[12][2])
 
     def fig13(output_path: Path) -> None:
-        if result.cumulative_factor_returns.empty:
-            _save_placeholder_figure(output_path, figure_specs[13][2], "No cumulative factor return data are available.")
-            return
-        _save_cumulative_factor_grid_plot(
-            result.cumulative_factor_returns,
-            figure_specs[13][2],
-            output_path,
-            ylabel="Cumulative log return",
-        )
+        from core.paper_tail import render_figure_13
+
+        render_figure_13(result, output_path, figure_specs[13][2])
+
+    def fig14(output_path: Path) -> None:
+        from core.paper_tail import render_figure_14
+
+        render_figure_14(result, output_path, figure_specs[14][2])
+
+    def fig15(output_path: Path) -> None:
+        from core.paper_tail import render_figure_15
+
+        render_figure_15(result, output_path, figure_specs[15][2])
 
     run_plot(8, "rolling_weight_summary", fig08)
     run_plot(9, "rolling_explained_variation", lambda path: _save_line_plot(rolling_explained_df, "window_index", ["explained_variation"], figure_specs[9][2], path, ylabel="Explained variation"))
     run_plot(10, "rolling_gc_and_explained_variation", fig10)
     run_plot(11, "rolling_gc", fig11)
-    run_plot(12, "factor_return_summary", fig12)
-    run_plot(13, "cumulative_factor_returns", fig13)
-    run_plot(14, "external_test_assets", lambda path: _save_placeholder_figure(path, figure_specs[14][2], "Industry portfolio returns are not available in the current repository. Provide external test-asset CSV files to replace this placeholder."), notes="External data required: industry portfolio returns")
-    run_plot(15, "external_test_assets", lambda path: _save_placeholder_figure(path, figure_specs[15][2], "Size/value sorted portfolio returns are not available in the current repository. Provide external test-asset CSV files to replace this placeholder."), notes="External data required: size/value portfolio returns")
+    run_plot(12, "paper_tail.figure12_data", fig12)
+    run_plot(13, "paper_tail.figure13_data", fig13)
+    run_plot(14, "paper_tail.pricing_industry", fig14)
+    run_plot(15, "paper_tail.pricing_size_value", fig15)
 
     plot_status = pd.DataFrame(status_rows).sort_values("figure_number").reset_index(drop=True)
     return plot_status, exported
@@ -4704,6 +4718,8 @@ def export_replication_outputs(
 def run_cn_replication(
     proc_root: str | Path = DEFAULT_PROC_ROOT,
     output_root: str | Path = DEFAULT_OUTPUT_ROOT,
+    external_data_root: str | Path | None = None,
+    paper_tail_root: str | Path | None = None,
     years: Optional[Sequence[int]] = None,
     return_mode: str = "open_close",
     max_stocks: Optional[int] = None,
@@ -4718,6 +4734,8 @@ def run_cn_replication(
     rolling_workers: Optional[int] = None,
     memory_budget_gb: Optional[float] = None,
     progress_interval_sec: float = DEFAULT_PROGRESS_INTERVAL_SEC,
+    paper_tail_weighting: str = "value_weighted",
+    refresh_paper_tail: bool = True,
     restart: bool = False,
 ) -> ReplicationResult:
     """Run the China A-share replication from preprocessed proc_Data panels only."""
@@ -4922,6 +4940,14 @@ def run_cn_replication(
             cumulative_factor_returns=cumulative_factor_returns,
             stage_timings=dict(timings),
             resource_plan=_json_ready(resource_plan.__dict__),
+        )
+        result = refresh_replication_result_views(
+            result,
+            proc_root=proc_root,
+            external_data_root=external_data_root,
+            paper_tail_root=paper_tail_root,
+            paper_tail_weighting=paper_tail_weighting,
+            refresh_paper_tail=refresh_paper_tail,
         )
         t = time.perf_counter()
         checkpoint_manager.update(stage="export", export_completed=False)

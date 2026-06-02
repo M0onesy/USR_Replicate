@@ -51,10 +51,10 @@ _FIGURE_TASKS: List[Task] = [
     Task("fig9",  "figure", "figcode.figure_09", "Figure 9  随时间变化的解释方差"),
     Task("fig10", "figure", "figcode.figure_10", "Figure 10 因子结构时间变化分解（avg GC + 解释度）"),
     Task("fig11", "figure", "figcode.figure_11", "Figure 11 连续因子结构分解（min/mean GC）"),
-    Task("fig12", "figure", "figcode.figure_12", "Figure 12 预期日内与隔夜收益（分段柱状）"),
-    Task("fig13", "figure", "figcode.figure_13", "Figure 13 因子累计收益"),
-    Task("fig14", "figure", "figcode.figure_14", "Figure 14 行业组合资产定价（外部数据/占位）"),
-    Task("fig15", "figure", "figcode.figure_15", "Figure 15 size/value 组合资产定价（外部数据/占位）"),
+    Task("fig12", "figure", "figcode.figure_12", "Figure 12 预期日内与隔夜超额收益（个股/行业/2x3 组合）"),
+    Task("fig13", "figure", "figcode.figure_13", "Figure 13 连续 PCA 与 FFC 因子标准化累计收益"),
+    Task("fig14", "figure", "figcode.figure_14", "Figure 14 行业组合资产定价（Continuous PCA vs FFC）"),
+    Task("fig15", "figure", "figcode.figure_15", "Figure 15 size/value 组合资产定价（Continuous PCA vs FFC）"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -63,9 +63,9 @@ _FIGURE_TASKS: List[Task] = [
 _TABLE_TASKS: List[Task] = [
     Task("table_i",   "table", "tablecode.table_i",              "Table I   连续/跳跃收益汇总统计"),
     Task("table_ii",  "table", "tablecode.table_ii",             "Table II  平衡/非平衡面板因子空间 GC"),
-    Task("table_iii", "table", "tablecode.table_iii",            "Table III 行业/FFC 因子 GC（外部数据/占位）"),
+    Task("table_iii", "table", "tablecode.table_iii",            "Table III 行业/FFC 因子 GC"),
     Task("table_iv",  "table", "tablecode.table_iv",             "Table IV  时间变化分解汇总"),
-    Task("table_v",   "table", "tablecode.table_v",              "Table V   日内/隔夜/日度夏普"),
+    Task("table_v",   "table", "tablecode.table_v",              "Table V   因子组与前四个连续因子的日内/隔夜/日度夏普"),
     Task("table_fc",  "table", "tablecode.table_factor_counts",  "扰动特征值比诊断表（Fig 1-2 底座）"),
     Task("table_w",   "table", "tablecode.table_weights",        "连续/代理/月频因子权重表（Fig 3-5 底座）"),
     Task("table_fr",  "table", "tablecode.table_factor_returns", "因子收益摘要（Fig 12-13 底座）"),

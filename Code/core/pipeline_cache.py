@@ -35,12 +35,24 @@ def _meta_path(cfg: RunConfig) -> Path:
     return _cache_root(cfg) / f"replication_result_{_signature_hash(cfg)}.meta.json"
 
 
-def _load_result_pickle(cache_path: Path, *, log_label: str) -> ReplicationResult:
+def _refresh_result(result: ReplicationResult, cfg: RunConfig) -> ReplicationResult:
+    refreshed = refresh_replication_result_views(
+        result,
+        proc_root=cfg.proc_root,
+        external_data_root=cfg.external_data_root,
+        paper_tail_root=cfg.paper_tail_root,
+        paper_tail_weighting=cfg.paper_tail_weighting,
+        refresh_paper_tail=cfg.refresh_paper_tail,
+    )
+    return refreshed
+
+
+def _load_result_pickle(cache_path: Path, *, log_label: str, cfg: RunConfig) -> ReplicationResult:
     log_step("cache", f"{log_label} {cache_path.name}，正在载入…")
     t0 = time.perf_counter()
     with open(cache_path, "rb") as fh:
         result = pickle.load(fh)
-    result = refresh_replication_result_views(result)
+    result = _refresh_result(result, cfg)
     log_info("cache", f"{cache_path.name} 载入完成，用时 {time.perf_counter() - t0:.2f}s")
     return result
 
@@ -88,6 +100,7 @@ def build_result(cfg: RunConfig) -> ReplicationResult:
     log_step("pipeline", f"开始构建 ReplicationResult（缓存键 {sig}）—— 这是最耗时的一步")
     t0 = time.perf_counter()
     result = run_cn_replication(**cfg.to_kwargs())
+    result = _refresh_result(result, cfg)
     elapsed = time.perf_counter() - t0
     log_info("pipeline", f"ReplicationResult 构建完成，用时 {elapsed:.1f}s")
 
@@ -122,12 +135,14 @@ def get_existing_result(cfg: RunConfig, *, allow_fallback: bool = True) -> Repli
 
     if sig in _MEMORY_CACHE:
         log_info("cache", f"命中内存缓存（键 {sig}），直接复用现有 ReplicationResult")
-        return _MEMORY_CACHE[sig]
+        result = _refresh_result(_MEMORY_CACHE[sig], cfg)
+        _MEMORY_CACHE[sig] = result
+        return result
 
     cache_path = _disk_cache_path(cfg)
     if cache_path.exists():
         try:
-            result = _load_result_pickle(cache_path, log_label="命中精确磁盘缓存")
+            result = _load_result_pickle(cache_path, log_label="命中精确磁盘缓存", cfg=cfg)
             _MEMORY_CACHE[sig] = result
             return result
         except Exception as exc:
@@ -139,7 +154,7 @@ def get_existing_result(cfg: RunConfig, *, allow_fallback: bool = True) -> Repli
             fallback_path = Path(candidate["cache_path"])
             meta = dict(candidate.get("meta", {}))
             try:
-                result = _load_result_pickle(fallback_path, log_label="复用旧版已完成缓存")
+                result = _load_result_pickle(fallback_path, log_label="复用旧版已完成缓存", cfg=cfg)
                 _MEMORY_CACHE[sig] = result
                 log_info(
                     "cache",
