@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -11,19 +12,69 @@ import numpy as np
 import pandas as pd
 
 
-PAPER_TAIL_VERSION = 3
-PAPER_TAIL_ALGORITHM_VERSION = "canonical_ffc_v1"
+# ======================================================================
+# 论文保真选项（env 驱动；这些都只影响 paper_tail“尾部/视图”层，复用既有
+# 重结果缓存即可生效，不会让 replication_result_*.pkl 失效）。
+# RunConfig 的同名字段可通过 RunConfig.export_fidelity_env() 写入这些 env。
+# ======================================================================
+def _fid_env(name: str, default: str) -> str:
+    return str(os.environ.get(name, default)).strip()
+
+
+def _industry_info_filename() -> str:
+    # 新版 11 桶映射放到 external/.../industry/ 下后，把文件名指过去即可。
+    return _fid_env("PELGER_INDUSTRY_INFO_FILENAME", "stock_full_info_with_std_industry.csv")
+
+
+def _industry_frozen() -> Optional[List[str]]:
+    """P5/D1：事先冻结的行业因子桶（std_industry，逗号分隔）。空 = 暂用占位自动挑选。"""
+    raw = _fid_env("PELGER_INDUSTRY_FROZEN", "")
+    items = [x.strip() for x in raw.split(",") if x.strip()]
+    return items or None
+
+
+def _annualization_days() -> int:
+    try:
+        return int(_fid_env("PELGER_ANNUALIZATION_DAYS", "252"))
+    except Exception:
+        return 252
+
+
+def _ffc_mom_mode() -> str:
+    """P6/D4：'carhart_daily'（自建日频 12-1 月）或 'legacy_hf'（旧高频 1 日动量）。"""
+    return _fid_env("PELGER_FFC_MOM_MODE", "carhart_daily").lower()
+
+
+def _size_value_full_market() -> bool:
+    """P9/D5：2×3 是否用全市场 symbol_returns 重建。"""
+    return _fid_env("PELGER_SIZE_VALUE_FULL_MARKET", "1").lower() not in {"0", "false", "no"}
+
+
+def _size_value_start() -> Optional[pd.Timestamp]:
+    """P10/D5：size/value 与分段 FFC 的样本起点（2012 账面缺失 -> 固定 2014-07-01）。"""
+    raw = _fid_env("PELGER_SIZE_VALUE_START", "2014-07-01")
+    try:
+        return pd.Timestamp(raw) if raw else None
+    except Exception:
+        return None
+
+
+# PAPER_TAIL_VERSION 提升以触发尾部缓存重建（应用本批论文保真修复）。
+PAPER_TAIL_VERSION = 4
+PAPER_TAIL_ALGORITHM_VERSION = "paper_faithful_v2"
 PORTFOLIO_ORDER = ["SL", "SM", "SH", "BL", "BM", "BH"]
+# N7：Figure 12 分组标题里的行业/规模组合数改为动态填充（新映射 11 桶）。
 GROUP_TITLES = {
     "balanced_panel_individual_stocks": "Balanced Panel Individual Stocks",
     "all_stocks": "All Stocks",
-    "industry_portfolios": "14 Industry Portfolios",
+    "industry_portfolios": "{n_industry} Industry Portfolios",
     "size_value_portfolios": "6 Size/Value Portfolios",
 }
 FIG13_FACTORSET_ORDER = ["Continuous PCA", "FFC 4-factor"]
 SEGMENT_ORDER = ["intraday", "overnight", "daily"]
 OFFICIAL_FFC_FACTORS = ["MKT_excess", "SMB", "HML", "MOM"]
 FIGURE12_MIN_ALL_STOCK_OBS = 60
+
 
 
 def _repo_root() -> Path:
@@ -138,7 +189,7 @@ def _discovered_paths(proc_root: Path, external_root: Path) -> Dict[str, Path]:
         "ff3": _find_file(external_root / "factors" / "ff3", "STK_MKT_THRFACDAY.csv"),
         "ff5": _find_file(external_root / "factors" / "ff5", "STK_MKT_FIVEFACDAY.csv"),
         "rf": sorted((external_root / "factors" / "rf").glob("*.csv"))[0],
-        "industry_info": external_root / "industry" / "stock_full_info_with_std_industry.csv",
+        "industry_info": external_root / "industry" / _industry_info_filename(),
         "industry_mapping": external_root / "industry" / "industry_mapping_reference.csv",
         "size_value_assignments": _find_file(reference_root, "size_value_2x3_assignments.csv"),
         "size_value_breakpoints": _find_file(reference_root, "size_value_2x3_breakpoints.csv"),
@@ -808,6 +859,29 @@ def _select_industries_from_pca(result: Any, industry_map: pd.DataFrame) -> Dict
     import core.engine as eng
 
     mapping = dict(zip(industry_map["ts_code"], industry_map["std_industry"]))
+    available = set(str(x) for x in industry_map["std_industry"].dropna().unique().tolist())
+
+    # ------------------------------------------------------------------
+    # P5/D1（论文 III.D 的 ex-ante 口径）：行业因子应“看一次修好后的 CN
+    # Figure 4 → 冻结 3 个桶 → 写死”，而不是每次从被解释对象里按集中度反推。
+    # 若 PELGER_INDUSTRY_FROZEN 给出了冻结桶（决策 D1 落地），直接采用，
+    # 不再做样本内反推；否则退回旧的“按集中度自动挑选”占位逻辑，并在
+    # selection_rule 里标注其为“待冻结的占位”。
+    frozen = _industry_frozen()
+    if frozen:
+        chosen = [b for b in frozen if b in available]
+        selected = [
+            {"factor": int(i + 2), "industry": str(b), "concentration": np.nan, "fallback_rank": 0, "frozen": True}
+            for i, b in enumerate(chosen)
+        ]
+        return {
+            "selected_industries": selected,
+            "market_factor_definition": "Equal-weighted full-market return across all stocks in the sample dates.",
+            "selection_rule": "EX-ANTE FROZEN buckets (paper III.D): fixed before estimation via PELGER_INDUSTRY_FROZEN.",
+            "frozen_requested": frozen,
+            "frozen_missing": [b for b in frozen if b not in available],
+        }
+
     display_pca = result.pipeline.pca_cont_display if getattr(result.pipeline, "pca_cont_display", None) is not None else result.pipeline.pca_cont
     weights = eng.factor_portfolio_weights(display_pca)
     factor_count = min(weights.shape[1], 4)
@@ -848,7 +922,7 @@ def _select_industries_from_pca(result: Any, industry_map: pd.DataFrame) -> Dict
     return {
         "selected_industries": selected,
         "market_factor_definition": "Equal-weighted full-market return across all stocks in the sample dates.",
-        "selection_rule": "For factors 2-4, choose the highest-concentration unique std_industry bucket by aggregated absolute PCA weights.",
+        "selection_rule": "PLACEHOLDER (pending D1 freeze): highest-concentration unique std_industry by aggregated |PCA weight|. After one corrected run, freeze the 3 buckets via PELGER_INDUSTRY_FROZEN.",
     }
 
 
@@ -1065,6 +1139,7 @@ def _build_table_iii(
         gc = eng.generalized_correlations(lhs, rhs) if lhs.size and rhs.size else np.array([], dtype=float)
         row: Dict[str, Any] = {
             "comparison": label,
+            "panel": "top_returns_gc",
             "n_factors": int(matrix.shape[1]) if matrix.ndim == 2 else 1,
             "sample_days": int(lhs.shape[0]) if lhs.ndim == 2 else 0,
             "gc_mean": float(np.nanmean(gc)) if len(gc) else np.nan,
@@ -1072,7 +1147,126 @@ def _build_table_iii(
         for idx in range(1, 5):
             row[f"gc_{idx}"] = float(gc[idx - 1]) if idx <= len(gc) else np.nan
         rows.append(row)
-    return pd.DataFrame(rows)
+
+    # ------------------------------------------------------------------
+    # N9（论文 Table III）：补上半部 HF PCA / PCA Proxy 两行 + 下半部
+    # ω HF/Jump/Overnight/Daily/Week/Month 的【载荷 GC】。全部 best-effort、
+    # 逐项 try/except；若复用的 pickle 缺少所需数组则跳过该行（不崩溃）。
+    try:
+        _extend_table_iii(rows, result, sample_dates=sample_dates)
+    except Exception as exc:  # pragma: no cover
+        print(f"[paper_tail] N9 Table III 扩展部分跳过: {exc!r}")
+
+    df = pd.DataFrame(rows)
+    if "panel" not in df.columns:
+        df["panel"] = "top_returns_gc"
+    return df
+
+
+def _gc_safe(A: np.ndarray, B: np.ndarray) -> np.ndarray:
+    import core.engine as eng
+    A = np.asarray(A, dtype=float)
+    B = np.asarray(B, dtype=float)
+    if A.ndim != 2 or B.ndim != 2 or A.size == 0 or B.size == 0:
+        return np.array([], dtype=float)
+    return eng.generalized_correlations(A, B)
+
+
+def _pca_loadings(R: Optional[np.ndarray], K: int) -> Optional[np.ndarray]:
+    """对一个 (T×N) 收益矩阵做 PCA，返回 N×K 载荷（用于载荷空间 GC）。"""
+    import core.engine as eng
+    if R is None:
+        return None
+    R = np.asarray(R, dtype=float)
+    if R.ndim != 2 or R.shape[0] < 3:
+        return None
+    res = eng._panel_pca(R, K=min(K, R.shape[1]), use_corr=True) if hasattr(eng, "_panel_pca") else eng.pca_factors(R, K=min(K, R.shape[1]), use_corr=True)
+    return np.asarray(res.Lambda, dtype=float)
+
+
+def _aggregate_daily_to_period(R_daily: np.ndarray, dates: pd.DatetimeIndex, freq: str) -> np.ndarray:
+    """把日频 (T×N) 聚合到 weekly / monthly（对数收益求和）。"""
+    df = pd.DataFrame(np.asarray(R_daily, dtype=float), index=pd.DatetimeIndex(dates))
+    key = df.index.to_period("W") if freq == "weekly" else df.index.to_period("M")
+    return df.groupby(key).sum(min_count=1).to_numpy(dtype=float)
+
+
+def _extend_table_iii(rows: List[Dict[str, Any]], result: Any, *, sample_dates: pd.DatetimeIndex) -> None:
+    """N9 的扩展行（top: HF PCA / PCA Proxy；bottom: ω 频率载荷 GC）。"""
+    import core.engine as eng
+    pipe = result.pipeline
+    panel = result.panel
+    display_k = int(np.asarray(pipe.F_cont_display_daily_total).shape[1]) if getattr(pipe, "F_cont_display_daily_total", None) is not None else 4
+    display_k = max(1, min(4, display_k))
+
+    # ---- 上半部 HF PCA 行：HF(连续+跳跃)PCA 因子收益 vs 连续 display 因子收益 ----
+    cont_ret = np.asarray(pipe.F_cont_display_daily_total, dtype=float)
+    try:
+        W_hf = eng.factor_portfolio_weights(_truncate_or_pca(pipe, "hf", display_k))
+        hf_ret = np.asarray(panel.R_daily, dtype=float) @ W_hf
+        lhs, rhs = _drop_invalid_rows(cont_ret, hf_ret)
+        gc = _gc_safe(lhs, rhs)
+        rows.append(_gc_row("HF PCA", "top_returns_gc", rhs.shape[1] if rhs.ndim == 2 else 1, lhs.shape[0] if lhs.ndim == 2 else 0, gc))
+    except Exception as exc:
+        print(f"[paper_tail] HF PCA 行跳过: {exc!r}")
+
+    # ---- 上半部 PCA Proxy 行：proxy 因子收益 vs 连续 display 因子收益 ----
+    try:
+        W_disp = eng.factor_portfolio_weights(pipe.pca_cont_display)
+        proxy_w, _ = eng.build_proxy_factors(W_disp, pipe.R_cont)
+        proxy_ret = np.asarray(panel.R_daily, dtype=float) @ proxy_w
+        lhs, rhs = _drop_invalid_rows(cont_ret, proxy_ret)
+        gc = _gc_safe(lhs, rhs)
+        rows.append(_gc_row("PCA Proxy", "top_returns_gc", rhs.shape[1] if rhs.ndim == 2 else 1, lhs.shape[0] if lhs.ndim == 2 else 0, gc))
+    except Exception as exc:
+        print(f"[paper_tail] PCA Proxy 行跳过: {exc!r}")
+
+    # ---- 下半部：ω 频率的【载荷 GC】（vs 连续 display 载荷）----
+    cont_load = np.asarray(pipe.pca_cont_display.Lambda, dtype=float)
+    freq_loadings: List[Tuple[str, Optional[np.ndarray]]] = [
+        ("omega HF", _pca_loadings(getattr(panel, "R_5min_full", None), display_k)),
+        ("omega Jump", _pca_loadings(getattr(pipe, "R_jump", None), display_k)),
+        ("omega Overnight", _pca_loadings(getattr(panel, "R_night", None), display_k)),
+        ("omega Daily", _pca_loadings(getattr(panel, "R_daily", None), display_k)),
+    ]
+    try:
+        wk = _aggregate_daily_to_period(panel.R_daily, panel.dates, "weekly")
+        freq_loadings.append(("omega Week", _pca_loadings(wk, display_k)))
+        mo = _aggregate_daily_to_period(panel.R_daily, panel.dates, "monthly")
+        freq_loadings.append(("omega Month", _pca_loadings(mo, display_k)))
+    except Exception as exc:
+        print(f"[paper_tail] weekly/monthly 载荷跳过: {exc!r}")
+
+    for label, Lam in freq_loadings:
+        if Lam is None:
+            continue
+        try:
+            gc = _gc_safe(cont_load, Lam)  # 载荷空间 GC（论文 footnote 19 同式）
+            rows.append(_gc_row(label, "bottom_loadings_gc", Lam.shape[1] if Lam.ndim == 2 else 1, int(cont_load.shape[0]), gc))
+        except Exception as exc:
+            print(f"[paper_tail] {label} 载荷 GC 跳过: {exc!r}")
+
+
+def _truncate_or_pca(pipe: Any, which: str, k: int):
+    import core.engine as eng
+    src = getattr(pipe, f"pca_{which}", None)
+    if src is not None and int(src.Lambda.shape[1]) >= k:
+        return eng._truncate_pca_result(src, k)
+    R = getattr(pipe, "R_cont", None) if which == "cont" else getattr(pipe.panel, "R_5min_full", None) if which == "hf" else getattr(pipe, "R_jump", None)
+    return eng.pca_factors(np.asarray(R, dtype=float), K=k, use_corr=getattr(pipe, "use_corr", True))
+
+
+def _gc_row(label: str, panel_name: str, n_factors: int, sample_n: int, gc: np.ndarray) -> Dict[str, Any]:
+    row: Dict[str, Any] = {
+        "comparison": label,
+        "panel": panel_name,
+        "n_factors": int(n_factors),
+        "sample_days": int(sample_n),
+        "gc_mean": float(np.nanmean(gc)) if len(gc) else np.nan,
+    }
+    for idx in range(1, 5):
+        row[f"gc_{idx}"] = float(gc[idx - 1]) if idx <= len(gc) else np.nan
+    return row
 
 
 def _segment_rf_vectors(rf_daily_sample: np.ndarray) -> Dict[str, np.ndarray]:
@@ -1103,7 +1297,7 @@ def _to_excess_matrices(
 def _portfolio_sharpes_from_excess_matrices(matrix_by_segment: Mapping[str, np.ndarray]) -> Dict[str, float]:
     import core.engine as eng
 
-    scale = np.sqrt(252.0)
+    scale = np.sqrt(float(_annualization_days()))  # N6: 论文 252；A 股可设 PELGER_ANNUALIZATION_DAYS=243
     intra = np.asarray(matrix_by_segment["intraday"], dtype=float)
     night = np.asarray(matrix_by_segment["overnight"], dtype=float)
     daily = np.asarray(matrix_by_segment["daily"], dtype=float)
@@ -1256,17 +1450,38 @@ def _build_table_v(
         )
 
     lower_rows: List[Dict[str, Any]] = []
+    ann = float(_annualization_days())
+
+    def _seg_sr(series: np.ndarray) -> float:
+        # footnote 33：因子按自身 std 归一化 -> 均值即 Sharpe（这里直接 mean/std×√ann）。
+        s = np.asarray(series, dtype=float)
+        sd = np.nanstd(s, ddof=1)
+        return float(np.nanmean(s) / sd * np.sqrt(ann)) if np.isfinite(sd) and sd > 0 else np.nan
+
     for idx, name in enumerate(factor_names_cont[:4], start=1):
-        intra = factor_sets["Continuous PCA"]["intraday"][:, idx - 1]
-        night = factor_sets["Continuous PCA"]["overnight"][:, idx - 1]
-        daily = factor_sets["Continuous PCA"]["daily"][:, idx - 1]
         lower_rows.append(
             {
                 "section": "continuous_individual_factors",
                 "portfolio": name,
-                "SR_intraday": float(np.nanmean(intra) / np.nanstd(intra, ddof=1) * np.sqrt(252)) if np.nanstd(intra, ddof=1) > 0 else np.nan,
-                "SR_overnight": float(np.nanmean(night) / np.nanstd(night, ddof=1) * np.sqrt(252)) if np.nanstd(night, ddof=1) > 0 else np.nan,
-                "SR_daily": float(np.nanmean(daily) / np.nanstd(daily, ddof=1) * np.sqrt(252)) if np.nanstd(daily, ddof=1) > 0 else np.nan,
+                "SR_intraday": _seg_sr(factor_sets["Continuous PCA"]["intraday"][:, idx - 1]),
+                "SR_overnight": _seg_sr(factor_sets["Continuous PCA"]["overnight"][:, idx - 1]),
+                "SR_daily": _seg_sr(factor_sets["Continuous PCA"]["daily"][:, idx - 1]),
+            }
+        )
+
+    # N10（论文 Table V 下半部）：补 Market / Size / Value / Momentum 的个体夏普，
+    # 用于展示特征因子“隔夜赚、盘中亏”的反转。取自（修好的）分段 FFC 四列。
+    ffc_mats = factor_sets["FFC 4-factor"]
+    for col, label in enumerate(["Market", "Size", "Value", "Momentum"]):
+        if col >= ffc_mats["daily"].shape[1]:
+            break
+        lower_rows.append(
+            {
+                "section": "characteristic_individual_factors",
+                "portfolio": label,
+                "SR_intraday": _seg_sr(ffc_mats["intraday"][:, col]),
+                "SR_overnight": _seg_sr(ffc_mats["overnight"][:, col]),
+                "SR_daily": _seg_sr(ffc_mats["daily"][:, col]),
             }
         )
 
@@ -1298,7 +1513,13 @@ def _build_figure12_data(
         .rename(columns={"portfolio": "asset"})
     )
     industry_summary.insert(0, "group", "industry_portfolios")
-    industry_summary["n_obs"] = int(len(sample_dates))
+    # P13a：n_obs 用真实有效观测数（按 daily 段非缺失计），不再写 len(sample_dates)。
+    _ind_obs = (
+        official_industry.loc[official_industry["segment_kind"].eq("daily")]
+        .assign(_ok=lambda d: d["ret"].notna())
+        .groupby("portfolio")["_ok"].sum()
+    )
+    industry_summary["n_obs"] = industry_summary["asset"].map(_ind_obs).fillna(0).astype(int)
     rows.append(industry_summary)
 
     official_sv = size_value_assets.loc[size_value_assets["weighting"].eq(weighting) & size_value_assets["date"].isin(sample_dates)].copy()
@@ -1313,7 +1534,12 @@ def _build_figure12_data(
         .rename(columns={"portfolio": "asset"})
     )
     size_summary.insert(0, "group", "size_value_portfolios")
-    size_summary["n_obs"] = int(len(sample_dates))
+    _sv_obs = (
+        official_sv.loc[official_sv["segment_kind"].eq("daily")]
+        .assign(_ok=lambda d: d["ret"].notna())
+        .groupby("portfolio")["_ok"].sum()
+    )
+    size_summary["n_obs"] = size_summary["asset"].map(_sv_obs).fillna(0).astype(int)
     rows.append(size_summary)
 
     out = pd.concat(rows, ignore_index=True, sort=False)
@@ -1356,11 +1582,43 @@ def _build_figure12_data(
     )
 
 
+def _build_unbalanced_pca_segments(proc_root: Path, sample_dates: pd.DatetimeIndex, k: int = 4) -> Dict[str, np.ndarray]:
+    """论文 Figure 13 的 “PCA (unbalanced)” 行：在【全市场非平衡】日频收益上估计 PCA。
+
+    近似口径（已在文档说明，与论文“逐年 PCA + 旋转”非完全一致）：对全部 symbol_returns
+    的日频【总】收益做一次全样本 pairwise PCA（NaN 容忍）得 4 个权重，再把权重施加到
+    intraday/overnight/daily 三段全市场收益，得到非平衡 PCA 因子的三段日频收益。
+    """
+    import core.engine as eng
+    files = sorted((proc_root / "symbol_returns").glob("*.npz"))
+    if not files:
+        raise RuntimeError("symbol_returns 不可用，无法构建非平衡 PCA")
+    date_index = {int(ts.strftime("%Y%m%d")): i for i, ts in enumerate(sample_dates)}
+    T, N = len(sample_dates), len(files)
+    key = {"intraday": "intraday_returns", "overnight": "overnight_returns", "daily": "daily_returns"}
+    M = {seg: np.full((T, N), np.nan, dtype=np.float64) for seg in SEGMENT_ORDER}
+    for col, path in enumerate(files):
+        a = np.load(path)
+        codes = a["date_codes"].astype(np.int64, copy=False)
+        ridx = np.fromiter((date_index.get(int(c), -1) for c in codes), dtype=np.int64, count=len(codes))
+        ok = ridx >= 0
+        if not ok.any():
+            continue
+        rr = ridx[ok]
+        for seg in SEGMENT_ORDER:
+            M[seg][rr, col] = np.asarray(a[key[seg]], dtype=np.float64)[ok]
+    res = eng.pca_factors_pairwise(M["daily"], K=int(k), use_corr=True)
+    eng.orient_pca_result(res)
+    W = eng.factor_portfolio_weights(res)
+    return {seg: np.nan_to_num(M[seg], nan=0.0) @ W for seg in SEGMENT_ORDER}
+
+
 def _build_figure13_data(
     result: Any,
     *,
     sample_dates: pd.DatetimeIndex,
     ffc_segmented: pd.DataFrame,
+    pca_unbalanced: Optional[Dict[str, np.ndarray]] = None,
 ) -> pd.DataFrame:
     continuous = {
         "intraday": np.asarray(result.pipeline.F_cont_display_daily_intra, dtype=float),
@@ -1375,25 +1633,45 @@ def _build_figure13_data(
 
     rows: List[Dict[str, Any]] = []
     continuous_names = [f"Factor {idx}" for idx in range(1, min(4, continuous["daily"].shape[1]) + 1)]
-    for factor_set, mats, factor_names in [
+    factor_set_specs = [
         ("Continuous PCA", continuous, continuous_names),
-        ("FFC 4-factor", ffc, ffc_names),
-    ]:
+    ]
+    # P-Fig13：补“Continuous PCA (unbalanced)”行（若全市场非平衡因子可用）。
+    if pca_unbalanced is not None:
+        ub_names = [f"Factor {idx}" for idx in range(1, min(4, pca_unbalanced["daily"].shape[1]) + 1)]
+        factor_set_specs.append(("Continuous PCA (unbalanced)", pca_unbalanced, ub_names))
+    factor_set_specs.append(("FFC 4-factor", ffc, ffc_names))
+    for factor_set, mats, factor_names in factor_set_specs:
+        # P11（论文 Figure 13 caption：“normalized by their DAILY standard deviation”）：
+        # 同一因子的 intraday/overnight/daily 三段统一用【该因子日频 std】归一化，
+        # 而不是各段用各自 std；前导缺失不再当 0（对齐首个有效日后再累计）。
+        daily_mat = mats["daily"]
+        factor_count = min(daily_mat.shape[1], len(factor_names), 4)
+        daily_std = np.nanstd(daily_mat[:, :factor_count], axis=0, ddof=1)
         for segment in SEGMENT_ORDER:
             matrix = mats[segment]
-            factor_count = min(matrix.shape[1], len(factor_names), 4)
             for factor_idx in range(factor_count):
                 series = matrix[:, factor_idx]
-                std = float(np.nanstd(series, ddof=1))
-                normalized = np.nan_to_num(series / std, nan=0.0) if std > 0 else np.zeros_like(series)
-                cumulative = np.cumsum(normalized)
+                std = float(daily_std[factor_idx]) if factor_idx < daily_std.size else np.nan
+                if not np.isfinite(std) or std <= 0:
+                    normalized = np.zeros_like(series)
+                else:
+                    normalized = series / std
+                # 前导/中间缺失：用 0 增量参与累计（不影响累计曲线的水平），
+                # 但仅在该因子首个有效日之后开始累计，避免“缺失期当 0 收益”。
+                valid = np.isfinite(normalized)
+                cumulative = np.full(series.shape, np.nan, dtype=float)
+                if valid.any():
+                    first = int(np.argmax(valid))
+                    filled = np.where(valid, normalized, 0.0)
+                    cumulative[first:] = np.cumsum(filled[first:])
                 rows.extend(
                     {
                         "date": sample_dates[pos],
                         "factor_set": factor_set,
                         "segment_kind": segment,
                         "factor": factor_names[factor_idx],
-                        "normalized_cumulative_return": float(cumulative[pos]),
+                        "normalized_cumulative_return": float(cumulative[pos]) if np.isfinite(cumulative[pos]) else np.nan,
                     }
                     for pos in range(len(sample_dates))
                 )
@@ -1479,27 +1757,78 @@ def _build_payload(
     )
 
     assignments = _load_assignments(discovered["size_value_assignments"])
-    size_value_assets, daily_wide_vw, daily_wide_ew, size_value_meta = _build_size_value_assets(proc_root, assignments)
+    # legacy（平衡子集）保留：用于旧 validation 工件与回退。
+    sv_legacy, daily_wide_vw, daily_wide_ew, size_value_meta = _build_size_value_assets(proc_root, assignments)
+    size_value_assets = sv_legacy
+    size_value_source = "legacy_balanced_subset"
+    if _size_value_full_market():
+        try:
+            from core.paper_fidelity import build_full_market_size_value
+            size_value_assets = build_full_market_size_value(
+                proc_root, assignments, global_dates=global_dates, mcap_matrix=mcap_matrix, symbols=symbols
+            )
+            size_value_source = "full_market"  # P9
+        except Exception as exc:  # pragma: no cover - refresh 仅分钟级，失败回退不丢重结果
+            print(f"[paper_fidelity] P9 full-market 2x3 失败，回退旧实现: {exc!r}")
+            size_value_assets = sv_legacy
+            size_value_source = "legacy_fallback_after_error"
+    # P10/D5：按 size/value 起点裁剪（2012 账面缺失 -> 2014-07-01）。
+    _sv_start = _size_value_start()
+    if _sv_start is not None and "date" in size_value_assets.columns:
+        size_value_assets = size_value_assets.loc[size_value_assets["date"] >= _sv_start].reset_index(drop=True)
     size_value_validation, size_value_validation_summary = _validate_size_value(
         daily_wide_vw,
         daily_wide_ew,
         discovered["size_value_reference_vw"],
         discovered["size_value_reference_ew"],
     )
+    # N8：把校验重定位为“与旧平衡口径的差异报告”，不再当作正确性证明。
+    if isinstance(size_value_validation_summary, dict):
+        size_value_validation_summary["size_value_source"] = size_value_source
+        size_value_validation_summary["note"] = (
+            "full_market 模式下，重建口径已不同于参考（平衡子集），差异预期非零，本表仅作差异报告。"
+        )
 
     industry_selection = _select_industries_from_pca(result, industry_map)
     industry_factors = _build_industry_factor_frame(market_returns, industry_assets, industry_selection, dates=global_dates)
-    ffc_segmented_raw, ffc_segmented, ffc_segment_reconciliation = _build_ffc_segmented_frames(
-        market_returns,
-        size_value_assets,
-        ffc_external,
-        dates=global_dates,
-    )
+
+    # P7/P6/P8：分段 FFC。默认用股票级直接构造（carhart_daily）；失败回退旧残差法。
+    ffc_source = "legacy_residual_allocation"
+    try:
+        if _ffc_mom_mode() == "carhart_daily":
+            from core.paper_fidelity import build_full_market_momentum, build_ffc_segmented_clean, split_daily_rf
+            rf_global = rf_daily.reindex(global_dates, fill_value=0.0).to_numpy(dtype=float)
+            rf_split_global = split_daily_rf(rf_global)
+            mom_segmented = build_full_market_momentum(
+                proc_root, global_dates=global_dates, mcap_matrix=mcap_matrix, symbols=symbols
+            )
+            ffc_segmented_raw, ffc_segmented = build_ffc_segmented_clean(
+                market_returns, size_value_assets, mom_segmented,
+                dates=global_dates, rf_split={seg: rf_split_global[seg] for seg in SEGMENT_ORDER},
+            )
+            ffc_segment_reconciliation = pd.DataFrame()
+            ffc_source = "stocklevel_carhart_clean"  # P7+P6+P8
+        else:
+            raise RuntimeError("ffc_mom_mode != carhart_daily -> 用旧实现")
+    except Exception as exc:  # pragma: no cover
+        if _ffc_mom_mode() == "carhart_daily":
+            print(f"[paper_fidelity] P7 分段 FFC 失败，回退旧实现: {exc!r}")
+        ffc_segmented_raw, ffc_segmented, ffc_segment_reconciliation = _build_ffc_segmented_frames(
+            market_returns,
+            size_value_assets,
+            ffc_external,
+            dates=global_dates,
+        )
     ffc_validation, ffc_validation_summary = _validate_ffc_daily(
         ffc_segmented.loc[ffc_segmented["date"].isin(sample_dates)],
         ffc_external,
         dates=sample_dates,
     )
+    if isinstance(ffc_validation_summary, dict):
+        ffc_validation_summary["ffc_source"] = ffc_source
+        ffc_validation_summary["note"] = (
+            "stocklevel 口径下 daily 不再被强制等于官方日频；本表是与官方日频的差异报告（N8）。"
+        )
 
     balanced_summary = _summarize_balanced_panel(result, rf_daily_sample)
     figure12_data, figure12_filter = _build_figure12_data(
@@ -1511,7 +1840,18 @@ def _build_payload(
         rf_daily_sample=rf_daily_sample,
         weighting=weighting,
     )
-    figure13_data = _build_figure13_data(result, sample_dates=sample_dates, ffc_segmented=ffc_segmented.loc[ffc_segmented["date"].isin(sample_dates)])
+    # P-Fig13：尝试构建“PCA (unbalanced)”行（全市场非平衡 PCA，近似口径），失败则只出 2 行。
+    pca_unbalanced = None
+    try:
+        pca_unbalanced = _build_unbalanced_pca_segments(proc_root, sample_dates, k=4)
+    except Exception as exc:  # pragma: no cover
+        print(f"[paper_tail] Figure 13 非平衡 PCA 行不可用，回退为 2 行: {exc!r}")
+    figure13_data = _build_figure13_data(
+        result,
+        sample_dates=sample_dates,
+        ffc_segmented=ffc_segmented.loc[ffc_segmented["date"].isin(sample_dates)],
+        pca_unbalanced=pca_unbalanced,
+    )
 
     result.paper_tail = {"industry_selection": industry_selection}
     table_iii = _build_table_iii(
@@ -1643,40 +1983,51 @@ def render_figure_12(result: Any, output_path: Path, title: str) -> None:
         _save_placeholder_figure(output_path, title, "Paper-tail Figure 12 data are not available.")
         return
 
-    group_order = list(GROUP_TITLES.keys())
-    fig, axes = plt.subplots(2, 2, figsize=(13, 10), sharex=False, sharey=False)
-    color_map = plt.cm.get_cmap("RdBu_r")
-    for ax, group in zip(axes.flat, group_order):
+    # 论文 Figure 12：3 个面板（All stocks / Industry / Sorted），1 行 × 3 列。
+    # 用空心圆点（无填充、无色条），并画一条向下倾斜的趋势参考线（intraday↔overnight 反向）。
+    paper_groups = [
+        ("all_stocks", "All Stocks"),
+        ("industry_portfolios", "{n_industry} Industry Portfolios"),
+        ("size_value_portfolios", "6 Size/Value Portfolios"),
+    ]
+    n_industry = 0
+    if isinstance(df, pd.DataFrame) and "group" in df.columns:
+        ind = df.loc[df["group"].eq("industry_portfolios"), "asset"]
+        n_industry = int(ind.nunique()) if not ind.empty else 0
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5.2), sharex=False, sharey=False)
+    for ax, (group, gtitle) in zip(np.atleast_1d(axes).flat, paper_groups):
         sub = df.loc[df["group"].eq(group)].copy()
         if group == "all_stocks" and "eligible_for_plot" in sub.columns:
             keep = sub["eligible_for_plot"]
             if keep.dtype != bool:
                 keep = keep.astype(str).str.lower().isin({"1", "true", "yes"})
             sub = sub.loc[keep].copy()
+        title_group = gtitle.format(n_industry=n_industry) if "{n_industry}" in gtitle else gtitle
         if sub.empty:
-            ax.set_title(GROUP_TITLES[group])
+            ax.set_title(title_group)
             ax.text(0.5, 0.5, "No data", ha="center", va="center")
             continue
-        scatter = ax.scatter(
-            sub["mean_overnight_excess"],
-            sub["mean_intraday_excess"],
-            c=sub["mean_daily_excess"],
-            cmap=color_map,
-            alpha=0.65 if len(sub) > 20 else 0.9,
-            s=28 if len(sub) > 20 else 48,
-            edgecolor="none",
-        )
-        ax.axhline(0.0, color="0.75", linewidth=1.0)
-        ax.axvline(0.0, color="0.75", linewidth=1.0)
-        ax.set_title(GROUP_TITLES[group])
-        ax.set_xlabel("Expected overnight excess return")
-        ax.set_ylabel("Expected intraday excess return")
+        xs = sub["mean_intraday_excess"].to_numpy(dtype=float)
+        ys = sub["mean_overnight_excess"].to_numpy(dtype=float)
+        # N4：x=预期盘中、y=预期隔夜；空心圆（论文样式）。
+        ax.scatter(xs, ys, facecolors="none", edgecolors="#1f5fbf", linewidths=1.0,
+                   s=30 if len(sub) > 20 else 55, alpha=0.85)
+        ax.axhline(0.0, color="0.85", linewidth=0.8)
+        ax.axvline(0.0, color="0.85", linewidth=0.8)
+        # 向下趋势参考线：对该面板点做一次最小二乘拟合（捕捉论文强调的负相关）。
+        good = np.isfinite(xs) & np.isfinite(ys)
+        if good.sum() >= 2 and np.ptp(xs[good]) > 0:
+            b1, b0 = np.polyfit(xs[good], ys[good], 1)
+            xline = np.array([xs[good].min(), xs[good].max()])
+            ax.plot(xline, b0 + b1 * xline, color="0.4", linestyle="--", linewidth=1.0)
+        ax.set_title(title_group)
+        ax.set_xlabel("Expected intraday excess return")
+        ax.set_ylabel("Expected overnight excess return")
         if len(sub) <= 16:
             for _, row in sub.iterrows():
-                ax.annotate(str(row["asset"]), (row["mean_overnight_excess"], row["mean_intraday_excess"]), fontsize=8, alpha=0.85)
-        fig.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04, label="Expected daily excess return")
+                ax.annotate(str(row["asset"]), (row["mean_intraday_excess"], row["mean_overnight_excess"]), fontsize=7, alpha=0.8)
     fig.suptitle(title)
-    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
     _atomic_save_figure(fig, output_path, dpi=170)
     plt.close(fig)
 
@@ -1695,24 +2046,29 @@ def render_figure_13(result: Any, output_path: Path, title: str) -> None:
         _save_placeholder_figure(output_path, title, "Paper-tail Figure 13 data are not available.")
         return
 
-    fig, axes = plt.subplots(3, 2, figsize=(14, 11), sharex=True)
-    for row_idx, segment in enumerate(SEGMENT_ORDER):
-        for col_idx, factor_set in enumerate(FIG13_FACTORSET_ORDER):
+    # 论文 Figure 13：行=因子集（PCA / PCA-unbalanced / FFC），列=频段，每子图画各因子归一化累计收益。
+    seg_cols = ["intraday", "overnight", "daily"]
+    seg_label = {"intraday": "Intraday", "overnight": "Overnight", "daily": "Daily"}
+    preferred = ["Continuous PCA", "Continuous PCA (unbalanced)", "FFC 4-factor"]
+    present = list(df["factor_set"].unique()) if "factor_set" in df.columns else []
+    factor_sets = [fs for fs in preferred if fs in present] or preferred
+    fig, axes = plt.subplots(len(factor_sets), 3, figsize=(16, 4.6 * len(factor_sets)), sharex=True)
+    axes = np.atleast_2d(axes)
+    for row_idx, factor_set in enumerate(factor_sets):
+        for col_idx, segment in enumerate(seg_cols):
             ax = axes[row_idx, col_idx]
             sub = df.loc[df["segment_kind"].eq(segment) & df["factor_set"].eq(factor_set)].copy()
+            ax.set_title(f"{factor_set} {seg_label[segment]} Return", fontsize=9)
             if sub.empty:
-                ax.set_title(f"{factor_set} | {segment}")
-                ax.text(0.5, 0.5, "No data", ha="center", va="center")
-                continue
+                ax.text(0.5, 0.5, "No data", ha="center", va="center"); continue
             for factor_name, factor_df in sub.groupby("factor", sort=False):
-                ax.plot(pd.to_datetime(factor_df["date"]), factor_df["normalized_cumulative_return"], linewidth=1.5, label=factor_name)
-            ax.set_title(f"{factor_set} | {segment}")
+                ax.plot(pd.to_datetime(factor_df["date"]), factor_df["normalized_cumulative_return"], linewidth=1.4, label=str(factor_name))
             ax.grid(True, alpha=0.2)
-            if row_idx == len(SEGMENT_ORDER) - 1:
-                ax.set_xlabel("Date")
-            ax.set_ylabel("Normalized cumulative return")
-            if row_idx == 0:
-                ax.legend(loc="best", fontsize=8)
+            if row_idx == len(factor_sets) - 1:
+                ax.set_xlabel("Time")
+            if col_idx == 0:
+                ax.set_ylabel("Return")
+            ax.legend(loc="best", fontsize=7)
     fig.suptitle(title)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     _atomic_save_figure(fig, output_path, dpi=170)
@@ -1732,39 +2088,48 @@ def _render_pricing_figure(df: pd.DataFrame, output_path: Path, title: str) -> N
         return
 
     factor_sets = ["Continuous PCA", "FFC 4-factor"]
-    fig, axes = plt.subplots(3, 2, figsize=(14, 11), sharex=False, sharey=False)
-    for row_idx, segment in enumerate(SEGMENT_ORDER):
-        for col_idx, factor_set in enumerate(factor_sets):
-            ax = axes[row_idx, col_idx]
+    seg_cols = ["daily", "intraday", "overnight"]  # 论文列序
+    seg_label = {"daily": "Daily", "intraday": "Intraday", "overnight": "Overnight"}
+    set_label = {"Continuous PCA": "PCA", "FFC 4-factor": "Fama-French-Carhart"}
+    # 论文 Figure 14/15：Panel A（预测 vs 预期散点，2 行模型 × 3 列频段）在上，
+    # Panel B（各资产时序定价误差 alpha 柱状，2 行 × 3 列）在下。
+    fig, axes = plt.subplots(4, 3, figsize=(16, 16))
+    for r, factor_set in enumerate(factor_sets):          # Panel A 两行
+        for c, segment in enumerate(seg_cols):
+            ax = axes[r, c]
             sub = df.loc[df["segment_kind"].eq(segment) & df["factor_set"].eq(factor_set)].copy()
             if sub.empty:
-                ax.set_title(f"{factor_set} | {segment}")
-                ax.text(0.5, 0.5, "No data", ha="center", va="center")
-                continue
-            min_xy = float(np.nanmin(np.concatenate([sub["expected_return"].to_numpy(), sub["predicted_return"].to_numpy()])))
-            max_xy = float(np.nanmax(np.concatenate([sub["expected_return"].to_numpy(), sub["predicted_return"].to_numpy()])))
-            pad = max(1e-4, 0.08 * max(abs(min_xy), abs(max_xy), 1e-4))
-            ax.scatter(sub["expected_return"], sub["predicted_return"], c=sub["abs_alpha"], cmap="viridis", s=55, alpha=0.85)
-            ax.plot([min_xy - pad, max_xy + pad], [min_xy - pad, max_xy + pad], color="0.5", linestyle="--", linewidth=1.0)
-            ax.set_title(f"{factor_set} | {segment}")
-            ax.set_xlabel("Expected return")
-            ax.set_ylabel("Predicted return")
+                ax.set_title(f"{seg_label[segment]} {set_label[factor_set]}", fontsize=9)
+                ax.text(0.5, 0.5, "No data", ha="center", va="center"); continue
+            ex = sub["expected_return"].to_numpy(dtype=float)
+            pr = sub["predicted_return"].to_numpy(dtype=float)
+            lo = float(np.nanmin(np.concatenate([ex, pr]))); hi = float(np.nanmax(np.concatenate([ex, pr])))
+            pad = max(1e-4, 0.08 * max(abs(lo), abs(hi), 1e-4))
+            ax.scatter(ex, pr, facecolors="none", edgecolors="#1f5fbf", linewidths=1.0, s=42, alpha=0.85)
+            ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], color="0.5", linestyle="--", linewidth=1.0)  # 45°
+            ax.set_title(f"{seg_label[segment]} {set_label[factor_set]}", fontsize=9)
+            ax.set_xlabel("Expected return"); ax.set_ylabel("Predicted return")
             ax.grid(True, alpha=0.2)
-            if len(sub) <= 18:
-                for _, row in sub.iterrows():
-                    ax.annotate(str(row["asset"]), (row["expected_return"], row["predicted_return"]), fontsize=8, alpha=0.85)
-            ax.text(
-                0.02,
-                0.98,
-                f"mean |alpha|={sub['abs_alpha'].mean():.4g}\nmean R2={sub['r2'].mean():.3f}",
-                transform=ax.transAxes,
-                va="top",
-                ha="left",
-                fontsize=8,
-                bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "0.8"},
-            )
-    fig.suptitle(title)
-    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    for r, factor_set in enumerate(factor_sets):          # Panel B 两行（柱状）
+        for c, segment in enumerate(seg_cols):
+            ax = axes[r + 2, c]
+            sub = df.loc[df["segment_kind"].eq(segment) & df["factor_set"].eq(factor_set)].copy()
+            if sub.empty:
+                ax.set_title(f"{seg_label[segment]} {set_label[factor_set]}", fontsize=9)
+                ax.text(0.5, 0.5, "No data", ha="center", va="center"); continue
+            subb = sub.sort_values("asset")
+            xpos = np.arange(len(subb))
+            ax.bar(xpos, subb["alpha"].to_numpy(dtype=float), color="#1f5fbf", alpha=0.85)
+            ax.axhline(0.0, color="0.4", linewidth=0.9)
+            ax.set_title(f"{seg_label[segment]} {set_label[factor_set]}", fontsize=9)
+            ax.set_ylabel("Pricing error")
+            ax.set_xticks(xpos)
+            ax.set_xticklabels([str(a) for a in subb["asset"].tolist()], fontsize=6, rotation=90 if len(subb) > 8 else 0)
+            ax.grid(True, axis="y", alpha=0.2)
+    fig.text(0.5, 0.985, "Panel A: Predicted Returns", ha="center", fontsize=12, weight="bold")
+    fig.text(0.5, 0.495, "Panel B: Pricing Errors", ha="center", fontsize=12, weight="bold")
+    fig.suptitle(title, y=1.0, fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, 0.965))
     _atomic_save_figure(fig, output_path, dpi=170)
     plt.close(fig)
 

@@ -27,6 +27,29 @@ DEFAULT_PREPROCESS_CACHE_ROOT = REPO_ROOT / ".hf_cache" / "pelger_cn_preprocess"
 PREPROCESS_VERSION = "v3"
 PANEL_RETURN_SCHEME = "daily_intra_night_total_plus_full_5min_v1"
 
+
+def _intraday_only_5min_enabled() -> bool:
+    """N1 开关：R_5min_full 是否为纯盘中（默认 1=贴近论文；0=旧含隔夜口径）。"""
+    return str(os.environ.get("PELGER_INTRADAY_ONLY_5MIN", "1")).strip().lower() not in {"0", "false", "no"}
+
+
+def _effective_return_scheme() -> str:
+    """口径不同则版本号不同，避免新旧 proc_data 混用（影响重结果缓存命中）。"""
+    return PANEL_RETURN_SCHEME + ("_intraday5min_v2" if _intraday_only_5min_enabled() else "")
+
+
+def _balanced_mode() -> str:
+    """P2 平衡面板口径：'strict'（每日都在，旧）或 'paper_lenient'（论文宽松过滤）。"""
+    return str(os.environ.get("PELGER_BALANCED_MODE", "strict")).strip().lower()
+
+
+def _balanced_min_coverage() -> float:
+    """paper_lenient 模式下，每年最低覆盖率阈值（论文≈ ≤500/12000 缺失 -> ~0.96）。"""
+    try:
+        return float(os.environ.get("PELGER_BALANCED_MIN_COVERAGE", "0.96"))
+    except Exception:
+        return 0.96
+
 REQUIRED_RAW_COLUMNS = ["code", "kline_time", "open", "high", "low", "close", "volume", "amount"]
 CN_5MIN_BAR_TIMES = [
     "09:30:00", "09:35:00", "09:40:00", "09:45:00", "09:50:00", "09:55:00",
@@ -389,7 +412,19 @@ def _build_adjusted_symbol_returns(
             intraday = float(np.log(adjusted_close[-1] / adjusted_open[0]))
 
             full_5min = np.empty(len(adjusted_close), dtype=np.float64)
-            if previous_adjusted_close is None:
+            # ----------------------------------------------------------------
+            # N1（论文 II.A：“Overnight returns are modeled as separate jumps”）：
+            #   连续/跳跃 PCA 必须用【纯盘中】5 分钟收益；隔夜跨隙单独存于
+            #   overnight，不混入主序列。因此每日第 0 根 = 当日开盘→首根收盘
+            #   （log(close[0]/open[0])），而不是 log(close[0]/前一日收盘)。
+            #   这样 sum(48 根) = log(close[-1]/open[0]) = intraday（不含隔夜）。
+            #   默认开启（贴近论文）；设 PELGER_INTRADAY_ONLY_5MIN=0 可复现旧口径
+            #   （旧口径首根含隔夜，sum(48)=前收→收盘=daily）。
+            #   注意：切换该口径会改变 proc_data，从而使既有重结果缓存失效，
+            #   需 restart=True 重跑（属“完整路径”）。
+            if _intraday_only_5min_enabled():
+                full_5min[0] = np.log(adjusted_close[0] / adjusted_open[0])
+            elif previous_adjusted_close is None:
                 full_5min[0] = np.log(adjusted_close[0] / adjusted_open[0])
             else:
                 full_5min[0] = np.log(adjusted_close[0] / previous_adjusted_close)
@@ -502,6 +537,27 @@ def _summarize_processed_universe(universe: pd.DataFrame, proc_root: Path) -> Tu
         & universe["last_valid_date"].eq(global_valid_dates[-1])
     )
 
+    # ------------------------------------------------------------------
+    # P2（论文附录 A 平衡面板口径）：论文不要求“每个交易日都在”，而是按宽松
+    # 缺失阈值（某日前 10 根全缺 / 某日前缺失 > 50 / 全年缺失 > 500 才剔除）+
+    # 缺失插值（增量为 0），再取 13 年都在的交集（美股 ~332，占当年 ~55%）。
+    # 这里用“每年覆盖率 ≥ 阈值（默认 0.96，≈ ≤500/12000 缺失）”近似该过滤，
+    # 并要求样本期首尾年都达标（13 年都在）。
+    # 注意：要真正用 paper_lenient 面板跑 PCA，面板构建器需对缺失日做插值
+    # （详见 docs/SPEC_PAPER_FAITHFUL.md 的 P2 小节）；本标记先把“可用宇宙”
+    # 选出来。切换到 paper_lenient 会改变面板，使既有重结果缓存失效（完整路径）。
+    min_cov = _balanced_min_coverage()
+    year_cov_cols = [f"coverage_{year}" for year in global_dates_by_year]
+    if year_cov_cols:
+        cov_ok = np.logical_and.reduce([universe[col].to_numpy() >= min_cov for col in year_cov_cols])
+    else:
+        cov_ok = universe["coverage_ratio"].to_numpy() >= min_cov
+    universe["is_balanced_paper"] = (
+        pd.Series(cov_ok, index=universe.index)
+        & universe["first_valid_date"].le(global_valid_dates[0])
+        & universe["last_valid_date"].ge(global_valid_dates[-1])
+    )
+
     summary = {
         "data_root": str(proc_root.resolve()),
         "source": "processed_adjusted",
@@ -516,6 +572,9 @@ def _summarize_processed_universe(universe: pd.DataFrame, proc_root: Path) -> Tu
         "global_dates": global_valid_dates,
         "global_dates_by_year": global_dates_by_year,
         "strict_balanced_symbols_full": int(universe["is_strict_balanced"].sum()),
+        "balanced_paper_symbols_full": int(universe["is_balanced_paper"].sum()) if "is_balanced_paper" in universe.columns else 0,
+        "balanced_mode": _balanced_mode(),
+        "balanced_min_coverage": _balanced_min_coverage(),
         "strict_balanced_symbols_by_year": {int(year): int(universe[f"is_strict_{year}"].sum()) for year in global_dates_by_year},
     }
     summary["strict_balanced_symbols"] = int(summary["strict_balanced_symbols_full"])
@@ -558,7 +617,12 @@ def _select_sample_rows(
         raise ValueError(f"Unknown sample_mode: {sample_mode}")
 
     if years is None:
-        mask = universe["is_strict_balanced"]
+        # P2：完整路径用 PELGER_BALANCED_MODE=paper_lenient 时，按论文宽松口径
+        # （每年覆盖率达标 + 13 年都在）选平衡面板；默认 strict（每日都在，旧）。
+        if _balanced_mode() == "paper_lenient" and "is_balanced_paper" in universe.columns:
+            mask = universe["is_balanced_paper"]
+        else:
+            mask = universe["is_strict_balanced"]
     else:
         mask = universe[f"is_strict_{int(years[0])}"].copy()
         for year in years[1:]:
@@ -731,6 +795,16 @@ def _write_panel(
         R_night[:, col_idx] = night_col
         R_daily[:, col_idx] = daily_col
 
+    # P2（论文宽松面板）：缺失日"插值"为【零增量】——价格沿用上一可得值，故缺失日收益记 0。
+    # 这样在 paper_lenient 宽松缺失阈值下，平衡全样本面板仍是完整矩形，可直接做（非 pairwise）PCA，
+    # 与论文一致。strict 口径不受影响（其面板本就无缺失）。
+    interpolated_missing = False
+    if allow_missing and _balanced_mode() == "paper_lenient":
+        n_missing = int(np.isnan(R_5min_full).sum() + np.isnan(R_daily).sum())
+        for arr in (R_intra, R_night, R_daily, R_5min_full):
+            np.nan_to_num(arr, copy=False, nan=0.0)
+        interpolated_missing = True
+
     day_ids = np.repeat(np.arange(day_count), bar_count).astype(np.int32)
     sample_report = {
         "sample_mode": sample_mode,
@@ -745,6 +819,8 @@ def _write_panel(
         "selected_calendar_end": dates[-1] if dates else None,
         "target_symbols": tickers,
         "contains_nan": bool(np.isnan(R_intra).any() or np.isnan(R_5min_full).any()),
+        "balanced_mode": _balanced_mode(),
+        "missing_interpolated_to_zero": bool(interpolated_missing),
         "panel_workers": int(panel_workers),
     }
 

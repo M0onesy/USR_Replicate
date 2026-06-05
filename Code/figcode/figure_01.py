@@ -55,18 +55,37 @@ def _plot_er_panel(df, panel_block: str, title: str, output_path: Path) -> None:
             f"No HF perturbed eigenvalue-ratio data are available for {panel_block.lower()}.",
         )
         return
+    # critical value = 1 + gamma（论文 1.08），取自诊断表（每行一致），缺省 0.08
+    gamma = 0.08
+    if "gamma" in sub.columns and sub["gamma"].notna().any():
+        try:
+            gamma = float(sub["gamma"].dropna().iloc[0])
+        except Exception:
+            gamma = 0.08
+    crit = 1.0 + gamma
+
+    sub = sub.sort_values("year")
+    years = sub["year"].tolist()
+    # 1:1 复刻论文 Figure 1/2 的版式：把年份按每组 ~4 个分到竖排子图，
+    # 每个子图叠该组年份的 ER 折线 + critical value 判别线（图例标注）。
     x = np.arange(1, len(er_cols) + 1)
-    fig, ax = plt.subplots(figsize=(9.5, 5.0))
-    for _, row in sub.sort_values("year").iterrows():
-        y = [float(row[col]) for col in er_cols]
-        label = f"{int(row['year'])} (K={int(row['K_hat'])})"
-        ax.plot(x, y, marker="o", linewidth=1.4, label=label)
-    ax.set_title(title)
-    ax.set_xlabel("k")
-    ax.set_ylabel("Perturbed eigenvalue ratio")
-    ax.set_xticks(x)
-    ax.grid(True, alpha=0.25)
-    ax.legend(loc="best", fontsize=8, ncol=2)
+    group_size = 4
+    groups = [years[i:i + group_size] for i in range(0, len(years), group_size)] or [years]
+    nrows = len(groups)
+    fig, axes = plt.subplots(nrows, 1, figsize=(9.5, max(2.4 * nrows, 3.0)), sharex=True)
+    if nrows == 1:
+        axes = [axes]
+    for ax, grp in zip(axes, groups):
+        for _, row in sub.loc[sub["year"].isin(grp)].iterrows():
+            y = [float(row[col]) for col in er_cols]
+            ax.plot(x, y, marker="o", linewidth=1.4, label=f"{int(row['year'])} (K={int(row['K_hat'])})")
+        ax.axhline(crit, color="green", linewidth=1.3, label=f"Critical value {crit:.2f}")
+        ax.set_ylabel("Perturbed ER")
+        ax.set_xticks(x)
+        ax.grid(True, alpha=0.25)
+        ax.legend(loc="best", fontsize=8, ncol=2)
+    axes[0].set_title(title)
+    axes[-1].set_xlabel("k")
     fig.tight_layout()
     _atomic_save_figure(fig, output_path, dpi=160)
     plt.close(fig)

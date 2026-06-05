@@ -2042,6 +2042,48 @@ def _build_paper_resource_plan(
     )
 
 
+def orient_pca_result(res: PCAResult, *, market_first: bool = True) -> PCAResult:
+    """P4 —— 对 PCA 载荷/因子做确定性符号定向，消除特征解的任意翻号。
+
+    论文 Figure 4：第 1 个连续因子是“只做多、量级相近”的等权市场组合。
+    约定：
+      * 因子 1：使平均载荷为正（正的等权市场）。
+      * 因子 2..K：使绝对值最大的那只股票的载荷为正（可复现的主导方向）。
+    翻号同时作用于 Lambda 与 F（C = FΛ' 保持不变），原地修改并返回 res。
+    注：因子 2..K 的“经济朝向”（与冻结行业同号）可在 paper_tail 层再定向，
+    本函数只保证可复现、且因子 1 为正市场（修掉“负市场”这一最显眼问题）。
+    """
+    if res is None or getattr(res, "Lambda", None) is None:
+        return res
+    Lam = np.asarray(res.Lambda, dtype=float)
+    K = Lam.shape[1] if Lam.ndim == 2 else 0
+    if K == 0:
+        return res
+    signs = np.ones(K, dtype=float)
+    for k in range(K):
+        col = Lam[:, k]
+        if k == 0 and market_first:
+            m = np.nanmean(col)
+            signs[k] = 1.0 if (not np.isfinite(m)) or m >= 0 else -1.0
+        else:
+            finite = np.where(np.isfinite(col), np.abs(col), -1.0)
+            j = int(np.argmax(finite))
+            signs[k] = 1.0 if col[j] >= 0 else -1.0
+    if np.allclose(signs, 1.0):
+        return res
+    res.Lambda = Lam * signs[None, :]
+    if getattr(res, "F", None) is not None:
+        F = np.asarray(res.F, dtype=float)
+        if F.ndim == 2 and F.shape[1] == K:
+            res.F = F * signs[None, :]
+    return res
+
+
+def _paper_faithful_signs_enabled() -> bool:
+    """P4 开关：默认开启；设环境变量 PELGER_PAPER_FAITHFUL_SIGNS=0 可关闭。"""
+    return str(os.environ.get("PELGER_PAPER_FAITHFUL_SIGNS", "1")).strip().lower() not in {"0", "false", "no"}
+
+
 def factor_portfolio_weights(res: PCAResult) -> np.ndarray:
     """
     把 PCA loadings 转成股票组合权重:
@@ -2084,14 +2126,39 @@ def perturbed_eigenvalue_ratio(
     return K_hat, ER
 
 
+def _inv_sqrt_psd(A: np.ndarray) -> np.ndarray:
+    """对称半正定矩阵的逆平方根 A^{-1/2}（特征分解，零特征值置零）。"""
+    w, V = np.linalg.eigh((A + A.T) / 2.0)
+    w = np.clip(w, 0.0, None)
+    inv_sqrt = np.where(w > 1e-12, 1.0 / np.sqrt(w), 0.0)
+    return (V * inv_sqrt) @ V.T
+
+
 def generalized_correlations(F: np.ndarray, G: np.ndarray) -> np.ndarray:
-    """Bai-Ng (2006) generalized correlation."""
+    """广义相关 = 典则相关（Bai-Ng 2006 / 论文 footnote 19）。
+
+    平方典则相关 = 对称半正定矩阵
+        Mₛ = (G'G)^{-1/2}(G'F)(F'F)^{-1}(F'G)(G'G)^{-1/2}
+    的特征值（实、∈[0,1]）。直接取该对称矩阵的特征值，避免对非对称
+    (G'G)^{-1}(G'F)(F'F)^{-1}(F'G) 做 (M+M')/2 近似带来的偏差。
+    """
+    F = np.asarray(F, dtype=float)
+    G = np.asarray(G, dtype=float)
+    if F.ndim == 1:
+        F = F[:, None]
+    if G.ndim == 1:
+        G = G[:, None]
     FtF = F.T @ F
     GtG = G.T @ G
     FtG = F.T @ G
     GtF = FtG.T
-    M = _safe_inv(GtG) @ GtF @ _safe_inv(FtF) @ FtG
-    eigvals, _ = _sym_eig_desc((M + M.T) / 2.0)
+    try:
+        Gisq = _inv_sqrt_psd(GtG)
+        M_sym = Gisq @ GtF @ _safe_inv(FtF) @ FtG @ Gisq
+        eigvals, _ = _sym_eig_desc((M_sym + M_sym.T) / 2.0)
+    except Exception:
+        M = _safe_inv(GtG) @ GtF @ _safe_inv(FtF) @ FtG  # 退路：非对称形式
+        eigvals, _ = _sym_eig_desc((M + M.T) / 2.0)
     eigvals = np.clip(eigvals, 0.0, 1.0)
     k = min(F.shape[1], G.shape[1])
     return np.sqrt(eigvals[:k])
@@ -4110,6 +4177,14 @@ def refresh_replication_result_views(
         else:
             pipe.pca_cont_display = pca_factors(pipe.R_cont, K=display_k, use_corr=pipe.use_corr)
 
+    # P4：确定性符号定向（在重算 display 因子收益之前）。复用既有重结果时，
+    # pca_cont_display 是从 pickle 中的 pca_cont / R_cont 重新派生的，所以这里
+    # 定向后无需重跑 PCA，即可让 Table_11/12/14、Figure 3/4/13、Table III/V
+    # 全部继承“因子1=正等权市场”的一致符号。可用 PELGER_PAPER_FAITHFUL_SIGNS=0 关闭。
+    if _paper_faithful_signs_enabled():
+        orient_pca_result(pipe.pca_cont, market_first=True)
+        orient_pca_result(pipe.pca_cont_display, market_first=True)
+
     W_display = factor_portfolio_weights(pipe.pca_cont_display)
     pipe.F_cont_display_daily_intra = panel.R_intra @ W_display
     pipe.F_cont_display_daily_night = panel.R_night @ W_display
@@ -4385,6 +4460,15 @@ def export_all_paper_figures(
             y = [float(row[col]) for col in er_cols]
             label = f"{int(row['year'])} (K={int(row['K_hat'])})"
             ax.plot(x, y, marker="o", linewidth=1.4, label=label)
+        # 1:1 复刻论文 Figure 1/2：critical value 判别线（=1+gamma，论文 1.08）。
+        _gamma = 0.08
+        if "gamma" in df.columns and df["gamma"].notna().any():
+            try:
+                _gamma = float(df["gamma"].dropna().iloc[0])
+            except Exception:
+                _gamma = 0.08
+        _crit = 1.0 + _gamma
+        ax.axhline(_crit, color="red", linestyle="--", linewidth=1.3, label=f"critical value {_crit:.2f}")
         ax.set_title(title)
         ax.set_xlabel("k")
         ax.set_ylabel("Perturbed eigenvalue ratio")

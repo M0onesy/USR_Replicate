@@ -36,6 +36,7 @@ def _meta_path(cfg: RunConfig) -> Path:
 
 
 def _refresh_result(result: ReplicationResult, cfg: RunConfig) -> ReplicationResult:
+    cfg.export_fidelity_env()  # 论文保真开关 -> env（复用/刷新前生效）
     refreshed = refresh_replication_result_views(
         result,
         proc_root=cfg.proc_root,
@@ -96,6 +97,7 @@ def _fallback_cache_candidates(cfg: RunConfig) -> List[Dict[str, Any]]:
 
 
 def build_result(cfg: RunConfig) -> ReplicationResult:
+    cfg.export_fidelity_env()  # 论文保真开关 -> env（全量构建前生效）
     sig = _signature_hash(cfg)
     log_step("pipeline", f"开始构建 ReplicationResult（缓存键 {sig}）—— 这是最耗时的一步")
     t0 = time.perf_counter()

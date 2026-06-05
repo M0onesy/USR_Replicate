@@ -41,6 +41,15 @@ def generate(result: ReplicationResult, cfg: RunConfig) -> Path:
     title = figure_title(FIGURE_NUMBER)
     output_path = figure_path(result, FIGURE_NUMBER)
 
+    # 论文形态优先（自洽滚动计算 figcode/_timevar）；失败回退旧绘图。
+    try:
+        from figcode._timevar import render_fig10
+        log_render(TAG, "按论文形态绘制（PCA 因子结构分解，自洽滚动计算）")
+        render_fig10(result, cfg, output_path, title)
+        return output_path
+    except Exception as _exc:
+        log_render(TAG, f"论文形态绘制失败，回退旧实现: {_exc!r}")
+
     # ---------------- 数据处理 ----------------
     log_step(TAG, "还原滚动 GC 与解释度表，并合并")
     rolling_gc_df, rolling_explained_df = get_rolling_frames(result)

@@ -27,7 +27,7 @@ from core.engine import ReplicationResult
 from core.io_utils import figure_path, figure_title
 from core.logging_utils import log_step, log_render
 from core.runner import run_standalone
-from figcode.figure_03 import plot_weight_heatmap
+from figcode.figure_03 import plot_weight_heatmap, _full_weight_heatmap
 
 TAG = "figure_04"
 FIGURE_NUMBER = 4
@@ -38,11 +38,11 @@ def generate(result: ReplicationResult, cfg: RunConfig) -> Path:
     output_path = figure_path(result, FIGURE_NUMBER)
 
     # ---------------- 数据处理 ----------------
-    log_step(TAG, f"读取 pca_weights（{len(result.pca_weights)} 行），准备透视为因子×股票矩阵")
+    log_step(TAG, "重算全市场连续 PCA 权重，按行业排序，准备绘制因子×股票热图")
 
     # ---------------- 图表输出 ----------------
-    log_render(TAG, "绘制连续 PCA 因子权重热图")
-    plot_weight_heatmap(result.pca_weights, title, output_path)
+    log_render(TAG, "绘制连续 PCA 因子权重热图（按行业排序，1:1 论文 Figure 4）")
+    _full_weight_heatmap(result, cfg, proxy=False, title=title, output_path=output_path)
     return output_path
 
 

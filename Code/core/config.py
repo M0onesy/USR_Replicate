@@ -24,7 +24,12 @@ class RunConfig:
     jump_a: float = 3.0
     k_max: int = 10
     gamma: float = 0.08
-    g_fn: str = "median_N"
+    # P1 修复：默认改为论文 footnote 17 的口径 g(N,M)=√N·median{λ}（"median_sqrtN"）。
+    #  K̂(γ)=max{k: ER_k>1+γ}，临界值 1.08。
+    # 注意：cache_signature 含 g_fn，故此默认值【不再命中】旧重结果缓存
+    #  replication_result_2ae5dce6a23fd2a2.pkl —— 需重跑（你已计划补数据重跑）。
+    #  若确需复用旧缓存做对照，可显式传 g_fn="median_N"（= N·median，非论文口径）。
+    g_fn: str = "median_sqrtN"
 
     workers: Optional[int] = None
     paper_workers: Optional[int] = None
@@ -35,6 +40,26 @@ class RunConfig:
     paper_tail_root: Path = field(default_factory=lambda: Path(DEFAULT_PAPER_TAIL_ROOT))
     paper_tail_weighting: str = "value_weighted"
     refresh_paper_tail: bool = True
+
+    # ------------------------------------------------------------------
+    # 论文保真开关（视图/尾部层，复用路径即可生效；不进 cache_signature，
+    # 故改动这些不会让重结果缓存失效）。详见 docs/SPEC_PAPER_FAITHFUL.md。
+    # P4：对 4 个连续 PCA display 因子做确定性符号定向（因子1=正等权市场）。
+    paper_faithful_signs: bool = True
+    # P5/D1：事先冻结的行业因子桶（std_industry 名称，市场恒为等权全市场）。
+    #   None = 暂用“看修好后 CN Figure 4 自动挑 3 个最集中桶”的占位逻辑；
+    #   跑完一次后把最终 3 个桶写死在这里即冻结（决策 D1）。
+    industry_factors_frozen: Optional[List[str]] = None
+    # P6/P7/D4：自建日频 Carhart 12-1 月 MOM（"carhart_daily"）vs 旧高频 1 日动量。
+    ffc_mom_mode: str = "carhart_daily"
+    # P9/D5：2×3 用全市场 symbol_returns 重建（True）vs 旧平衡子集（False）。
+    size_value_full_market: bool = True
+    # N6：年化交易日数（论文 252；A 股实测约 243，可按需切换）。
+    annualization_days: int = 252
+    # P10/D5：size/value（及分段 FFC）样本起点；2012 账面缺失 -> 固定 2014-07-01。
+    size_value_start: str = "2014-07-01"
+    # 新版 11 桶行业映射文件名（放在 external_data/.../industry/ 下）。
+    industry_info_filename: str = "stock_full_info_with_std_industry.csv"
 
     save_plots: bool = True
     restart: bool = False
@@ -62,6 +87,23 @@ class RunConfig:
             "refresh_paper_tail": self.refresh_paper_tail,
             "restart": self.restart,
         }
+
+    def export_fidelity_env(self) -> None:
+        """把视图层论文保真开关写入 env，供 engine / paper_tail 读取。
+        在每次构建/刷新 ReplicationResult 前调用（见 pipeline_cache）。
+        这些 env 都【不】进 cache_signature，故不会让重结果缓存失效。"""
+        import os as _os
+
+        _os.environ["PELGER_PAPER_FAITHFUL_SIGNS"] = "1" if self.paper_faithful_signs else "0"
+        _os.environ["PELGER_FFC_MOM_MODE"] = str(self.ffc_mom_mode)
+        _os.environ["PELGER_SIZE_VALUE_FULL_MARKET"] = "1" if self.size_value_full_market else "0"
+        _os.environ["PELGER_ANNUALIZATION_DAYS"] = str(int(self.annualization_days))
+        _os.environ["PELGER_SIZE_VALUE_START"] = str(self.size_value_start or "")
+        _os.environ["PELGER_INDUSTRY_INFO_FILENAME"] = str(self.industry_info_filename)
+        if self.industry_factors_frozen:
+            _os.environ["PELGER_INDUSTRY_FROZEN"] = ",".join(self.industry_factors_frozen)
+        else:
+            _os.environ.pop("PELGER_INDUSTRY_FROZEN", None)
 
     def cache_signature(self) -> Dict[str, Any]:
         return {
@@ -111,7 +153,7 @@ class MainLaunchProfile:
     jump_a: float = 3.0
     k_max: int = 10
     gamma: float = 0.08
-    g_fn: str = "median_N"
+    g_fn: str = "median_sqrtN"  # P1：论文 footnote 17 口径（√N·median）
     workers: Optional[int] = None
     paper_workers: Optional[int] = None
     rolling_workers: Optional[int] = None

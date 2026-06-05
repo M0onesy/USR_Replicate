@@ -38,6 +38,15 @@ def generate(result: ReplicationResult, cfg: RunConfig) -> Path:
     title = figure_title(FIGURE_NUMBER)
     output_path = figure_path(result, FIGURE_NUMBER)
 
+    # 论文形态优先（自洽滚动计算 figcode/_timevar）；失败回退旧绘图。
+    try:
+        from figcode._timevar import render_fig8
+        log_render(TAG, "按论文形态绘制（两窗口权重柱状，自洽滚动计算）")
+        render_fig8(result, cfg, output_path, title)
+        return output_path
+    except Exception as _exc:
+        log_render(TAG, f"论文形态绘制失败，回退旧实现: {_exc!r}")
+
     # ---------------- 数据处理 ----------------
     log_step(TAG, f"读取 rolling_weight_summary（{len(result.rolling_weight_summary)} 行）")
     if result.rolling_weight_summary.empty:
