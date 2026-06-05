@@ -54,7 +54,7 @@ def _load_industry_lookup(cfg) -> dict:
     """读取行业映射（新版 11 桶或旧版），返回 {ts_code: std_industry}。失败返回空 dict。"""
     import os as _os
     import pandas as pd
-    fname = _os.environ.get("PELGER_INDUSTRY_INFO_FILENAME") or getattr(cfg, "industry_info_filename", "stock_full_info_with_std_industry.csv")
+    fname = _os.environ.get("PELGER_INDUSTRY_INFO_FILENAME") or getattr(cfg, "industry_info_filename", "stock_full_info_std_industry_final.csv")
     path = Path(cfg.external_data_root) / "industry" / fname
     try:
         d = pd.read_csv(path)

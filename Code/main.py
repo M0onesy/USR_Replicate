@@ -10,12 +10,7 @@ _CODE_DIR = Path(__file__).resolve().parent
 if str(_CODE_DIR) not in sys.path:
     sys.path.insert(0, str(_CODE_DIR))
 
-from core.config import (
-    MainLaunchProfile,
-    RunConfig,
-    get_active_main_profile,
-    profile_to_run_config,
-)
+from core.config import MainLaunchProfile, RunConfig, get_active_main_profile, profile_to_run_config
 from core.engine import _atomic_to_csv, _plot_status_row
 from core.logging_utils import Heartbeat, log_done, log_info, log_warn
 from core.pipeline_cache import get_result
@@ -30,7 +25,7 @@ def _ensure_no_cli_args(argv: List[str]) -> None:
     raise SystemExit(
         "main.py 现在不再接受命令行参数。\n"
         f"检测到传入参数：{joined}\n"
-        "请改 Code/core/config.py 中的 ACTIVE_MAIN_PROFILE 或 MAIN_RUN_PROFILES 后，再直接运行 main.py。"
+        "请改 Code/core/config.py 中的 ACTIVE_MAIN_PROFILE 或 MAIN_RUN_PROFILES，然后重新运行 main.py。"
     )
 
 
@@ -48,7 +43,7 @@ def _write_plot_status_for_export_only(
     failed: list[tuple[str, str]],
     cfg: RunConfig,
 ) -> None:
-    diagnostics_dir = Path(cfg.output_root) / "diagnostics"
+    diagnostics_dir = Path(cfg.runtime_root) / "diagnostics"
     diagnostics_dir.mkdir(parents=True, exist_ok=True)
     succeeded_map = {key: path for key, path in succeeded}
     failed_map = {key: err for key, err in failed}
@@ -78,13 +73,12 @@ def _write_plot_status_for_export_only(
                 _plot_status_row(
                     figure_id,
                     title,
-                    Path(cfg.output_root) / "figures" / f"{figure_id}.png",
+                    Path(cfg.final_result_root) / "figures" / f"{figure_id}.png",
                     "error",
                     "reused_replication_result",
                     failed_map[task.key],
                 )
             )
-
     if rows:
         plot_status = sorted(rows, key=lambda item: int(item.get("figure_number", -1)))
         _atomic_to_csv(
@@ -97,16 +91,16 @@ def _write_plot_status_for_export_only(
 
 def _print_task_list() -> None:
     print("=" * 78)
-    print(" 可用任务列表（请在 core/config.py 的 task_selectors 中使用这些短名）")
+    print("可用任务列表（请在 core/config.py 的 task_selectors 中使用这些短名）")
     print("=" * 78)
-    print(" [图 / figure]")
+    print("[图 / figure]")
     for task in all_tasks():
         if task.kind == "figure":
-            print(f"   {task.key:<8} {task.desc}")
-    print(" [表 / table]")
+            print(f"  {task.key:<8} {task.desc}")
+    print("[表 / table]")
     for task in all_tasks():
         if task.kind == "table":
-            print(f"   {task.key:<10} {task.desc}")
+            print(f"  {task.key:<10} {task.desc}")
     print("=" * 78)
 
 
@@ -114,14 +108,10 @@ def _resolve_tasks(profile_name: str, profile: MainLaunchProfile) -> List[Task]:
     if profile.list_tasks_only:
         _print_task_list()
         raise SystemExit(0)
-
     try:
         tasks = resolve_keys(list(profile.task_selectors))
     except KeyError as exc:
-        raise ValueError(
-            f"profile {profile_name!r} 的 task_selectors 配置无效：{exc}"
-        ) from exc
-
+        raise ValueError(f"profile {profile_name!r} 的 task_selectors 配置无效：{exc}") from exc
     if not tasks:
         raise ValueError(f"profile {profile_name!r} 没有解析出任何任务，请检查 task_selectors。")
     return tasks
@@ -150,9 +140,8 @@ def _run_tasks(
 
     succeeded: list[tuple[str, str]] = []
     failed: list[tuple[str, str]] = []
-
     for idx, task in enumerate(tasks, start=1):
-        heartbeat.set_status(f"{task.key}（{task.kind}）", done=len(succeeded) + len(failed), total=len(tasks))
+        heartbeat.set_status(f"{task.key} ({task.kind})", done=len(succeeded) + len(failed), total=len(tasks))
         log_info("main", f"[{idx}/{len(tasks)}] 开始 {task.key} - {task.desc}")
         try:
             generate = task.load_generate()
@@ -170,23 +159,22 @@ def _run_tasks(
 
     if not rebuild_result and _has_figure_tasks(tasks):
         _write_plot_status_for_export_only(tasks, succeeded, failed, cfg)
-
     return succeeded, failed
 
 
 def _print_summary(succeeded: list[tuple[str, str]], failed: list[tuple[str, str]], total_elapsed: float) -> None:
     print("=" * 78)
-    print(" 运行汇总")
+    print("运行汇总")
     print("=" * 78)
-    print(f" 成功 {len(succeeded)} 项 / 失败 {len(failed)} 项 / 总用时 {total_elapsed:.1f}s")
+    print(f"成功 {len(succeeded)} 项 / 失败 {len(failed)} 项 / 总用时 {total_elapsed:.1f}s")
     if succeeded:
-        print(" [成功]")
+        print("[成功]")
         for key, path in succeeded:
-            print(f"   {key:<10} -> {path}")
+            print(f"  {key:<10} -> {path}")
     if failed:
-        print(" [失败]")
+        print("[失败]")
         for key, err in failed:
-            print(f"   {key:<10} : {err}")
+            print(f"  {key:<10} : {err}")
     print("=" * 78)
 
 
@@ -196,7 +184,6 @@ def _build_run_config(profile: MainLaunchProfile, tasks: List[Task]) -> RunConfi
 
 def main() -> int:
     _ensure_no_cli_args(sys.argv)
-
     profile_name, profile = get_active_main_profile()
     tasks = _resolve_tasks(profile_name, profile)
     cfg = _build_run_config(profile, tasks)
@@ -204,8 +191,13 @@ def main() -> int:
     log_info("main", f"当前 main profile：{profile_name}")
     log_info("main", f"任务数 {len(tasks)}：{', '.join(task.key for task in tasks)}")
     log_info("main", f"任务选择器：{', '.join(profile.task_selectors)}")
-    log_info("main", f"运行模式：{'重建上游 ReplicationResult' if profile.rebuild_result else '优先复用已有 ReplicationResult'}")
-    log_info("main", f"输出目录 {cfg.output_root}")
+    log_info(
+        "main",
+        f"运行模式：{'重建上游 ReplicationResult' if profile.rebuild_result else '优先复用已有 ReplicationResult'}",
+    )
+    log_info("main", f"主样本模式：{cfg.balanced_mode}")
+    log_info("main", f"运行目录 {cfg.runtime_root}")
+    log_info("main", f"最终结果目录 {cfg.final_result_root}")
     if cfg.years or cfg.max_stocks:
         log_info("main", f"样本限制 years={cfg.years} max_stocks={cfg.max_stocks}")
 

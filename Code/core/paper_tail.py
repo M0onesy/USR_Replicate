@@ -26,6 +26,18 @@ def _industry_info_filename() -> str:
     return _fid_env("PELGER_INDUSTRY_INFO_FILENAME", "stock_full_info_with_std_industry.csv")
 
 
+def _industry_info_filename() -> str:
+    return _fid_env("PELGER_INDUSTRY_INFO_FILENAME", "stock_full_info_std_industry_final.csv")
+
+
+def _industry_mapping_filename() -> str:
+    return _fid_env("PELGER_INDUSTRY_MAPPING_FILENAME", "行业映射表_终版.csv")
+
+
+def _strict_final_export() -> bool:
+    return _fid_env("PELGER_STRICT_FINAL_EXPORT", "0").lower() not in {"0", "false", "no"}
+
+
 def _industry_frozen() -> Optional[List[str]]:
     """P5/D1：事先冻结的行业因子桶（std_industry，逗号分隔）。空 = 暂用占位自动挑选。"""
     raw = _fid_env("PELGER_INDUSTRY_FROZEN", "")
@@ -60,8 +72,8 @@ def _size_value_start() -> Optional[pd.Timestamp]:
 
 
 # PAPER_TAIL_VERSION 提升以触发尾部缓存重建（应用本批论文保真修复）。
-PAPER_TAIL_VERSION = 4
-PAPER_TAIL_ALGORITHM_VERSION = "paper_faithful_v2"
+PAPER_TAIL_VERSION = 5
+PAPER_TAIL_ALGORITHM_VERSION = "paper_faithful_v3"
 PORTFOLIO_ORDER = ["SL", "SM", "SH", "BL", "BM", "BH"]
 # N7：Figure 12 分组标题里的行业/规模组合数改为动态填充（新映射 11 桶）。
 GROUP_TITLES = {
@@ -190,7 +202,7 @@ def _discovered_paths(proc_root: Path, external_root: Path) -> Dict[str, Path]:
         "ff5": _find_file(external_root / "factors" / "ff5", "STK_MKT_FIVEFACDAY.csv"),
         "rf": sorted((external_root / "factors" / "rf").glob("*.csv"))[0],
         "industry_info": external_root / "industry" / _industry_info_filename(),
-        "industry_mapping": external_root / "industry" / "industry_mapping_reference.csv",
+        "industry_mapping": external_root / "industry" / _industry_mapping_filename(),
         "size_value_assignments": _find_file(reference_root, "size_value_2x3_assignments.csv"),
         "size_value_breakpoints": _find_file(reference_root, "size_value_2x3_breakpoints.csv"),
         "size_value_reference_vw": _find_file(reference_root, "size_value_2x3_daily_returns_value_weighted.csv"),
@@ -244,6 +256,9 @@ def _scope_info(result: Any, proc_root: Path, external_root: Path, weighting: st
         "proc_root": str(proc_root),
         "external_data_root": str(external_root),
         "paper_tail_weighting": weighting,
+        "industry_info_filename": _industry_info_filename(),
+        "industry_mapping_filename": _industry_mapping_filename(),
+        "strict_final_export": bool(_strict_final_export()),
         "panel_start": str(panel.dates[0].date()) if panel.dates else None,
         "panel_end": str(panel.dates[-1].date()) if panel.dates else None,
         "panel_days": int(panel.D),
@@ -651,11 +666,15 @@ def _load_assignments(path: Path) -> pd.DataFrame:
     return df.sort_values(["sort_year", "portfolio", "code"]).reset_index(drop=True)
 
 
-def _load_year_panel(proc_root: Path, year: int) -> Tuple[pd.DatetimeIndex, List[str], Dict[str, np.ndarray]]:
-    meta = _load_json(proc_root / "panels" / "strict_balanced" / f"year_{year}.json")
+def _load_year_panel(
+    proc_root: Path,
+    year: int,
+    sample_mode: str = "strict_balanced",
+) -> Tuple[pd.DatetimeIndex, List[str], Dict[str, np.ndarray]]:
+    meta = _load_json(proc_root / "panels" / sample_mode / f"year_{year}.json")
     dates = pd.to_datetime(meta["dates"])
     tickers = [str(value).strip().upper() for value in meta["tickers"]]
-    year_dir = proc_root / "panels" / "strict_balanced" / f"year_{year}"
+    year_dir = proc_root / "panels" / sample_mode / f"year_{year}"
     arrays = {
         "intraday": np.load(year_dir / "R_intra.npy", mmap_mode="r"),
         "overnight": np.load(year_dir / "R_night.npy", mmap_mode="r"),
@@ -667,9 +686,10 @@ def _load_year_panel(proc_root: Path, year: int) -> Tuple[pd.DatetimeIndex, List
 def _build_size_value_assets(
     proc_root: Path,
     assignments: pd.DataFrame,
+    sample_mode: str = "strict_balanced",
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
     assignments_by_year = {year: frame.reset_index(drop=True) for year, frame in assignments.groupby("sort_year", sort=True)}
-    strict_root = proc_root / "panels" / "strict_balanced"
+    strict_root = proc_root / "panels" / sample_mode
     year_meta_files = sorted(strict_root.glob("year_*.json"))
     years = [int(path.stem.split("_")[1]) for path in year_meta_files if path.stem != "full"]
 
@@ -679,7 +699,7 @@ def _build_size_value_assets(
     coverage_rows: List[Dict[str, Any]] = []
 
     for panel_year in years:
-        dates, tickers, arrays = _load_year_panel(proc_root, panel_year)
+        dates, tickers, arrays = _load_year_panel(proc_root, panel_year, sample_mode=sample_mode)
         ticker_lookup = {ticker: idx for idx, ticker in enumerate(tickers)}
         segments = [
             ("H1", panel_year - 1, np.flatnonzero(dates.month <= 6)),
@@ -1758,7 +1778,11 @@ def _build_payload(
 
     assignments = _load_assignments(discovered["size_value_assignments"])
     # legacy（平衡子集）保留：用于旧 validation 工件与回退。
-    sv_legacy, daily_wide_vw, daily_wide_ew, size_value_meta = _build_size_value_assets(proc_root, assignments)
+    sv_legacy, daily_wide_vw, daily_wide_ew, size_value_meta = _build_size_value_assets(
+        proc_root,
+        assignments,
+        sample_mode=str(getattr(result.panel, "sample_mode", "strict_balanced") or "strict_balanced"),
+    )
     size_value_assets = sv_legacy
     size_value_source = "legacy_balanced_subset"
     if _size_value_full_market():
@@ -1770,6 +1794,8 @@ def _build_payload(
             size_value_source = "full_market"  # P9
         except Exception as exc:  # pragma: no cover - refresh 仅分钟级，失败回退不丢重结果
             print(f"[paper_fidelity] P9 full-market 2x3 失败，回退旧实现: {exc!r}")
+            if _strict_final_export():
+                raise RuntimeError("paper-tail size/value full-market build failed under strict final export mode") from exc
             size_value_assets = sv_legacy
             size_value_source = "legacy_fallback_after_error"
     # P10/D5：按 size/value 起点裁剪（2012 账面缺失 -> 2014-07-01）。
@@ -1813,6 +1839,8 @@ def _build_payload(
     except Exception as exc:  # pragma: no cover
         if _ffc_mom_mode() == "carhart_daily":
             print(f"[paper_fidelity] P7 分段 FFC 失败，回退旧实现: {exc!r}")
+        if _strict_final_export():
+            raise RuntimeError("paper-tail FFC segmented build failed under strict final export mode") from exc
         ffc_segmented_raw, ffc_segmented, ffc_segment_reconciliation = _build_ffc_segmented_frames(
             market_returns,
             size_value_assets,
@@ -1941,21 +1969,28 @@ def refresh_paper_tail_views(
     paper_tail_root: str | Path | None = None,
     paper_tail_weighting: str = "value_weighted",
     refresh_paper_tail: bool = True,
+    strict_final_export: bool | None = None,
 ) -> Dict[str, Any]:
     if not refresh_paper_tail:
         return getattr(result, "paper_tail", {}) if hasattr(result, "paper_tail") else {}
+    if strict_final_export is not None:
+        os.environ["PELGER_STRICT_FINAL_EXPORT"] = "1" if strict_final_export else "0"
     proc_root_path = _ensure_path(proc_root, default=_repo_root() / "Data" / "proc_Data" / "pelger_cn_adjusted")
     external_root_path = _ensure_path(external_data_root, default=default_external_data_root())
     paper_tail_root_path = _ensure_path(paper_tail_root, default=default_paper_tail_root(proc_root_path))
     if paper_tail_weighting not in {"value_weighted", "equal_weighted"}:
         raise ValueError(f"Unsupported paper_tail_weighting: {paper_tail_weighting}")
     existing = getattr(result, "paper_tail", None)
+    existing_manifest = existing.get("manifest", {}) if isinstance(existing, dict) else {}
+    existing_scope = dict(existing_manifest.get("scope", {})) if isinstance(existing_manifest, dict) else {}
     if isinstance(existing, dict) and _manifest_is_compatible(
-        existing.get("manifest", {}),
+        existing_manifest,
         external_root=external_root_path,
         paper_tail_root=paper_tail_root_path,
         weighting=paper_tail_weighting,
-    ):
+    ) and existing_scope.get("industry_info_filename") == _industry_info_filename() and existing_scope.get(
+        "industry_mapping_filename"
+    ) == _industry_mapping_filename() and bool(existing_scope.get("strict_final_export", False)) == bool(_strict_final_export()):
         return existing
 
     payload = _discover_or_build_payload(

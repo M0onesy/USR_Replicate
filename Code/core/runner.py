@@ -27,7 +27,7 @@ def run_generator(
     if result is None:
         from core.pipeline_cache import get_result
 
-        result = get_result(cfg, allow_build=True, allow_fallback=True)
+        result = get_result(cfg, allow_build=False, allow_fallback=True)
 
     log_start(tag, "脚本开始执行")
     t0 = time.perf_counter()
@@ -48,8 +48,9 @@ def run_standalone(tag: str, generate: GenerateFn) -> int:
     parser.add_argument("--years", nargs="+", type=int, default=None)
     parser.add_argument("--max-stocks", type=int, default=None)
     parser.add_argument("--proc-root", default=None)
-    parser.add_argument("--output-root", default=None)
-    parser.add_argument("--allow-build", action="store_true", help="当没有可复用缓存时，允许显式重建 ReplicationResult")
+    parser.add_argument("--runtime-root", default=None)
+    parser.add_argument("--output-root", default=None, help="最终图表/表格输出目录")
+    parser.add_argument("--allow-build", action="store_true", help="没有可复用缓存时，允许显式重建 ReplicationResult")
     args = parser.parse_args()
 
     cfg = RunConfig()
@@ -59,7 +60,10 @@ def run_standalone(tag: str, generate: GenerateFn) -> int:
         cfg.max_stocks = args.max_stocks
     if args.proc_root is not None:
         cfg.proc_root = Path(args.proc_root)
+    if args.runtime_root is not None:
+        cfg.runtime_root = Path(args.runtime_root)
     if args.output_root is not None:
+        cfg.final_result_root = Path(args.output_root)
         cfg.output_root = Path(args.output_root)
     cfg.save_plots = False
     cfg.restart = False

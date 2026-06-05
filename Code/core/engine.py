@@ -37,6 +37,7 @@ import sys
 import tempfile
 import time
 import threading
+import warnings
 import numpy as np
 import pandas as pd
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
@@ -67,6 +68,8 @@ CN_5MIN_BAR_CODES = np.array(
 )
 
 STRICT_BALANCED_SAMPLE = "strict_balanced"
+PAPER_LENIENT_SAMPLE = "paper_lenient"
+VALID_PANEL_SAMPLE_MODES = {STRICT_BALANCED_SAMPLE, PAPER_LENIENT_SAMPLE}
 PANEL_RETURN_SCHEME = "daily_intra_night_total_plus_full_5min_v1"
 
 # 拆分后本文件位于 Code/core/engine.py，比原始 Code/allcode_Need.py 深一层，
@@ -74,6 +77,7 @@ PANEL_RETURN_SCHEME = "daily_intra_night_total_plus_full_5min_v1"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PROC_ROOT = REPO_ROOT / "Data" / "proc_Data" / "pelger_cn_adjusted"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "Result" / "pelger_cn_adjusted"
+DEFAULT_RUNTIME_ROOT = DEFAULT_PROC_ROOT / "runtime"
 BLAS_THREAD_ENV_KEYS = (
     "OMP_NUM_THREADS",
     "MKL_NUM_THREADS",
@@ -421,15 +425,16 @@ class CheckpointLayout:
 
 @dataclass
 class CheckpointManager:
-    output_root: Path
+    runtime_root: Path
     signature: Dict[str, Any]
     restart: bool = False
+    export_root: Optional[Path] = None
     layout: CheckpointLayout = field(init=False)
     state: Dict[str, Any] = field(init=False)
     resumed: bool = field(init=False, default=False)
 
     def __post_init__(self) -> None:
-        checkpoint_root = self.output_root / "checkpoints"
+        checkpoint_root = self.runtime_root / "checkpoints"
         self.layout = CheckpointLayout(
             root=checkpoint_root,
             rolling_dir=checkpoint_root / "rolling",
@@ -449,7 +454,8 @@ class CheckpointManager:
             self.layout.root.mkdir(parents=True, exist_ok=True)
             self.layout.rolling_dir.mkdir(parents=True, exist_ok=True)
             self.layout.paper_dir.mkdir(parents=True, exist_ok=True)
-            cleaned_items.extend(_cleanup_export_tmp_files(self.output_root))
+            if self.export_root is not None:
+                cleaned_items.extend(_cleanup_export_tmp_files(self.export_root))
             self.state = _new_run_state(self.signature)
             self.save()
             return {"resumed": False, "cleaned_items": cleaned_items, "reason": "restart"}
@@ -460,14 +466,15 @@ class CheckpointManager:
             if loaded_signature != self.signature:
                 raise ValueError(
                     "Existing checkpoint state is not compatible with the current semantic run signature. "
-                    "Use a different --output-root or pass --restart."
+                    "Use a different runtime/final output root or restart the run with a clean checkpoint state."
                 )
             self.state = dict(loaded_state)
             self.resumed = True
         else:
             self.state = _new_run_state(self.signature)
 
-        cleaned_items.extend(_cleanup_export_tmp_files(self.output_root))
+        if self.export_root is not None:
+            cleaned_items.extend(_cleanup_export_tmp_files(self.export_root))
         cleaned_items.extend(self._cleanup_incomplete_checkpoint_units())
         self.state["status"] = "running"
         self.state["last_updated"] = pd.Timestamp.utcnow().isoformat()
@@ -757,7 +764,9 @@ def _atomic_save_npz(path: Path, **arrays: Any) -> None:
 def _atomic_save_figure(fig: Any, path: Path, dpi: int = 160) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f"{path.stem}.tmp{path.suffix}")
-    fig.savefig(tmp_path, dpi=dpi)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=r"Glyph .* missing from font", category=UserWarning)
+        fig.savefig(tmp_path, dpi=dpi)
     tmp_path.replace(path)
 
 
@@ -784,6 +793,7 @@ def _build_run_signature(
     proc_root: Path,
     years: Optional[Sequence[int]],
     max_stocks: Optional[int],
+    balanced_mode: str,
     jump_a: float,
     k_max: int,
     gamma: float,
@@ -794,6 +804,7 @@ def _build_run_signature(
         "proc_root": str(proc_root),
         "years": _normalize_years(years),
         "max_stocks": None if max_stocks is None else int(max_stocks),
+        "balanced_mode": str(balanced_mode),
         "jump_a": float(jump_a),
         "k_max": int(k_max),
         "gamma": float(gamma),
@@ -1045,8 +1056,13 @@ def _select_unbalanced_symbols_for_year(
     return selected["symbol"].tolist()
 
 
-def _balanced_symbol_count_for_year(proc_root: Path, year: int, max_stocks: Optional[int] = None) -> int:
-    _, meta_path = _proc_panel_paths(proc_root, STRICT_BALANCED_SAMPLE, f"year_{int(year)}")
+def _balanced_symbol_count_for_year(
+    proc_root: Path,
+    year: int,
+    max_stocks: Optional[int] = None,
+    sample_mode: str = STRICT_BALANCED_SAMPLE,
+) -> int:
+    _, meta_path = _proc_panel_paths_resolved(proc_root, sample_mode, f"year_{int(year)}")
     meta = _load_json(meta_path)
     count = int(len(meta.get("tickers", [])))
     if max_stocks is not None:
@@ -1215,8 +1231,17 @@ def summarize_cn_universe(universe: pd.DataFrame) -> Dict[str, Any]:
     return stats
 
 def _proc_panel_paths(proc_root: Path, sample_mode: str, panel_name: str) -> Tuple[Path, Path]:
-    if sample_mode != STRICT_BALANCED_SAMPLE:
+    if sample_mode not in VALID_PANEL_SAMPLE_MODES:
         raise ValueError("当前数据政策仅保留 strict_balanced 面板")
+    panel_dir = proc_root / "panels" / sample_mode
+    return panel_dir / f"{panel_name}.npz", panel_dir / f"{panel_name}.json"
+
+
+def _proc_panel_paths_resolved(proc_root: Path, sample_mode: str, panel_name: str) -> Tuple[Path, Path]:
+    if sample_mode not in VALID_PANEL_SAMPLE_MODES:
+        raise ValueError(
+            f"Unknown sample_mode {sample_mode!r}. Expected one of {sorted(VALID_PANEL_SAMPLE_MODES)}."
+        )
     panel_dir = proc_root / "panels" / sample_mode
     return panel_dir / f"{panel_name}.npz", panel_dir / f"{panel_name}.json"
 
@@ -1257,7 +1282,7 @@ def _subset_panel_columns(panel: HFPanel, max_stocks: Optional[int]) -> HFPanel:
 
 
 def _load_proc_panel_file(proc_root: Path, sample_mode: str, panel_name: str) -> HFPanel:
-    npz_path, meta_path = _proc_panel_paths(proc_root, sample_mode, panel_name)
+    npz_path, meta_path = _proc_panel_paths_resolved(proc_root, sample_mode, panel_name)
     if not meta_path.exists():
         raise FileNotFoundError(
             f"Processed panel metadata not found: {meta_path}. Run Code/preprocess_cn_data.py first."
@@ -1316,7 +1341,7 @@ def load_proc_hf_panel(
 ) -> HFPanel:
     """从 Data/proc_Data 中读取预处理好的 HFPanel。"""
     proc_root = _ensure_path(proc_root)
-    if sample_mode != STRICT_BALANCED_SAMPLE:
+    if sample_mode not in VALID_PANEL_SAMPLE_MODES:
         raise ValueError("当前数据政策仅保留 strict_balanced 面板")
     panel_name = _proc_panel_name(years)
     if panel_name is not None:
@@ -1338,6 +1363,7 @@ def load_proc_hf_panel(
 
 def load_proc_5min_panel(
     proc_root: str | Path = DEFAULT_PROC_ROOT,
+    sample_mode: str = STRICT_BALANCED_SAMPLE,
     years: Optional[Sequence[int]] = None,
     max_stocks: Optional[int] = None,
 ) -> HF5MinPanel:
@@ -1345,7 +1371,7 @@ def load_proc_5min_panel(
     panel_name = _proc_panel_name(years)
     if panel_name is None:
         raise ValueError("load_proc_5min_panel only supports one calendar year or full panel.")
-    _, meta_path = _proc_panel_paths(proc_root, STRICT_BALANCED_SAMPLE, panel_name)
+    _, meta_path = _proc_panel_paths_resolved(proc_root, sample_mode, panel_name)
     meta = _load_json(meta_path)
     array_files = meta.get("array_files", {})
     if "R_5min_full" not in array_files or "day_ids" not in array_files:
@@ -1365,7 +1391,7 @@ def load_proc_5min_panel(
         tickers=tickers,
         dates=[pd.Timestamp(date) for date in meta["dates"]],
         bar_times=list(meta.get("bar_times", [])),
-        sample_mode=meta.get("sample_mode", STRICT_BALANCED_SAMPLE),
+        sample_mode=meta.get("sample_mode", sample_mode),
         panel_name=panel_name,
     )
 
@@ -1768,7 +1794,7 @@ def _assemble_yearly_paper_outputs_from_items(yearly_results: Sequence[Dict[str,
 
 
 def _build_runtime_config(
-    output_root: Path,
+    runtime_root: Path,
     memory_budget_gb: Optional[float],
     progress_interval_sec: float,
 ) -> RuntimeConfig:
@@ -1780,7 +1806,7 @@ def _build_runtime_config(
         if requested_budget_gb <= 0.0:
             raise ValueError("--memory-budget-gb must be positive")
         budget_bytes = int(max(1.0, requested_budget_gb * (1024 ** 3)))
-    diagnostics_dir = output_root / "diagnostics"
+    diagnostics_dir = runtime_root / "diagnostics"
     scratch_root = diagnostics_dir / "runtime_tmp"
     return RuntimeConfig(
         memory_budget_bytes=budget_bytes,
@@ -1980,6 +2006,7 @@ def _build_paper_resource_plan(
     proc_root: Path,
     summary: Dict[str, Any],
     years: Sequence[int],
+    sample_mode: str,
     requested_workers: int,
     requested_paper_workers: int,
     requested_rolling_workers: int,
@@ -1997,7 +2024,12 @@ def _build_paper_resource_plan(
         tickers = _select_unbalanced_symbols_for_year(universe, int(year), max_stocks=max_stocks)
         day_count = len(year_dates)
         unbalanced_n = len(tickers)
-        balanced_n = _balanced_symbol_count_for_year(proc_root, int(year), max_stocks=max_stocks)
+        balanced_n = _balanced_symbol_count_for_year(
+            proc_root,
+            int(year),
+            max_stocks=max_stocks,
+            sample_mode=sample_mode,
+        )
         peak_estimate = _estimate_paper_year_peak_bytes(
             day_count=day_count,
             balanced_stock_count=balanced_n,
@@ -3000,6 +3032,7 @@ class ReplicationResult:
     rolling_explained_variation: np.ndarray
     robustness: pd.DataFrame
     output_root: Path
+    runtime_root: Optional[Path] = None
     corp_action_risk: pd.DataFrame = field(default_factory=pd.DataFrame)
     paper_jump_stats: pd.DataFrame = field(default_factory=pd.DataFrame)
     paper_factor_counts: pd.DataFrame = field(default_factory=pd.DataFrame)
@@ -3307,6 +3340,7 @@ def _build_year_panel_analysis(
     year: int,
     year_dates: Sequence[str],
     tickers: Sequence[str],
+    sample_mode: str,
     max_stocks: Optional[int],
     panel_workers: int = 1,
     scratch_root: Optional[Path] = None,
@@ -3315,6 +3349,7 @@ def _build_year_panel_analysis(
     t_panel = time.perf_counter()
     balanced_year = load_proc_5min_panel(
         proc_root=proc_root,
+        sample_mode=sample_mode,
         years=[year],
         max_stocks=max_stocks,
     )
@@ -3562,6 +3597,7 @@ def yearly_paper_metrics_worker(task: Dict[str, Any]) -> Dict[str, Any]:
     k_max = int(task["k_max"])
     gamma = float(task["gamma"])
     g_fn = str(task["g_fn"])
+    sample_mode = str(task.get("sample_mode", STRICT_BALANCED_SAMPLE))
     max_stocks = task.get("max_stocks")
     year_dates = list(task["year_dates"])
     tickers = list(task["tickers"])
@@ -3587,6 +3623,7 @@ def yearly_paper_metrics_worker(task: Dict[str, Any]) -> Dict[str, Any]:
         year=year,
         year_dates=year_dates,
         tickers=tickers,
+        sample_mode=sample_mode,
         max_stocks=max_stocks,
         panel_workers=panel_workers,
         scratch_root=scratch_root,
@@ -3642,14 +3679,16 @@ def build_yearly_paper_outputs(
     checkpoint_manager: Optional[CheckpointManager] = None,
 ) -> YearlyPaperOutputs:
     years = sorted({date.year for date in balanced_panel.dates})
+    sample_mode = str(getattr(balanced_panel, "sample_mode", STRICT_BALANCED_SAMPLE) or STRICT_BALANCED_SAMPLE)
     summary = _universe_attr_summary(universe)
     if runtime is None:
-        runtime = _build_runtime_config(DEFAULT_OUTPUT_ROOT, None, DEFAULT_PROGRESS_INTERVAL_SEC)
+        runtime = _build_runtime_config(DEFAULT_RUNTIME_ROOT, None, DEFAULT_PROGRESS_INTERVAL_SEC)
     if resource_plan is None:
         resource_plan = _build_paper_resource_plan(
             proc_root=proc_root,
             summary=summary,
             years=years,
+            sample_mode=sample_mode,
             requested_workers=_normalize_worker_count(workers),
             requested_paper_workers=_normalize_worker_count(workers),
             requested_rolling_workers=_normalize_worker_count(workers),
@@ -3663,6 +3702,7 @@ def build_yearly_paper_outputs(
             "year": int(year),
             "year_dates": _year_dates_from_universe_summary(summary, year),
             "tickers": _select_unbalanced_symbols_for_year(universe, year, max_stocks=max_stocks),
+            "sample_mode": sample_mode,
             "thresholds": [float(value) for value in thresholds],
             "jump_a": float(jump_a),
             "k_max": int(k_max),
@@ -4158,6 +4198,7 @@ def refresh_replication_result_views(
     paper_tail_root: str | Path | None = None,
     paper_tail_weighting: str = "value_weighted",
     refresh_paper_tail: bool = True,
+    strict_final_export: bool = False,
 ) -> ReplicationResult:
     """Refresh lightweight presentation-layer tables from an existing ReplicationResult.
 
@@ -4209,6 +4250,7 @@ def refresh_replication_result_views(
             paper_tail_root=paper_tail_root,
             paper_tail_weighting=paper_tail_weighting,
             refresh_paper_tail=refresh_paper_tail,
+            strict_final_export=strict_final_export,
         )
         result.paper_tail = payload
         if isinstance(payload.get("table_iii"), pd.DataFrame):
@@ -4561,11 +4603,13 @@ def export_replication_outputs(
     save_plots: bool = True,
 ) -> Dict[str, str]:
     """Export canonical paper-numbered tables/figures plus compatibility aliases."""
-    output_root = result.output_root
+    output_root = Path(result.output_root)
+    runtime_root = Path(getattr(result, "runtime_root", None) or output_root)
     output_root.mkdir(parents=True, exist_ok=True)
+    runtime_root.mkdir(parents=True, exist_ok=True)
     tables_dir = output_root / "tables"
     figures_dir = output_root / "figures"
-    diagnostics_dir = output_root / "diagnostics"
+    diagnostics_dir = runtime_root / "diagnostics"
     tables_dir.mkdir(parents=True, exist_ok=True)
     figures_dir.mkdir(parents=True, exist_ok=True)
     diagnostics_dir.mkdir(parents=True, exist_ok=True)
@@ -4663,10 +4707,7 @@ def export_replication_outputs(
         "Table_IV": tables_dir / "Table_IV_time_variation_decomposition.csv",
         "Table_V": tables_dir / "Table_V_intraday_overnight_daily_sharpe_ratios.csv",
     }
-    legacy_table_aliases = {
-        "Table_I": [tables_dir / "Table_08_paper_style_yearly_jump_stats.csv"],
-        "Table_V": [tables_dir / "Table_10_paper_style_factor_sharpes.csv"],
-    }
+    legacy_table_aliases: Dict[str, List[Path]] = {}
 
     _write_csv_with_aliases(result.paper_table_i, canonical_table_paths["Table_I"], legacy_table_aliases.get("Table_I"))
     _write_csv_with_aliases(result.paper_table_ii, canonical_table_paths["Table_II"])
@@ -4675,7 +4716,7 @@ def export_replication_outputs(
     _write_csv_with_aliases(result.paper_table_v, canonical_table_paths["Table_V"], legacy_table_aliases.get("Table_V"))
 
     factor_count_diag_path = diagnostics_dir / "paper_factor_count_diagnostics.csv"
-    _write_csv_with_aliases(result.paper_factor_counts, factor_count_diag_path, [tables_dir / "Table_09_paper_style_factor_count_diagnostics.csv"])
+    _write_csv_with_aliases(result.paper_factor_counts, factor_count_diag_path)
 
     pca_weights_path = tables_dir / "Table_11_continuous_pca_weights.csv"
     _atomic_to_csv(result.pca_weights, pca_weights_path, index=False, encoding="utf-8-sig")
@@ -4723,28 +4764,9 @@ def export_replication_outputs(
         "cumulative_factor_returns": str(cumulative_returns_path),
         "corp_action_risk": str(corp_action_path),
         "replication_coverage_report": str(coverage_path),
-        "Table_08": str(tables_dir / "Table_08_paper_style_yearly_jump_stats.csv"),
-        "Table_09": str(tables_dir / "Table_09_paper_style_factor_count_diagnostics.csv"),
-        "Table_10": str(tables_dir / "Table_10_paper_style_factor_sharpes.csv"),
     }
 
-    legacy_figure_aliases = {
-        "Figure_1": [figures_dir / "Figure_01_number_of_hf_factors_unbalanced.png"],
-        "Figure_2": [figures_dir / "Figure_02_number_of_hf_factors_balanced.png"],
-        "Figure_3": [figures_dir / "Figure_03_proxy_factor_weights.png"],
-        "Figure_4": [figures_dir / "Figure_04_continuous_pca_weights.png"],
-        "Figure_5": [figures_dir / "Figure_05_monthly_pca_weights.png"],
-        "Figure_6": [figures_dir / "Figure_06_time_variation_loadings_gc.png"],
-        "Figure_7": [figures_dir / "Figure_07_local_continuous_factor_gc.png"],
-        "Figure_8": [figures_dir / "Figure_08_time_varying_portfolio_weights.png"],
-        "Figure_9": [figures_dir / "Figure_09_time_varying_explained_variation.png"],
-        "Figure_10": [figures_dir / "Figure_10_factor_structure_decomposition.png"],
-        "Figure_11": [figures_dir / "Figure_11_continuous_factor_structure_decomposition.png"],
-        "Figure_12": [figures_dir / "Figure_12_expected_intraday_overnight_returns.png"],
-        "Figure_13": [figures_dir / "Figure_13_cumulative_factor_returns.png"],
-        "Figure_14": [figures_dir / "Figure_14_asset_pricing_industry_portfolios.png"],
-        "Figure_15": [figures_dir / "Figure_15_asset_pricing_size_value_portfolios.png"],
-    }
+    legacy_figure_aliases: Dict[str, List[Path]] = {}
 
     if save_plots:
         plot_status, figure_files = export_all_paper_figures(result, figures_dir, rolling_gc_df, rolling_explained_df)
@@ -4802,9 +4824,12 @@ def export_replication_outputs(
 def run_cn_replication(
     proc_root: str | Path = DEFAULT_PROC_ROOT,
     output_root: str | Path = DEFAULT_OUTPUT_ROOT,
+    runtime_root: str | Path | None = None,
+    final_result_root: str | Path | None = None,
     external_data_root: str | Path | None = None,
     paper_tail_root: str | Path | None = None,
     years: Optional[Sequence[int]] = None,
+    balanced_mode: str = STRICT_BALANCED_SAMPLE,
     return_mode: str = "open_close",
     max_stocks: Optional[int] = None,
     jump_a: float = 3.0,
@@ -4820,29 +4845,42 @@ def run_cn_replication(
     progress_interval_sec: float = DEFAULT_PROGRESS_INTERVAL_SEC,
     paper_tail_weighting: str = "value_weighted",
     refresh_paper_tail: bool = True,
+    strict_final_export: bool = False,
     restart: bool = False,
 ) -> ReplicationResult:
     """Run the China A-share replication from preprocessed proc_Data panels only."""
     proc_root = _ensure_path(proc_root)
-    output_root = _ensure_path(output_root)
-    output_root.mkdir(parents=True, exist_ok=True)
-    diagnostics_dir = output_root / "diagnostics"
+    final_output_root = _ensure_path(final_result_root or output_root)
+    runtime_root = _ensure_path(runtime_root or DEFAULT_RUNTIME_ROOT)
+    if balanced_mode not in VALID_PANEL_SAMPLE_MODES:
+        raise ValueError(
+            f"Unknown balanced_mode {balanced_mode!r}. Expected one of {sorted(VALID_PANEL_SAMPLE_MODES)}."
+        )
+    final_output_root.mkdir(parents=True, exist_ok=True)
+    runtime_root.mkdir(parents=True, exist_ok=True)
+    diagnostics_dir = runtime_root / "diagnostics"
     diagnostics_dir.mkdir(parents=True, exist_ok=True)
     workers = _normalize_worker_count(workers)
     paper_workers = _resolve_stage_workers(workers, paper_workers)
     rolling_workers = _resolve_stage_workers(workers, rolling_workers)
-    runtime = _build_runtime_config(output_root=output_root, memory_budget_gb=memory_budget_gb, progress_interval_sec=progress_interval_sec)
+    runtime = _build_runtime_config(runtime_root=runtime_root, memory_budget_gb=memory_budget_gb, progress_interval_sec=progress_interval_sec)
     run_signature = _build_run_signature(
         proc_root=proc_root,
         years=years,
         max_stocks=max_stocks,
+        balanced_mode=balanced_mode,
         jump_a=jump_a,
         k_max=k_max,
         gamma=gamma,
         g_fn=g_fn,
         return_mode=return_mode,
     )
-    checkpoint_manager = CheckpointManager(output_root=output_root, signature=run_signature, restart=bool(restart))
+    checkpoint_manager = CheckpointManager(
+        runtime_root=runtime_root,
+        export_root=final_output_root,
+        signature=run_signature,
+        restart=bool(restart),
+    )
     checkpoint_info = checkpoint_manager.prepare()
     progress = ProgressReporter(
         diagnostics_dir=diagnostics_dir,
@@ -4885,22 +4923,23 @@ def run_cn_replication(
         universe_summary = summarize_cn_universe(universe)
         checkpoint_manager.update(stage="load_panel", export_completed=False)
         progress.update_state(stage="load_panel")
-        progress.event("stage_started", message="loading strict balanced panel")
+        progress.event("stage_started", message=f"loading {balanced_mode} panel")
 
         t = time.perf_counter()
         panel = load_proc_hf_panel(
             proc_root=proc_root,
-            sample_mode=STRICT_BALANCED_SAMPLE,
+            sample_mode=balanced_mode,
             years=years,
             return_mode=return_mode,
             max_stocks=max_stocks,
         )
         timings["load_panel_sec"] = time.perf_counter() - t
-        progress.event("stage_finished", stage="load_panel", message="strict balanced panel loaded")
+        progress.event("stage_finished", stage="load_panel", message=f"{balanced_mode} panel loaded")
         resource_plan = _build_paper_resource_plan(
             proc_root=proc_root,
             summary=_universe_attr_summary(universe),
             years=sorted({date.year for date in panel.dates}),
+            sample_mode=balanced_mode,
             requested_workers=workers,
             requested_paper_workers=paper_workers,
             requested_rolling_workers=rolling_workers,
@@ -5005,7 +5044,8 @@ def run_cn_replication(
             rolling_gc=rolling_gc,
             rolling_explained_variation=rolling_ev,
             robustness=robustness,
-            output_root=output_root,
+            output_root=final_output_root,
+            runtime_root=runtime_root,
             corp_action_risk=corp_action_risk,
             paper_jump_stats=paper_table_i,
             paper_factor_counts=paper_factor_counts,
@@ -5032,6 +5072,7 @@ def run_cn_replication(
             paper_tail_root=paper_tail_root,
             paper_tail_weighting=paper_tail_weighting,
             refresh_paper_tail=refresh_paper_tail,
+            strict_final_export=strict_final_export,
         )
         t = time.perf_counter()
         checkpoint_manager.update(stage="export", export_completed=False)

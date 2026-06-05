@@ -66,6 +66,8 @@ CN_5MIN_BAR_CODES = np.array(
     dtype=np.int32,
 )
 STRICT_BALANCED_SAMPLE = "strict_balanced"
+PAPER_LENIENT_SAMPLE = "paper_lenient"
+VALID_PANEL_SAMPLE_MODES = {STRICT_BALANCED_SAMPLE, PAPER_LENIENT_SAMPLE}
 SUSPICIOUS_OVERNIGHT_THRESHOLDS = (0.12, 0.20)
 
 
@@ -241,7 +243,7 @@ def _symbol_meta_path(proc_root: Path, symbol: str) -> Path:
 
 def _panel_paths(proc_root: Path, sample_mode: str, panel_name: str) -> Tuple[Path, Path]:
     """面板数组和面板元数据保存位置。"""
-    if sample_mode != STRICT_BALANCED_SAMPLE:
+    if sample_mode not in VALID_PANEL_SAMPLE_MODES:
         raise ValueError("当前数据政策仅保留 strict_balanced 面板")
     panel_dir = proc_root / "panels" / sample_mode
     return panel_dir / panel_name, panel_dir / f"{panel_name}.json"
@@ -526,6 +528,7 @@ def _summarize_processed_universe(universe: pd.DataFrame, proc_root: Path) -> Tu
         universe[f"observed_days_{year}"] = universe["observed_days_by_year"].apply(lambda item: int(item.get(year, item.get(str(year), 0))))
         universe[f"coverage_{year}"] = universe[f"valid_days_{year}"] / float(len(year_dates))
         universe[f"is_strict_{year}"] = universe[f"valid_days_{year}"].eq(len(year_dates)) & universe[f"observed_days_{year}"].eq(len(year_dates))
+        universe[f"is_paper_{year}"] = universe[f"coverage_{year}"].ge(_balanced_min_coverage())
 
     calendar_days = len(global_valid_dates)
     universe["missing_days"] = calendar_days - universe["n_valid_days"]
@@ -573,9 +576,10 @@ def _summarize_processed_universe(universe: pd.DataFrame, proc_root: Path) -> Tu
         "global_dates_by_year": global_dates_by_year,
         "strict_balanced_symbols_full": int(universe["is_strict_balanced"].sum()),
         "balanced_paper_symbols_full": int(universe["is_balanced_paper"].sum()) if "is_balanced_paper" in universe.columns else 0,
-        "balanced_mode": _balanced_mode(),
+        "balanced_mode": "strict_and_paper_lenient",
         "balanced_min_coverage": _balanced_min_coverage(),
         "strict_balanced_symbols_by_year": {int(year): int(universe[f"is_strict_{year}"].sum()) for year in global_dates_by_year},
+        "balanced_paper_symbols_by_year": {int(year): int(universe[f"is_paper_{year}"].sum()) for year in global_dates_by_year},
     }
     summary["strict_balanced_symbols"] = int(summary["strict_balanced_symbols_full"])
     universe.attrs["summary"] = summary
@@ -613,20 +617,21 @@ def _select_sample_rows(
         raise ValueError("universe.attrs['summary'] is required before sample selection")
     summary = universe.attrs["summary"]
     years = _normalize_years(years)
-    if sample_mode != STRICT_BALANCED_SAMPLE:
+    if sample_mode not in VALID_PANEL_SAMPLE_MODES:
         raise ValueError(f"Unknown sample_mode: {sample_mode}")
 
     if years is None:
         # P2：完整路径用 PELGER_BALANCED_MODE=paper_lenient 时，按论文宽松口径
         # （每年覆盖率达标 + 13 年都在）选平衡面板；默认 strict（每日都在，旧）。
-        if _balanced_mode() == "paper_lenient" and "is_balanced_paper" in universe.columns:
+        if sample_mode == PAPER_LENIENT_SAMPLE and "is_balanced_paper" in universe.columns:
             mask = universe["is_balanced_paper"]
         else:
             mask = universe["is_strict_balanced"]
     else:
-        mask = universe[f"is_strict_{int(years[0])}"].copy()
+        col_prefix = "is_paper" if sample_mode == PAPER_LENIENT_SAMPLE else "is_strict"
+        mask = universe[f"{col_prefix}_{int(years[0])}"].copy()
         for year in years[1:]:
-            mask &= universe[f"is_strict_{int(year)}"]
+            mask &= universe[f"{col_prefix}_{int(year)}"]
 
     selected = universe.loc[mask].sort_values("symbol").copy()
     if max_stocks is not None:
@@ -799,7 +804,7 @@ def _write_panel(
     # 这样在 paper_lenient 宽松缺失阈值下，平衡全样本面板仍是完整矩形，可直接做（非 pairwise）PCA，
     # 与论文一致。strict 口径不受影响（其面板本就无缺失）。
     interpolated_missing = False
-    if allow_missing and _balanced_mode() == "paper_lenient":
+    if allow_missing and sample_mode == PAPER_LENIENT_SAMPLE:
         n_missing = int(np.isnan(R_5min_full).sum() + np.isnan(R_daily).sum())
         for arr in (R_intra, R_night, R_daily, R_5min_full):
             np.nan_to_num(arr, copy=False, nan=0.0)
@@ -1020,6 +1025,13 @@ def preprocess_cn_data(
             strict_year = _select_sample_rows(processed_universe, STRICT_BALANCED_SAMPLE, years=[int(year)])
             if not strict_year.empty:
                 panel_outputs.append(_write_panel(proc_root, STRICT_BALANCED_SAMPLE, f"year_{year}", strict_year, year_dates, allow_missing=False, return_mode=return_mode, panel_workers=panel_workers))
+    lenient_selected = _select_sample_rows(processed_universe, PAPER_LENIENT_SAMPLE, years=None)
+    if not lenient_selected.empty:
+        panel_outputs.append(_write_panel(proc_root, PAPER_LENIENT_SAMPLE, "full", lenient_selected, processed_summary["global_dates"], allow_missing=True, return_mode=return_mode, panel_workers=panel_workers))
+        for year, year_dates in processed_summary["global_dates_by_year"].items():
+            lenient_year = _select_sample_rows(processed_universe, PAPER_LENIENT_SAMPLE, years=[int(year)])
+            if not lenient_year.empty:
+                panel_outputs.append(_write_panel(proc_root, PAPER_LENIENT_SAMPLE, f"year_{year}", lenient_year, year_dates, allow_missing=True, return_mode=return_mode, panel_workers=panel_workers))
 
     manifest = {
         "version": PREPROCESS_VERSION,
@@ -1043,6 +1055,8 @@ def preprocess_cn_data(
         "strict_balanced_symbols": int(processed_summary["strict_balanced_symbols"]),
         "strict_balanced_symbols_full": int(processed_summary["strict_balanced_symbols_full"]),
         "strict_balanced_symbols_by_year": processed_summary["strict_balanced_symbols_by_year"],
+        "balanced_paper_symbols_full": int(processed_summary.get("balanced_paper_symbols_full", 0)),
+        "balanced_paper_symbols_by_year": processed_summary.get("balanced_paper_symbols_by_year", {}),
         "summary": processed_summary,
         "panel_outputs": panel_outputs,
         "metadata_files": {

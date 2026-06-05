@@ -10,7 +10,7 @@
 
 | 类别 | 对象 | 动作 | 触发原因 |
 |---|---|---|---|
-| 补充 | 11 桶行业映射 CSV | **放置** 到 industry/ | 新映射，图3/4/5/6/8 + 行业因子 |
+| 补充 | 11 桶行业映射 CSV(已放置) | **放置** 到 industry/ | 新映射，图3/4/5/6/8 + 行业因子 |
 | 重算·必做 | `checkpoints/replication_result_*.pkl` + `checkpoints/paper/year_YYYY/*.pkl` | **restart 重跑管线+逐年分析** | g_fn 默认 median_N→median_sqrtN，缓存失效 |
 | 重算·条件 | `symbol_returns/*.npz` + `panels/strict_balanced/*` | **`preprocess --refresh`** | N1（隔夜=独立跳跃）写在预处理；旧缓存若非 N1 口径需重建 |
 | 重算·条件 | `metadata/universe.csv` | 随 `--refresh` 重生成 | 缺 `is_balanced_paper` 列（P2 选样需要） |

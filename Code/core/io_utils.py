@@ -51,7 +51,8 @@ def tables_dir(result: ReplicationResult) -> Path:
 
 
 def diagnostics_dir(result: ReplicationResult) -> Path:
-    d = Path(result.output_root) / "diagnostics"
+    root = Path(getattr(result, "runtime_root", None) or result.output_root)
+    d = root / "diagnostics"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
