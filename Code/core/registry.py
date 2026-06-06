@@ -73,6 +73,9 @@ _TABLE_TASKS: List[Task] = [
 ]
 
 ALL_TASKS: List[Task] = _FIGURE_TASKS + _TABLE_TASKS
+_CORE_TABLE_KEYS = {"table_i", "table_ii", "table_iii", "table_iv", "table_v"}
+_CORE_TASKS: List[Task] = _FIGURE_TASKS + [task for task in _TABLE_TASKS if task.key in _CORE_TABLE_KEYS]
+_AUX_TABLE_TASKS: List[Task] = [task for task in _TABLE_TASKS if task.key not in _CORE_TABLE_KEYS]
 _BY_KEY = {t.key: t for t in ALL_TASKS}
 
 
@@ -88,6 +91,14 @@ def table_tasks() -> List[Task]:
     return list(_TABLE_TASKS)
 
 
+def core_tasks() -> List[Task]:
+    return list(_CORE_TASKS)
+
+
+def auxiliary_table_tasks() -> List[Task]:
+    return list(_AUX_TABLE_TASKS)
+
+
 def get_task(key: str) -> Optional[Task]:
     return _BY_KEY.get(key)
 
@@ -97,7 +108,7 @@ def resolve_keys(selectors: List[str]) -> List[Task]:
 
     支持：
       - 具体短名：fig8 / table_i
-      - 分组关键字：figures（所有图）/ tables（所有表）/ all（全部）
+      - 分组关键字：figures（所有图）/ tables（所有表）/ all（正式论文输出）/ diagnostics（附加诊断表）
     顺序保持登记顺序，去重。
     """
     chosen: List[Task] = []
@@ -111,7 +122,7 @@ def resolve_keys(selectors: List[str]) -> List[Task]:
     for sel in selectors:
         s = sel.strip().lower()
         if s == "all":
-            for t in ALL_TASKS:
+            for t in _CORE_TASKS:
                 _add(t)
         elif s in ("figures", "figure", "figs", "fig"):
             for t in _FIGURE_TASKS:
@@ -119,9 +130,12 @@ def resolve_keys(selectors: List[str]) -> List[Task]:
         elif s in ("tables", "table"):
             for t in _TABLE_TASKS:
                 _add(t)
+        elif s in ("diagnostics", "aux", "aux_tables", "diagnostic_tables"):
+            for t in _AUX_TABLE_TASKS:
+                _add(t)
         else:
             task = get_task(s)
             if task is None:
-                raise KeyError(f"未知任务选择器: {sel!r}（可用 all / figures / tables 或具体短名）")
+                raise KeyError(f"未知任务选择器: {sel!r}（可用 all / figures / tables / diagnostics 或具体短名）")
             _add(task)
     return chosen

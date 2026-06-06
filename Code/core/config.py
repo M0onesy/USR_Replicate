@@ -200,6 +200,12 @@ MAIN_RUN_PROFILES: Dict[str, MainLaunchProfile] = {
         strict_final_export=True,
         fail_fast=True,
     ),
+    "diagnostics_only": MainLaunchProfile(
+        task_selectors=("diagnostics",),
+        rebuild_result=False,
+        restart=False,
+        balanced_mode=STRICT_BALANCED_SAMPLE,
+    ),
     "figures_only": MainLaunchProfile(
         task_selectors=("figures",),
         rebuild_result=False,
@@ -227,7 +233,7 @@ MAIN_RUN_PROFILES["export_all"] = MAIN_RUN_PROFILES["reuse_export_smoke"]
 MAIN_RUN_PROFILES["rebuild_all"] = MAIN_RUN_PROFILES["rebuild_proc_and_result"]
 
 
-ACTIVE_MAIN_PROFILE = "reuse_export_smoke"
+ACTIVE_MAIN_PROFILE = "final_paper_export"
 
 
 def available_main_profile_names() -> List[str]:

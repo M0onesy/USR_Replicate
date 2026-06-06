@@ -1,154 +1,90 @@
-# `allcode_Need.py` 拆分版说明
+# `Code/` 目录运行说明
 
-本目录是把原先的大型单文件流程拆成“核心引擎 + 图表脚本 + 表格脚本 + 总控入口”的版本，目标是让结果复用、调试和维护更清晰。
+当前拆分版已经不再依赖旧的 `allcode_Need.py` 单文件入口。`Code/` 下的真实运行方式如下。
 
-当前有两个关键约定：
+## 主入口
 
-1. `main.py` 现在是 **纯配置驱动入口**。
-2. 单图/单表脚本仍然保留各自的独立 CLI，用于局部调试。
+- `main.py`
+  - 主复现入口
+  - 纯 `core/config.py` 配置驱动
+  - 不再接受命令行参数
 
-## 目录结构
-
-```text
-Code/
-├─ main.py                  总控入口：读取 core/config.py 中的主运行配置后执行
-├─ core/
-│  ├─ engine.py             核心复现引擎与重型计算流程
-│  ├─ config.py             运行参数 RunConfig + main.py 集中式 profile 配置
-│  ├─ pipeline_cache.py     ReplicationResult 的内存/磁盘缓存复用
-│  ├─ logging_utils.py      控制台日志与心跳
-│  ├─ io_utils.py           输出路径与通用 I/O 工具
-│  ├─ runner.py             单图/单表脚本统一执行器
-│  └─ registry.py           全部图表任务注册表
-├─ figcode/                 每张图一个脚本
-└─ tablecode/               每张表一个脚本
-```
-
-## `main.py` 现在怎么运行
-
-`main.py` 不再接受 `--only`、`--restart`、`--rebuild-result` 之类命令行参数。
-
-现在的用法是：
-
-1. 打开 [core/config.py](/d:/Courses/机器学习/Reposit/Code/core/config.py:1)
-2. 修改 `ACTIVE_MAIN_PROFILE`
-3. 如有需要，调整 `MAIN_RUN_PROFILES` 中对应 profile 的常量
-4. 在 PyCharm 里直接点运行 `main.py`，或在终端执行：
-
-```bash
-python main.py
-```
-
-如果你在仓库根目录运行，则使用：
+从仓库根目录运行：
 
 ```bash
 python Code/main.py
 ```
 
-## 主运行配置在哪里改
+从 `Code/` 目录运行：
 
-`core/config.py` 里现在有三层关键内容：
-
-1. `RunConfig`
-   底层运行参数容器，给 pipeline、缓存、图表导出共用。
-
-2. `MAIN_RUN_PROFILES`
-   `main.py` 的预设运行方案字典。
-
-3. `ACTIVE_MAIN_PROFILE`
-   当前真正生效的主入口 profile 名称。你在 PyCharm 点运行时，程序就按它执行。
-
-默认内置了这些 profile：
-
-- `export_all`
-  优先复用已有 `ReplicationResult`，导出全部图和表。
-- `figures_only`
-  只导出全部图。
-- `tables_only`
-  只导出全部表。
-- `fig13_only`
-  只跑 `fig13`，适合局部调试。
-- `rebuild_all`
-  显式重建上游 `ReplicationResult`，然后再导出全部结果。
-
-## 推荐工作流
-
-### 1. 平时重导结果
-
-把 `ACTIVE_MAIN_PROFILE` 设为：
-
-```python
-ACTIVE_MAIN_PROFILE = "export_all"
+```bash
+python main.py
 ```
 
-这会优先复用已有 `ReplicationResult`，不会默认重新跑 20 小时级上游计算。
+## 配置真源
 
-### 2. 只看某一张图
+`core/config.py` 是主入口唯一真源。
 
-把 `ACTIVE_MAIN_PROFILE` 设为：
+重点字段：
 
-```python
-ACTIVE_MAIN_PROFILE = "fig13_only"
-```
+- `ACTIVE_MAIN_PROFILE`
+  - 当前主运行 profile
+- `MAIN_RUN_PROFILES`
+  - 所有可切换预设
 
-然后直接运行 `main.py`。
+当前常用 profile：
 
-### 3. 真的需要重建上游
+- `reuse_export_smoke`
+  - 优先复用已有 `ReplicationResult`，快速重导正式论文输出
+- `rebuild_proc_and_result`
+  - 进入显式重建模式，但不强制严格最终导出
+- `final_paper_export`
+  - 正式全量导出模式，使用 `paper_lenient`
+- `diagnostics_only`
+  - 只导出附加诊断表
 
-把 `ACTIVE_MAIN_PROFILE` 切到：
+## 任务分组
 
-```python
-ACTIVE_MAIN_PROFILE = "rebuild_all"
-```
+`core/registry.py` 当前把任务分成两层：
 
-或者在 `MAIN_RUN_PROFILES` 里把当前 profile 改成：
+- `all`
+  - 正式论文输出：Figure 1–15 和 Table I–V
+- `diagnostics`
+  - 附加诊断表，例如因子数诊断、权重表、因子收益摘要、覆盖报告
 
-- `rebuild_result=True`
-- `restart=True`
+这意味着默认主运行不会再把诊断底座表写进 `Result/tables/`。
 
-然后再运行 `main.py`。
+## 目录职责
 
-## 结果复用逻辑
-
-`main.py` 会先尝试从：
-
-- `Result/.../checkpoints/replication_result_*.pkl`
-
-复用已有 `ReplicationResult`。
-
-如果存在精确签名缓存，就直接命中。
-如果精确签名没命中，但当前是导出模式，程序还会回退尝试最近一次已完成的缓存结果。
-
-只有在 profile 明确要求 `rebuild_result=True` 时，才会进入重型 pipeline。
-
-## 心跳与进度
-
-`main.py` 的心跳现在也由 `core/config.py` 控制：
-
-- `enable_heartbeat`
-- `heartbeat_sec`
-
-适合在 PyCharm 中直接看控制台进度，不必再传 `--heartbeat-sec` 或 `--no-heartbeat`。
+- `core/`
+  - 引擎、缓存、配置、任务注册、I/O
+- `figcode/`
+  - 各张图的单独导出脚本
+- `tablecode/`
+  - 各张表的单独导出脚本
 
 ## 单图 / 单表脚本
 
-这次集中配置只收口 `main.py`。
-
-因此下面这些入口仍然保持原有 CLI：
+单图、单表脚本仍保留独立 CLI，用于局部调试。例如：
 
 ```bash
-python figcode/figure_13.py
-python tablecode/table_i.py --years 2024
+python Code/figcode/figure_13.py
+python Code/tablecode/table_i.py
 ```
 
-如果单脚本运行时没有可复用缓存，而你又允许它显式构建上游，可以继续使用：
+默认会优先复用已有 `ReplicationResult`。如果没有可复用缓存，且你明确允许它显式重建上游，可使用：
 
 ```bash
-python figcode/figure_13.py --allow-build
+python Code/figcode/figure_13.py --allow-build
 ```
 
-## 注意事项
+## 输出分层
 
-- `main.py` 若收到任何命令行参数，会直接报错，并提示去修改 `core/config.py`。
-- `restart=True` 只能和 `rebuild_result=True` 一起使用；配置写错会在启动前直接报错。
-- 如果只是展示层修改，优先使用已有 `ReplicationResult` 重导，不要轻易切到 `rebuild_all`。
+- `Result/pelger_cn_adjusted/`
+  - 正式论文输出
+- `Data/proc_Data/pelger_cn_adjusted/runtime/`
+  - checkpoint、进度日志、资源计划、诊断
+- `Data/proc_Data/pelger_cn_adjusted/paper_tail/`
+  - 后半段缓存与校验
+
+如果运行行为与旧截图或旧文档冲突，应以当前代码实现为准。

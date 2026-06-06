@@ -9,15 +9,22 @@
 """
 
 from __future__ import annotations
+
 import argparse
 import re
+import sys
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
-from allcode_Need import load_proc_hf_panel
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from core.engine import load_proc_hf_panel
+
 REPO_ROOT = SCRIPT_DIR.parent
 DEFAULT_PROC_ROOT = REPO_ROOT / "Data" / "proc_Data" / "pelger_cn_adjusted"
 STRICT_BALANCED_ROOT = DEFAULT_PROC_ROOT / "panels" / "strict_balanced"

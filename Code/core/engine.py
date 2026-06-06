@@ -4303,18 +4303,21 @@ def _plot_status_row(figure_id: str, title: str, output_path: Path, status: str,
     }
 
 
-def _copy_alias_files(source_path: Path, alias_paths: Sequence[Path]) -> None:
-    """Copy one exported file to one or more compatibility alias paths."""
-    for alias_path in alias_paths:
-        if source_path.resolve() == alias_path.resolve():
-            continue
-        _atomic_copy_file(source_path, alias_path)
+def _remove_if_exists(path: Path) -> None:
+    if path.is_file():
+        path.unlink()
 
 
-def _write_csv_with_aliases(df: pd.DataFrame, canonical_path: Path, alias_paths: Optional[Sequence[Path]] = None) -> None:
-    """Write one canonical CSV and then mirror it to compatibility aliases."""
-    _atomic_to_csv(df, canonical_path, index=False, encoding="utf-8-sig")
-    _copy_alias_files(canonical_path, alias_paths or [])
+def _cleanup_previous_final_exports(figures_dir: Path, tables_dir: Path) -> None:
+    """Remove stale final-export files so old aliases do not survive a new run."""
+    stale_figure_patterns = ("Figure_*.png",)
+    stale_table_patterns = ("Table_*.csv",)
+    for pattern in stale_figure_patterns:
+        for path in figures_dir.glob(pattern):
+            _remove_if_exists(path)
+    for pattern in stale_table_patterns:
+        for path in tables_dir.glob(pattern):
+            _remove_if_exists(path)
 
 
 def _save_placeholder_figure(output_path: Path, title: str, message: str) -> None:
@@ -4602,7 +4605,7 @@ def export_replication_outputs(
     result: ReplicationResult,
     save_plots: bool = True,
 ) -> Dict[str, str]:
-    """Export canonical paper-numbered tables/figures plus compatibility aliases."""
+    """Export canonical paper-numbered tables/figures only."""
     output_root = Path(result.output_root)
     runtime_root = Path(getattr(result, "runtime_root", None) or output_root)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -4613,6 +4616,7 @@ def export_replication_outputs(
     tables_dir.mkdir(parents=True, exist_ok=True)
     figures_dir.mkdir(parents=True, exist_ok=True)
     diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    _cleanup_previous_final_exports(figures_dir, tables_dir)
 
     universe_summary = result.universe_summary or summarize_cn_universe(result.universe)
     sample_report = result.panel.sample_report or {}
@@ -4642,7 +4646,7 @@ def export_replication_outputs(
     stage_timings_path = diagnostics_dir / "stage_timings.json"
     _write_json(stage_timings_path, result.stage_timings)
 
-    sample_summary_path = tables_dir / "Table_01_sample_summary.csv"
+    sample_summary_path = diagnostics_dir / "sample_summary.csv"
     _atomic_to_csv(
         pd.DataFrame(
         [
@@ -4669,9 +4673,9 @@ def export_replication_outputs(
         encoding="utf-8-sig",
     )
 
-    jump_stats_path = tables_dir / "Table_02_jump_stats.csv"
+    jump_stats_path = diagnostics_dir / "jump_stats.csv"
     _atomic_to_csv(pd.DataFrame([result.pipeline.jump_stats]), jump_stats_path, index=False, encoding="utf-8-sig")
-    factor_counts_path = tables_dir / "Table_03_factor_counts.csv"
+    factor_counts_path = diagnostics_dir / "factor_counts_summary.csv"
     _atomic_to_csv(
         pd.DataFrame(
         [
@@ -4688,15 +4692,15 @@ def export_replication_outputs(
         index=False,
         encoding="utf-8-sig",
     )
-    sharpes_path = tables_dir / "Table_04_sharpes.csv"
+    sharpes_path = diagnostics_dir / "sharpes_summary.csv"
     _atomic_to_csv(pd.DataFrame([result.pipeline.sharpes]), sharpes_path, index=False, encoding="utf-8-sig")
 
     sample_symbols_path = diagnostics_dir / "main_sample_symbols.csv"
     _atomic_to_csv(pd.DataFrame({"symbol": result.panel.tickers}), sample_symbols_path, index=False, encoding="utf-8-sig")
 
     rolling_gc_df, rolling_explained_df = _rolling_output_frames(result.rolling_gc, result.rolling_explained_variation)
-    rolling_gc_path = tables_dir / "Table_05_rolling_gc.csv"
-    rolling_ev_path = tables_dir / "Table_06_rolling_explained_variation.csv"
+    rolling_gc_path = diagnostics_dir / "rolling_gc.csv"
+    rolling_ev_path = diagnostics_dir / "rolling_explained_variation.csv"
     _atomic_to_csv(rolling_gc_df, rolling_gc_path, index=False, encoding="utf-8-sig")
     _atomic_to_csv(rolling_explained_df, rolling_ev_path, index=False, encoding="utf-8-sig")
 
@@ -4707,24 +4711,22 @@ def export_replication_outputs(
         "Table_IV": tables_dir / "Table_IV_time_variation_decomposition.csv",
         "Table_V": tables_dir / "Table_V_intraday_overnight_daily_sharpe_ratios.csv",
     }
-    legacy_table_aliases: Dict[str, List[Path]] = {}
-
-    _write_csv_with_aliases(result.paper_table_i, canonical_table_paths["Table_I"], legacy_table_aliases.get("Table_I"))
-    _write_csv_with_aliases(result.paper_table_ii, canonical_table_paths["Table_II"])
-    _write_csv_with_aliases(result.paper_table_iii, canonical_table_paths["Table_III"])
-    _write_csv_with_aliases(result.paper_table_iv, canonical_table_paths["Table_IV"])
-    _write_csv_with_aliases(result.paper_table_v, canonical_table_paths["Table_V"], legacy_table_aliases.get("Table_V"))
+    _atomic_to_csv(result.paper_table_i, canonical_table_paths["Table_I"], index=False, encoding="utf-8-sig")
+    _atomic_to_csv(result.paper_table_ii, canonical_table_paths["Table_II"], index=False, encoding="utf-8-sig")
+    _atomic_to_csv(result.paper_table_iii, canonical_table_paths["Table_III"], index=False, encoding="utf-8-sig")
+    _atomic_to_csv(result.paper_table_iv, canonical_table_paths["Table_IV"], index=False, encoding="utf-8-sig")
+    _atomic_to_csv(result.paper_table_v, canonical_table_paths["Table_V"], index=False, encoding="utf-8-sig")
 
     factor_count_diag_path = diagnostics_dir / "paper_factor_count_diagnostics.csv"
-    _write_csv_with_aliases(result.paper_factor_counts, factor_count_diag_path)
+    _atomic_to_csv(result.paper_factor_counts, factor_count_diag_path, index=False, encoding="utf-8-sig")
 
-    pca_weights_path = tables_dir / "Table_11_continuous_pca_weights.csv"
+    pca_weights_path = diagnostics_dir / "continuous_pca_weights.csv"
     _atomic_to_csv(result.pca_weights, pca_weights_path, index=False, encoding="utf-8-sig")
-    proxy_weights_path = tables_dir / "Table_12_proxy_factor_weights.csv"
+    proxy_weights_path = diagnostics_dir / "proxy_factor_weights.csv"
     _atomic_to_csv(result.proxy_weights, proxy_weights_path, index=False, encoding="utf-8-sig")
-    monthly_weights_path = tables_dir / "Table_13_monthly_pca_weights.csv"
+    monthly_weights_path = diagnostics_dir / "monthly_pca_weights.csv"
     _atomic_to_csv(result.monthly_pca_weights, monthly_weights_path, index=False, encoding="utf-8-sig")
-    factor_return_summary_path = tables_dir / "Table_14_factor_return_summary.csv"
+    factor_return_summary_path = diagnostics_dir / "factor_return_summary.csv"
     _atomic_to_csv(result.factor_return_summary, factor_return_summary_path, index=False, encoding="utf-8-sig")
 
     corp_action_path = diagnostics_dir / "corp_action_risk_after_adjustment.csv"
@@ -4766,13 +4768,8 @@ def export_replication_outputs(
         "replication_coverage_report": str(coverage_path),
     }
 
-    legacy_figure_aliases: Dict[str, List[Path]] = {}
-
     if save_plots:
         plot_status, figure_files = export_all_paper_figures(result, figures_dir, rolling_gc_df, rolling_explained_df)
-        for figure_id, path in figure_files.items():
-            alias_paths = legacy_figure_aliases.get(figure_id, [])
-            _copy_alias_files(Path(path), alias_paths)
     else:
         plot_status = pd.DataFrame(
             [
@@ -4791,20 +4788,11 @@ def export_replication_outputs(
         figure_files = {}
 
     plot_status = plot_status.copy()
-    plot_status["legacy_alias_path"] = plot_status["figure_id"].map(
-        lambda figure_id: ";".join(str(path) for path in legacy_figure_aliases.get(figure_id, []))
-    )
+    plot_status["legacy_alias_path"] = ""
     result.plot_status = plot_status
 
     for figure_id, path in figure_files.items():
         exported_files[figure_id] = path
-        alias_paths = legacy_figure_aliases.get(figure_id, [])
-        for alias_path in alias_paths:
-            try:
-                alias_key = alias_path.stem.split("_")[0] + "_" + alias_path.stem.split("_")[1]
-            except Exception:
-                alias_key = alias_path.stem
-            exported_files[alias_key] = str(alias_path)
 
     plot_status_path = diagnostics_dir / "plot_export_status.csv"
     _atomic_to_csv(plot_status, plot_status_path, index=False, encoding="utf-8-sig")

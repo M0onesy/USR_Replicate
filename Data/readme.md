@@ -1,15 +1,8 @@
 # Data 目录说明
 
-`Data/` 只存放原始数据、复权因子和下游产物，不存放论文主复现代码。
+`Data/` 只存放原始数据、外部补充数据、预处理产物和运行期缓存，不存放最终正式论文图表。
 
-当前数据流分成两段：
-
-1. `Code/preprocess_cn_data.py`
-   从原始 `.bz2` 生成 `proc_Data/pelger_cn_adjusted`
-2. `Code/build_mom_5min.py`
-   从原始 `.bz2` 直接生成 `proc_Data/mom_5min`
-
-## 目录总览
+## 总体结构
 
 ```text
 Data/
@@ -17,81 +10,87 @@ Data/
 │  └─ EXTRA_STOCK_A/
 ├─ fact_Data/
 │  └─ backward_factor.csv
+├─ external_Data/
+│  └─ pelger_tail/
 └─ proc_Data/
    ├─ pelger_cn_adjusted/
    └─ mom_5min/
 ```
 
-## 上游：原始 5 分钟 K 线
+## 上游输入层
 
-- 目录：`kline_Data/EXTRA_STOCK_A`
-- 结构：每只股票一个子目录，内部包含 `data.bz2`
-- 主要消费者：
+### `kline_Data/EXTRA_STOCK_A`
+
+- 每只股票一个子目录，内部包含 `data.bz2`
+- 这是项目的原始 5 分钟 K 线输入
+- 直接消费者：
   - `Code/preprocess_cn_data.py`
   - `Code/build_mom_5min.py`
 
-这里是项目的原始输入层。`Code/allcode_Need.py` 不会直接读取这里的 `.bz2`。
+### `fact_Data/backward_factor.csv`
 
-如果需要重新抓取原始数据，可使用 `Code/getApidb.py` 将 API 返回结果导出成这类目录结构。
-
-## 复权因子
-
-- 文件：`fact_Data/backward_factor.csv`
-- 主要消费者：
+- 后复权因子宽表
+- 直接消费者：
   - `Code/preprocess_cn_data.py`
   - `Code/build_mom_5min.py`
 
-当前默认且唯一使用的是后复权口径：
+当前使用口径：
 
 ```text
 adjusted_ohlc = raw_ohlc * backward_factor
 ```
 
-如果你替换了 `backward_factor.csv`，应重新运行依赖它的下游脚本。
+## 外部补充数据层：`external_Data/pelger_tail`
 
-## 下游一：`proc_Data/pelger_cn_adjusted`
+这是论文后半段 `paper_tail` 使用的外部支持数据，不应再依赖临时“补充数据及代码”目录。
 
-这是论文主复现链路使用的预处理产物根目录。
+当前关键子目录：
 
-### 主要内容
+- `factors/ff3/`
+- `factors/ff5/`
+- `factors/rf/shibor_对数收益率.csv`
+- `industry/stock_full_info_std_industry_final.csv`
+- `industry/行业映射表_终版.csv`
+- `industry/行业映射表_终版.md`
+- `size_value/raw/`
+- `size_value/reference/`
+
+这些文件由 `Code/main.py` 间接通过 `paper_tail` 刷新层消费。
+
+## 预处理主产物：`proc_Data/pelger_cn_adjusted`
+
+这是主复现链路的数据根目录。
+
+### 目录职责
 
 - `manifest.json`
   - 预处理版本、输入签名、参数、样本统计、面板输出清单
 - `metadata/`
-  - `universe.pkl`
-  - `universe.csv`
-  - `universe_summary.json`
-  - `corp_action_risk_after_adjustment.csv`
+  - 样本宇宙、年份覆盖和风险诊断
 - `symbol_returns/`
-  - 逐股票收益缓存，供后续非平衡样本构建和调试使用
+  - 逐股票收益缓存
+- `panels/`
+  - 主 PCA / rolling / paper 读取的面板文件
+- `runtime/`
+  - 断点续跑 checkpoint、进度日志、资源计划、运行期诊断
+- `paper_tail/`
+  - 后半段资产、FFC、行业组合、校验文件和诊断
+
+### `panels/` 下的两套主样本
+
 - `panels/strict_balanced/`
   - 严格平衡面板
+- `panels/paper_lenient/`
+  - 论文宽松平衡面板
 
-`manifest.json` 当前会记录一组稳定的统计字段，例如：
+每套面板都应包含：
 
-- `raw_symbol_count`
-- `processed_symbol_count`
-- `failed_symbol_count`
-- `strict_balanced_symbols`
-- `strict_balanced_symbols_by_year`
-- `panel_return_scheme`
+- `full/`
+- `full.json`
+- `year_YYYY/`
+- `year_YYYY.json`
 
-这些字段比 README 中手写数字更可靠，后续如需确认当前样本规模，应以 `manifest.json` 为准。
-
-### 严格平衡面板结构
-
-当前仅保留 `strict_balanced` 口径。
-
-- `panels/strict_balanced/full`
-  - 全样本区间严格平衡面板数组目录
-- `panels/strict_balanced/full.json`
-  - `full` 面板元数据
-- `panels/strict_balanced/year_YYYY`
-  - 单年严格平衡面板数组目录
-- `panels/strict_balanced/year_YYYY.json`
-  - 单年面板元数据
-
-数组目录中主要文件包括：
+数组目录中的主要文件：
 
 - `R_daily.npy`
 - `R_intra.npy`
@@ -108,37 +107,70 @@ adjusted_ohlc = raw_ohlc * backward_factor
 - `R_night`
   - 隔夜对数收益，前一交易日收盘到当日开盘
 - `R_5min_full`
-  - 5 分钟连续收盘接续对数收益，形状为 `(D*48, N)`，是高频主流程输入
+  - 高频主序列，形状为 `(D*48, N)` 的 5 分钟连续收盘接续对数收益
 - `day_ids`
-  - 高频行到交易日的映射索引，只和 `R_5min_full` 配套
+  - `R_5min_full` 行到交易日的映射索引
 
-当前 `Code/allcode_Need.py` 的 jump decomposition、PCA 和 rolling analysis 都统一使用 `R_5min_full` 作为高频输入。
-
-### 与脚本的关系
+### 与主流程的关系
 
 - `Code/preprocess_cn_data.py`
   - 负责生成整个 `proc_Data/pelger_cn_adjusted`
-- `Code/allcode_Need.py`
-  - 只读取这个目录，不回退读取原始 `.bz2`
+- `Code/main.py`
+  - 只读取这里的预处理产物，不回退读取原始 `.bz2`
 - `Code/export_panel_csv.py`
-  - 从 `panels/strict_balanced/full` 或 `year_YYYY` 导出可读 CSV
+  - 读取 `strict_balanced` 面板并导出人工检查用 CSV
 
-## 下游二：`proc_Data/mom_5min`
+## 运行期目录：`proc_Data/pelger_cn_adjusted/runtime`
+
+这是运行过程中的状态目录，不是最终论文结果目录。
+
+主要内容：
+
+- `checkpoints/run_state.json`
+- `checkpoints/rolling/chunk_XXXXX.npz`
+- `checkpoints/paper/year_YYYY/`
+- `diagnostics/progress.jsonl`
+- `diagnostics/resource_plan.json`
+- `diagnostics/stage_timings.json`
+- `diagnostics/replication_coverage_report.csv`
+- `diagnostics/plot_export_status.csv`
+
+## 后半段缓存：`proc_Data/pelger_cn_adjusted/paper_tail`
+
+这是 `paper_tail` 的规范化缓存目录。
+
+主要内容：
+
+- `manifest.json`
+- `assets/`
+- `factors/`
+- `tables/`
+- `figures/`
+- `validation/`
+- `diagnostics/`
+
+常见关键文件：
+
+- `factors/ffc_external_daily.csv`
+- `factors/ffc_segmented_returns.csv`
+- `assets/industry_portfolios.csv`
+- `assets/size_value_portfolios.csv`
+- `validation/ffc_daily_validation_summary.json`
+- `validation/size_value_daily_parity_summary.json`
+- `diagnostics/factor_matrix_diagnostics.json`
+
+## MOM 因子产物：`proc_Data/mom_5min`
 
 这是 `Code/build_mom_5min.py` 的输出目录。
 
-### 主要内容
+主要文件：
 
 - `mom_factor_5min.csv`
-  - 市场级 5 分钟 MOM 因子时序表
 - `mom_factor_5min.pkl`
-  - 同一结果的 Pickle 版本
 - `mom_factor_5min.parquet`
-  - 同一结果的 Parquet 版本
 - `metadata.json`
-  - 因子构建参数、年份覆盖范围、并行策略、处理统计
 
-结果表当前包含的核心列为：
+结果表当前核心列包括：
 
 - `kline_time`
 - `MOM`
@@ -148,50 +180,14 @@ adjusted_ohlc = raw_ohlc * backward_factor
 - `n_winners`
 - `n_losers`
 
-`metadata.json` 当前会记录例如：
+## 使用时的判断原则
 
-- `raw_root`
-- `factor_path`
-- `proc_root`
-- `lookback_bars`
-- `skip_bars`
-- `winner_pct`
-- `loser_pct`
-- `min_stocks`
-- `years`
-- `workers`
-- `parallel_strategy`
-- `raw_symbol_files`
-- `processed_symbols`
-- `skipped_symbols`
-
-如果环境缺少 Parquet 引擎，脚本会跳过 `mom_factor_5min.parquet` 并打印 warning；其余文件仍会正常写出。
-
-### 与脚本的关系
-
-- `Code/build_mom_5min.py`
-  - 直接从 `Data/kline_Data/EXTRA_STOCK_A` 和 `Data/fact_Data/backward_factor.csv` 生成该目录
-- `Code/allcode_Need.py`
-  - 不消费这个目录
-
-## 推荐顺序
-
-### 论文复现链路
-
-1. 准备原始 `data.bz2`
-2. 运行 `Code/preprocess_cn_data.py`
-3. 运行 `Code/allcode_Need.py`
-
-### 动量因子链路
-
-1. 准备原始 `data.bz2`
-2. 确认 `backward_factor.csv`
-3. 运行 `Code/build_mom_5min.py`
-
-## 常见提示
-
-- `proc_Data/pelger_cn_adjusted` 和 `proc_Data/mom_5min` 是两套独立产物，不应混用
-- 替换原始 K 线或复权因子后，应重跑对应下游脚本
-- 是否成功处理了多少股票、覆盖了哪些年份，应优先查看：
-  - `proc_Data/pelger_cn_adjusted/manifest.json`
-  - `proc_Data/mom_5min/metadata.json`
+- 看样本规模、覆盖年份、面板是否齐全：
+  - 先看 `proc_Data/pelger_cn_adjusted/manifest.json`
+  - 再看 `proc_Data/pelger_cn_adjusted/metadata/universe_summary.json`
+- 看 MOM 是否重建完成：
+  - 看 `proc_Data/mom_5min/metadata.json`
+- 看运行过程是否正常：
+  - 看 `proc_Data/pelger_cn_adjusted/runtime/diagnostics/`
+- 看后半段外部数据适配是否通过：
+  - 看 `proc_Data/pelger_cn_adjusted/paper_tail/validation/`
