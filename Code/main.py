@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import time
 import traceback
@@ -136,6 +137,7 @@ def _run_tasks(
     log_info("main", "准备 ReplicationResult（命中缓存则秒回，否则按当前 profile 决定是否重建）…")
     heartbeat.set_status("准备 ReplicationResult", done=0, total=len(tasks))
     result = _resolve_result(cfg, rebuild_result=rebuild_result)
+    heartbeat.clear_progress_log()
     log_done("main", "ReplicationResult 就绪，开始逐个生成图表和表格。")
 
     succeeded: list[tuple[str, str]] = []
@@ -182,6 +184,28 @@ def _build_run_config(profile: MainLaunchProfile, tasks: List[Task]) -> RunConfi
     return profile_to_run_config(profile, save_plots=_has_figure_tasks(tasks))
 
 
+def _log_resume_hint(cfg: RunConfig) -> None:
+    checkpoint_root = Path(cfg.runtime_root) / "checkpoints"
+    run_state_path = checkpoint_root / "run_state.json"
+    if not run_state_path.exists():
+        return
+    try:
+        state = json.loads(run_state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    rolling_done = len(state.get("completed_rolling_chunks") or [])
+    paper_done = len(state.get("completed_paper_years") or [])
+    status = str(state.get("status") or "")
+    if cfg.restart:
+        log_warn("main", f"本次配置 restart=True，将忽略已有 checkpoint（rolling={rolling_done}, paper_years={paper_done}）。")
+        return
+    if rolling_done or paper_done:
+        log_info(
+            "main",
+            f"检测到已有 checkpoint：rolling={rolling_done} 块、paper={paper_done} 年；若 semantic signature 一致将自动续跑。",
+        )
+
+
 def main() -> int:
     _ensure_no_cli_args(sys.argv)
     profile_name, profile = get_active_main_profile()
@@ -198,10 +222,21 @@ def main() -> int:
     log_info("main", f"主样本模式：{cfg.balanced_mode}")
     log_info("main", f"运行目录 {cfg.runtime_root}")
     log_info("main", f"最终结果目录 {cfg.final_result_root}")
+    log_info(
+        "main",
+        "执行层参数："
+        f" restart={cfg.restart}"
+        f" workers={cfg.workers}"
+        f" paper_workers={cfg.paper_workers}"
+        f" rolling_workers={cfg.rolling_workers}"
+        f" memory_budget_gb={cfg.memory_budget_gb}",
+    )
     if cfg.years or cfg.max_stocks:
         log_info("main", f"样本限制 years={cfg.years} max_stocks={cfg.max_stocks}")
+    _log_resume_hint(cfg)
 
     heartbeat = Heartbeat(interval_sec=profile.heartbeat_sec)
+    heartbeat.attach_progress_log(Path(cfg.runtime_root) / "diagnostics" / "progress.jsonl")
     t0 = time.perf_counter()
     if profile.enable_heartbeat:
         heartbeat.start()

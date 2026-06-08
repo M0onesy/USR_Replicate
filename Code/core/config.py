@@ -232,8 +232,38 @@ MAIN_RUN_PROFILES: Dict[str, MainLaunchProfile] = {
 MAIN_RUN_PROFILES["export_all"] = MAIN_RUN_PROFILES["reuse_export_smoke"]
 MAIN_RUN_PROFILES["rebuild_all"] = MAIN_RUN_PROFILES["rebuild_proc_and_result"]
 
+# Strict-equivalence rebuild profiles tuned for larger machines.
+# `final_paper_export_resume` keeps the official paper_lenient semantics but
+# stops deleting compatible checkpoints on every launch.
+MAIN_RUN_PROFILES["final_paper_export_resume"] = replace(
+    MAIN_RUN_PROFILES["final_paper_export"],
+    restart=False,
+)
+MAIN_RUN_PROFILES["final_paper_export_hpc_48g"] = replace(
+    MAIN_RUN_PROFILES["final_paper_export_resume"],
+    paper_workers=8,
+    rolling_workers=16,
+    memory_budget_gb=48.0,
+)
+MAIN_RUN_PROFILES["final_paper_export_hpc_64g"] = replace(
+    MAIN_RUN_PROFILES["final_paper_export_resume"],
+    paper_workers=10,
+    rolling_workers=16,
+    memory_budget_gb=64.0,
+)
+MAIN_RUN_PROFILES["final_paper_export_hpc_96g"] = replace(
+    MAIN_RUN_PROFILES["final_paper_export_resume"],
+    paper_workers=13,
+    rolling_workers=24,
+    memory_budget_gb=96.0,
+)
+MAIN_RUN_PROFILES["final_paper_export_hpc"] = MAIN_RUN_PROFILES["final_paper_export_hpc_64g"]
 
-ACTIVE_MAIN_PROFILE = "final_paper_export"
+# Safe default: keep strict final-export semantics and preserve compatible
+# checkpoints. On the high-compute platform, switch this to
+# `final_paper_export_hpc`, `final_paper_export_hpc_48g`, or
+# `final_paper_export_hpc_96g` as needed.
+ACTIVE_MAIN_PROFILE = "final_paper_export_resume"
 
 
 def available_main_profile_names() -> List[str]:

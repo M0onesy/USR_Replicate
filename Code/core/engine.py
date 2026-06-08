@@ -33,6 +33,7 @@ import contextlib
 import hashlib
 import json
 import os
+import shutil as _stdlib_shutil
 import sys
 import tempfile
 import time
@@ -88,9 +89,11 @@ DEFAULT_MEMORY_BUDGET_RATIO = 0.65
 DEFAULT_PROGRESS_INTERVAL_SEC = 10.0
 PROGRESS_HEARTBEAT_EVENT = "heartbeat"
 CHECKPOINT_FORMAT_VERSION = 1
+CHECKPOINT_COMPAT_VERSION = 1
 ROLLING_CHECKPOINT_WINDOW_COUNT = 64
 PAPER_PANEL_THREAD_CAP = 4
 PAPER_MEMORY_SAFETY_MULTIPLIER = 1.35
+SCRATCH_FIXED_HEADROOM_BYTES = 1024 ** 3
 DISPLAY_CONTINUOUS_FACTOR_COUNT = 4
 
 
@@ -432,6 +435,9 @@ class CheckpointManager:
     layout: CheckpointLayout = field(init=False)
     state: Dict[str, Any] = field(init=False)
     resumed: bool = field(init=False, default=False)
+    compatibility_mode: str = field(init=False, default="new_run")
+    compatibility_notes: List[str] = field(init=False, default_factory=list)
+    pending_paper_years: List[int] = field(init=False, default_factory=list)
 
     def __post_init__(self) -> None:
         checkpoint_root = self.runtime_root / "checkpoints"
@@ -448,6 +454,7 @@ class CheckpointManager:
 
     def prepare(self) -> Dict[str, Any]:
         cleaned_items: List[str] = []
+        reconciled = False
         if self.restart:
             if self.layout.root.exists():
                 shutil.rmtree(self.layout.root, ignore_errors=True)
@@ -457,33 +464,51 @@ class CheckpointManager:
             if self.export_root is not None:
                 cleaned_items.extend(_cleanup_export_tmp_files(self.export_root))
             self.state = _new_run_state(self.signature)
+            self.compatibility_mode = "restart"
             self.save()
-            return {"resumed": False, "cleaned_items": cleaned_items, "reason": "restart"}
+            return {
+                "resumed": False,
+                "cleaned_items": cleaned_items,
+                "reason": "restart",
+                "compatibility_mode": self.compatibility_mode,
+                "compatibility_notes": list(self.compatibility_notes),
+                "reconciled_state": False,
+            }
 
         loaded_state = _load_json_if_exists(self.layout.run_state_path)
         if loaded_state is not None:
-            loaded_signature = loaded_state.get("signature", {})
-            if loaded_signature != self.signature:
-                raise ValueError(
-                    "Existing checkpoint state is not compatible with the current semantic run signature. "
-                    "Use a different runtime/final output root or restart the run with a clean checkpoint state."
-                )
+            compat_result = self._resolve_signature_compatibility(loaded_state)
+            if not compat_result.get("compatible"):
+                raise ValueError(str(compat_result.get("message") or "Checkpoint signature mismatch."))
             self.state = dict(loaded_state)
             self.resumed = True
+            self.compatibility_mode = str(compat_result.get("mode") or "exact_resume")
+            self.compatibility_notes = list(compat_result.get("notes") or [])
         else:
             self.state = _new_run_state(self.signature)
+            self.compatibility_mode = "new_run"
 
         if self.export_root is not None:
             cleaned_items.extend(_cleanup_export_tmp_files(self.export_root))
         cleaned_items.extend(self._cleanup_incomplete_checkpoint_units())
+        reconciled = self._reconcile_state_with_disk()
         self.state["status"] = "running"
         self.state["last_updated"] = pd.Timestamp.utcnow().isoformat()
         self.state["resumed_from_previous"] = bool(self.resumed)
+        self.state["signature"] = self.signature
         self.save()
-        return {"resumed": bool(self.resumed), "cleaned_items": cleaned_items, "reason": "resume" if self.resumed else "new_run"}
+        return {
+            "resumed": bool(self.resumed),
+            "cleaned_items": cleaned_items,
+            "reason": "resume" if self.resumed else "new_run",
+            "compatibility_mode": self.compatibility_mode,
+            "compatibility_notes": list(self.compatibility_notes),
+            "reconciled_state": bool(reconciled),
+        }
 
     def save(self) -> None:
         self.state["checkpoint_format_version"] = int(CHECKPOINT_FORMAT_VERSION)
+        self.state["compat_version"] = int(CHECKPOINT_COMPAT_VERSION)
         self.state["last_updated"] = pd.Timestamp.utcnow().isoformat()
         _write_json(self.layout.run_state_path, self.state)
 
@@ -530,14 +555,21 @@ class CheckpointManager:
         self.save()
 
     def mark_paper_plan(self, years: Sequence[int]) -> None:
-        self.state["paper_total_years"] = int(len(years))
-        self.state["completed_paper_years"] = sorted(self.completed_paper_years())
+        year_list = sorted(int(year) for year in years)
+        completed = sorted(self.completed_paper_years())
+        self.state["paper_total_years"] = int(len(year_list))
+        self.state["completed_paper_years"] = completed
+        self.pending_paper_years = [year for year in year_list if year not in set(completed)]
+        self.state["paper_planned_years"] = year_list
+        self.state["pending_paper_years"] = list(self.pending_paper_years)
         self.save()
 
     def mark_paper_year_complete(self, year: int) -> None:
         completed = self.completed_paper_years()
         completed.add(int(year))
         self.state["completed_paper_years"] = sorted(completed)
+        self.pending_paper_years = [value for value in self.pending_paper_years if int(value) != int(year)]
+        self.state["pending_paper_years"] = list(self.pending_paper_years)
         self.save()
 
     def mark_export_complete(self) -> None:
@@ -551,8 +583,109 @@ class CheckpointManager:
         self.state["stage"] = str(stage)
         self.save()
 
+    def _loaded_signature(self) -> Dict[str, Any]:
+        return dict(self.state.get("signature") or {})
+
+    def _normalize_signature(self, signature: Dict[str, Any]) -> Dict[str, Any]:
+        if not signature:
+            return {}
+        if "semantic_payload" in signature:
+            payload = dict(signature.get("semantic_payload") or {})
+            return {
+                "compat_version": int(signature.get("compat_version", CHECKPOINT_COMPAT_VERSION)),
+                "semantic_payload": payload,
+                "semantic_sha256": str(signature.get("semantic_sha256") or _checkpoint_semantic_hash(payload)),
+                "build_info": dict(signature.get("build_info") or {}),
+            }
+        payload = dict(signature.get("payload") or {})
+        payload.pop("code_file_sha256", None)
+        return {
+            "compat_version": int(signature.get("compat_version", CHECKPOINT_COMPAT_VERSION)),
+            "semantic_payload": payload,
+            "semantic_sha256": _checkpoint_semantic_hash(payload),
+            "build_info": {"legacy_code_file_sha256": signature.get("payload", {}).get("code_file_sha256")},
+        }
+
+    def _signature_difference_lines(self, loaded_payload: Dict[str, Any], current_payload: Dict[str, Any]) -> List[str]:
+        diffs: List[str] = []
+        for key in sorted(set(loaded_payload) | set(current_payload)):
+            if loaded_payload.get(key) != current_payload.get(key):
+                diffs.append(f"{key}: {loaded_payload.get(key)!r} -> {current_payload.get(key)!r}")
+        return diffs
+
+    def _resolve_signature_compatibility(self, loaded_state: Dict[str, Any]) -> Dict[str, Any]:
+        loaded_signature_raw = dict(loaded_state.get("signature") or {})
+        loaded_signature = self._normalize_signature(loaded_signature_raw)
+        current_signature = self._normalize_signature(self.signature)
+        loaded_payload = dict(loaded_signature.get("semantic_payload") or {})
+        current_payload = dict(current_signature.get("semantic_payload") or {})
+        loaded_compat_version = int(loaded_signature.get("compat_version", CHECKPOINT_COMPAT_VERSION))
+        current_compat_version = int(current_signature.get("compat_version", CHECKPOINT_COMPAT_VERSION))
+        if loaded_compat_version != current_compat_version:
+            return {
+                "compatible": False,
+                "message": (
+                    "Existing checkpoint state is not compatible with the current checkpoint compatibility version. "
+                    f"compat_version: {loaded_compat_version} -> {current_compat_version}. "
+                    "Use a different runtime/final output root or restart with a clean checkpoint state."
+                ),
+            }
+        if loaded_payload != current_payload:
+            diff_lines = self._signature_difference_lines(loaded_payload, current_payload)
+            diff_text = "; ".join(diff_lines) if diff_lines else "unknown semantic differences"
+            return {
+                "compatible": False,
+                "message": (
+                    "Existing checkpoint state is not compatible with the current semantic run signature. "
+                    f"Differences: {diff_text}. "
+                    "This is a semantic mismatch rather than missing checkpoints."
+                ),
+            }
+        mode = "exact_resume" if "semantic_payload" in loaded_signature_raw else "legacy_bridge_resume"
+        notes: List[str] = []
+        if mode == "legacy_bridge_resume":
+            notes.append("legacy compatible checkpoint bridge active")
+        else:
+            loaded_build = dict(loaded_signature.get("build_info") or {})
+            current_build = dict(current_signature.get("build_info") or {})
+            if loaded_build.get("engine_code_sha256") != current_build.get("engine_code_sha256"):
+                notes.append("engine runtime hash changed but semantic signature matched")
+        return {"compatible": True, "mode": mode, "notes": notes}
+
+    def _reconcile_state_with_disk(self) -> bool:
+        rolling_done = sorted(self.completed_rolling_chunks())
+        paper_done = sorted(self.completed_paper_years())
+        changed = False
+        if list(self.state.get("completed_rolling_chunks") or []) != rolling_done:
+            self.state["completed_rolling_chunks"] = rolling_done
+            changed = True
+        if list(self.state.get("completed_paper_years") or []) != paper_done:
+            self.state["completed_paper_years"] = paper_done
+            changed = True
+        planned_years = sorted(int(year) for year in (self.state.get("paper_planned_years") or []))
+        if planned_years:
+            pending_years = [year for year in planned_years if year not in set(paper_done)]
+            if list(self.state.get("pending_paper_years") or []) != pending_years:
+                self.state["pending_paper_years"] = pending_years
+                self.pending_paper_years = list(pending_years)
+                changed = True
+        else:
+            paper_total = self.state.get("paper_total_years")
+            if paper_total is not None and int(paper_total) >= len(paper_done):
+                self.pending_paper_years = list(self.state.get("pending_paper_years") or [])
+        rolling_total = self.state.get("rolling_total_chunks")
+        if rolling_total is not None and int(rolling_total) < len(rolling_done):
+            self.state["rolling_total_chunks"] = len(rolling_done)
+            changed = True
+        paper_total = self.state.get("paper_total_years")
+        if paper_total is not None and int(paper_total) < len(paper_done):
+            self.state["paper_total_years"] = len(paper_done)
+            changed = True
+        return changed
+
     def _cleanup_incomplete_checkpoint_units(self) -> List[str]:
         cleaned_items: List[str] = []
+        scratch_root = self.runtime_root / "diagnostics" / "runtime_tmp"
         for tmp_path in self.layout.root.rglob("*.tmp"):
             try:
                 tmp_path.unlink()
@@ -569,8 +702,21 @@ class CheckpointManager:
                 continue
             if (year_dir / "complete.json").exists():
                 continue
+            year_suffix = year_dir.name.split("_")[-1]
             shutil.rmtree(year_dir, ignore_errors=True)
             cleaned_items.append(str(year_dir))
+            scratch_year_dir = scratch_root / f"year_{year_suffix}"
+            if scratch_year_dir.exists():
+                shutil.rmtree(scratch_year_dir, ignore_errors=True)
+                cleaned_items.append(str(scratch_year_dir))
+        if scratch_root.exists():
+            for scratch_year_dir in scratch_root.glob("year_*"):
+                if not scratch_year_dir.is_dir():
+                    continue
+                checkpoint_year_dir = self.layout.paper_dir / scratch_year_dir.name
+                if checkpoint_year_dir.exists() and (checkpoint_year_dir / "complete.json").exists():
+                    shutil.rmtree(scratch_year_dir, ignore_errors=True)
+                    cleaned_items.append(str(scratch_year_dir))
         return cleaned_items
 
 
@@ -637,8 +783,8 @@ class MemmapContext:
         self._paths.append(path)
         return arr
 
-    def cleanup_files(self) -> None:
-        if not self.cleanup:
+    def cleanup_files(self, *, force: bool = False) -> None:
+        if not self.cleanup and not force:
             return
         for path in self._paths:
             try:
@@ -647,6 +793,93 @@ class MemmapContext:
             except Exception:
                 pass
         self._paths.clear()
+        if self.scratch_root is not None:
+            try:
+                if self.scratch_root.exists():
+                    _stdlib_shutil.rmtree(self.scratch_root, ignore_errors=True)
+            except Exception:
+                pass
+
+
+def _disk_free_bytes(path: Path) -> int:
+    try:
+        usage = shutil.disk_usage(path if path.exists() else path.parent)
+        return int(usage.free)
+    except Exception:
+        return -1
+
+
+def _paper_scratch_required_bytes(resource_plan: "ResourcePlan", worker_count: int) -> int:
+    estimates = sorted(
+        (int(item.get("peak_memory_bytes", 0)) for item in resource_plan.paper_year_estimates),
+        reverse=True,
+    )
+    top_n = max(1, min(int(worker_count), len(estimates)))
+    return int(sum(estimates[:top_n]))
+
+
+def _scratch_space_report(
+    runtime: "RuntimeConfig",
+    resource_plan: "ResourcePlan",
+    worker_count: int,
+    *,
+    compat_resume_mode: str = "new_run",
+) -> Dict[str, Any]:
+    required_bytes_raw = _paper_scratch_required_bytes(resource_plan, worker_count)
+    # Keep at least 1 GiB of extra scratch headroom; this is not 1 TiB.
+    required_bytes_with_safety = int(
+        max(
+            required_bytes_raw * PAPER_MEMORY_SAFETY_MULTIPLIER,
+            required_bytes_raw + SCRATCH_FIXED_HEADROOM_BYTES,
+        )
+    )
+    free_bytes = _disk_free_bytes(runtime.scratch_root)
+    return {
+        "scratch_root": str(runtime.scratch_root),
+        "compat_resume_mode": str(compat_resume_mode),
+        "paper_workers_effective": int(worker_count),
+        "worker_count": int(worker_count),
+        "free_bytes": int(free_bytes),
+        "free_gb": _format_bytes_gb(free_bytes) if free_bytes >= 0 else None,
+        "required_bytes_raw": int(required_bytes_raw),
+        "required_gb_raw": _format_bytes_gb(required_bytes_raw),
+        "required_bytes_with_safety": int(required_bytes_with_safety),
+        "required_gb_with_safety": _format_bytes_gb(required_bytes_with_safety),
+        "required_bytes": int(required_bytes_with_safety),
+        "required_gb": _format_bytes_gb(required_bytes_with_safety),
+        "largest_year_peak_gb": max(
+            (float(item.get("peak_memory_gb", 0.0)) for item in resource_plan.paper_year_estimates),
+            default=0.0,
+        ),
+    }
+
+
+def _ensure_paper_scratch_capacity(
+    *,
+    runtime: "RuntimeConfig",
+    resource_plan: "ResourcePlan",
+    worker_count: int,
+    diagnostics_dir: Path,
+    compat_resume_mode: str = "new_run",
+) -> Dict[str, Any]:
+    report = _scratch_space_report(
+        runtime,
+        resource_plan,
+        worker_count,
+        compat_resume_mode=compat_resume_mode,
+    )
+    _write_json(diagnostics_dir / "scratch_space_check.json", report)
+    free_bytes = int(report.get("free_bytes", -1))
+    required_bytes = int(report["required_bytes_with_safety"])
+    if free_bytes >= 0 and free_bytes < required_bytes:
+        raise RuntimeError(
+            "Insufficient scratch disk space for paper_tables: "
+            f"scratch_root={report['scratch_root']}, free_gb={report.get('free_gb'):.2f}, "
+            f"required_gb≈{report['required_gb']:.2f}, workers={worker_count}. "
+            "Clean disk space, move runtime_root/diagnostics to a larger volume, "
+            "or lower paper_workers/memory_budget_gb."
+        )
+    return report
 
 
 def _universe_attr_summary(universe: pd.DataFrame) -> Dict[str, Any]:
@@ -789,6 +1022,36 @@ def _current_code_file_hash() -> str:
     return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
+def _checkpoint_semantic_payload(
+    proc_root: Path,
+    years: Optional[Sequence[int]],
+    max_stocks: Optional[int],
+    balanced_mode: str,
+    jump_a: float,
+    k_max: int,
+    gamma: float,
+    g_fn: str,
+    return_mode: str,
+) -> Dict[str, Any]:
+    return {
+        "proc_root": str(proc_root),
+        "years": _normalize_years(years),
+        "max_stocks": None if max_stocks is None else int(max_stocks),
+        "balanced_mode": str(balanced_mode),
+        "jump_a": float(jump_a),
+        "k_max": int(k_max),
+        "gamma": float(gamma),
+        "g_fn": str(g_fn),
+        "return_mode": str(return_mode),
+        "checkpoint_format_version": int(CHECKPOINT_FORMAT_VERSION),
+    }
+
+
+def _checkpoint_semantic_hash(payload: Dict[str, Any]) -> str:
+    payload_text = json.dumps(_json_ready(payload), ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+
+
 def _build_run_signature(
     proc_root: Path,
     years: Optional[Sequence[int]],
@@ -800,23 +1063,26 @@ def _build_run_signature(
     g_fn: str,
     return_mode: str,
 ) -> Dict[str, Any]:
-    payload = {
-        "proc_root": str(proc_root),
-        "years": _normalize_years(years),
-        "max_stocks": None if max_stocks is None else int(max_stocks),
-        "balanced_mode": str(balanced_mode),
-        "jump_a": float(jump_a),
-        "k_max": int(k_max),
-        "gamma": float(gamma),
-        "g_fn": str(g_fn),
-        "return_mode": str(return_mode),
-        "checkpoint_format_version": int(CHECKPOINT_FORMAT_VERSION),
-        "code_file_sha256": _current_code_file_hash(),
+    semantic_payload = _checkpoint_semantic_payload(
+        proc_root=proc_root,
+        years=years,
+        max_stocks=max_stocks,
+        balanced_mode=balanced_mode,
+        jump_a=jump_a,
+        k_max=k_max,
+        gamma=gamma,
+        g_fn=g_fn,
+        return_mode=return_mode,
+    )
+    build_info = {
+        "engine_code_sha256": _current_code_file_hash(),
+        "signature_built_at": pd.Timestamp.utcnow().isoformat(),
     }
-    payload_text = json.dumps(_json_ready(payload), ensure_ascii=False, sort_keys=True)
     return {
-        "payload": payload,
-        "sha256": hashlib.sha256(payload_text.encode("utf-8")).hexdigest(),
+        "compat_version": int(CHECKPOINT_COMPAT_VERSION),
+        "semantic_payload": semantic_payload,
+        "semantic_sha256": _checkpoint_semantic_hash(semantic_payload),
+        "build_info": build_info,
     }
 
 
@@ -1633,13 +1899,31 @@ class YearJumpDecomposition:
 @dataclass
 class YearPanelAnalysis:
     year: int
-    balanced_year: HFPanel
-    unbalanced_year: HFPanel
+    balanced_year: Optional[HFPanel]
+    unbalanced_year: Optional[HFPanel]
     decompositions: Dict[Tuple[str, float], YearJumpDecomposition] = field(default_factory=dict)
     pca_cache: Dict[Tuple[str, str, float], PCAResult] = field(default_factory=dict)
     explained_cache: Dict[Tuple[str, str, float, int], float] = field(default_factory=dict)
     stage_timings: Dict[str, float] = field(default_factory=dict)
     scratch_root: Optional[Path] = None
+    memmap_contexts: List[MemmapContext] = field(default_factory=list)
+
+    def register_memmap_context(self, ctx: MemmapContext) -> MemmapContext:
+        self.memmap_contexts.append(ctx)
+        return ctx
+
+    def cleanup_runtime_scratch(self) -> None:
+        for ctx in self.memmap_contexts:
+            try:
+                ctx.cleanup_files(force=True)
+            except Exception:
+                pass
+        self.memmap_contexts.clear()
+        self.decompositions.clear()
+        self.pca_cache.clear()
+        self.explained_cache.clear()
+        if self.scratch_root is not None:
+            shutil.rmtree(self.scratch_root / f"year_{self.year}", ignore_errors=True)
 
 
 @dataclass
@@ -3269,7 +3553,9 @@ def _cached_panel_jump_decomposition(
         return cached
     panel = analysis.balanced_year if panel_key == "balanced" else analysis.unbalanced_year
     scratch_root = None if analysis.scratch_root is None else analysis.scratch_root / f"year_{analysis.year}" / f"{panel_key}_{threshold:.1f}"
-    memmap_ctx = MemmapContext(scratch_root=scratch_root, prefix=f"{panel_key}_{threshold:.1f}", cleanup=not retain_arrays)
+    memmap_ctx = analysis.register_memmap_context(
+        MemmapContext(scratch_root=scratch_root, prefix=f"{panel_key}_{threshold:.1f}", cleanup=not retain_arrays)
+    )
     stats: Dict[str, float] = {}
     R_cont, R_jump = detect_jumps(panel, a=float(threshold), memmap_ctx=memmap_ctx, stats_out=stats)
     if not stats:
@@ -3347,11 +3633,24 @@ def _build_year_panel_analysis(
 ) -> YearPanelAnalysis:
     timings: Dict[str, float] = {}
     t_panel = time.perf_counter()
+    analysis = YearPanelAnalysis(
+        year=int(year),
+        balanced_year=None,
+        unbalanced_year=None,
+        stage_timings=timings,
+        scratch_root=scratch_root,
+    )
     balanced_year = load_proc_5min_panel(
         proc_root=proc_root,
         sample_mode=sample_mode,
         years=[year],
         max_stocks=max_stocks,
+    )
+    unbalanced_ctx = analysis.register_memmap_context(
+        MemmapContext(
+            scratch_root=None if scratch_root is None else scratch_root / f"year_{year}",
+            prefix=f"unbalanced_{year}",
+        )
     )
     unbalanced_year = _build_unbalanced_year_5min_panel(
         proc_root=proc_root,
@@ -3359,19 +3658,12 @@ def _build_year_panel_analysis(
         year_dates=year_dates,
         tickers=tickers,
         panel_workers=panel_workers,
-        memmap_ctx=MemmapContext(
-            scratch_root=None if scratch_root is None else scratch_root / f"year_{year}",
-            prefix=f"unbalanced_{year}",
-        ),
+        memmap_ctx=unbalanced_ctx,
     )
     timings["panel_build_sec"] = time.perf_counter() - t_panel
-    return YearPanelAnalysis(
-        year=int(year),
-        balanced_year=balanced_year,
-        unbalanced_year=unbalanced_year,
-        stage_timings=timings,
-        scratch_root=scratch_root,
-    )
+    analysis.balanced_year = balanced_year
+    analysis.unbalanced_year = unbalanced_year
+    return analysis
 
 
 def _table_i_rows_from_analysis(
@@ -3636,30 +3928,33 @@ def yearly_paper_metrics_worker(task: Dict[str, Any]) -> Dict[str, Any]:
         n_symbols=int(len(tickers)),
         message="balanced and unbalanced yearly panels loaded",
     )
-    with _temporary_blas_thread_env(blas_threads):
-        return {
-            "year": year,
-            "table_i_rows": _table_i_rows_from_analysis(analysis, thresholds, progress_hook=emit),
-            "table_ii_rows": _table_ii_rows_from_analysis(
-                analysis=analysis,
-                jump_a=jump_a,
-                gamma=gamma,
-                g_fn=g_fn,
-                k_max=k_max,
-                progress_hook=emit,
-            ),
-            "factor_count_rows": _factor_count_rows_from_analysis(
-                analysis=analysis,
-                jump_a=jump_a,
-                k_max=k_max,
-                gamma=gamma,
-                g_fn=g_fn,
-                progress_hook=emit,
-            ),
-            "stage_timings": dict(analysis.stage_timings),
-            "n_days": int(len(year_dates)),
-            "n_symbols": int(len(tickers)),
-        }
+    try:
+        with _temporary_blas_thread_env(blas_threads):
+            return {
+                "year": year,
+                "table_i_rows": _table_i_rows_from_analysis(analysis, thresholds, progress_hook=emit),
+                "table_ii_rows": _table_ii_rows_from_analysis(
+                    analysis=analysis,
+                    jump_a=jump_a,
+                    gamma=gamma,
+                    g_fn=g_fn,
+                    k_max=k_max,
+                    progress_hook=emit,
+                ),
+                "factor_count_rows": _factor_count_rows_from_analysis(
+                    analysis=analysis,
+                    jump_a=jump_a,
+                    k_max=k_max,
+                    gamma=gamma,
+                    g_fn=g_fn,
+                    progress_hook=emit,
+                ),
+                "stage_timings": dict(analysis.stage_timings),
+                "n_days": int(len(year_dates)),
+                "n_symbols": int(len(tickers)),
+            }
+    finally:
+        analysis.cleanup_runtime_scratch()
 
 
 def build_yearly_paper_outputs(
@@ -3737,6 +4032,24 @@ def build_yearly_paper_outputs(
             memory_budget_gb=runtime.memory_budget_gb,
         )
         progress.event("stage_started", message="yearly paper outputs")
+    scratch_report = _ensure_paper_scratch_capacity(
+        runtime=runtime,
+        resource_plan=resource_plan,
+        worker_count=worker_count,
+        diagnostics_dir=progress.diagnostics_dir if progress is not None else runtime.scratch_root.parent,
+        compat_resume_mode=checkpoint_manager.compatibility_mode if checkpoint_manager is not None else "new_run",
+    )
+    if progress is not None:
+        progress.event(
+            "scratch_checked",
+            stage="paper_tables",
+            completed_years=completed_years,
+            total_years=len(years),
+            message=(
+                f"scratch ok: free={scratch_report.get('free_gb', 0.0):.2f}GB "
+                f"required≈{scratch_report['required_gb']:.2f}GB root={scratch_report['scratch_root']}"
+            ),
+        )
 
     pending_tasks: List[Dict[str, Any]] = []
     for task in base_tasks:
@@ -3753,6 +4066,17 @@ def build_yearly_paper_outputs(
                 )
             continue
         pending_tasks.append(task)
+    if progress is not None and checkpoint_manager is not None and checkpoint_manager.resumed:
+        pending_years = sorted(int(task["year"]) for task in pending_tasks)
+        checkpoint_manager.pending_paper_years = pending_years
+        if pending_years:
+            progress.event(
+                "checkpoint_pending_years",
+                stage="paper_tables",
+                completed_years=completed_years,
+                total_years=len(years),
+                message=f"pending paper years: {', '.join(str(year) for year in pending_years)}",
+            )
 
     def build_task_payload(task: Dict[str, Any], active_years: int) -> Dict[str, Any]:
         task_payload = dict(task)
@@ -4885,8 +5209,19 @@ def run_cn_replication(
             cleaned_count=len(checkpoint_info["cleaned_items"]),
             message=f"cleaned {len(checkpoint_info['cleaned_items'])} incomplete checkpoint/export artifacts",
         )
+    if checkpoint_info.get("reconciled_state"):
+        progress.event(
+            "checkpoint_state_reconciled",
+            stage="startup",
+            rolling_chunks=len(checkpoint_manager.completed_rolling_chunks()),
+            paper_years=len(checkpoint_manager.completed_paper_years()),
+            message="checkpoint state was reconciled to match on-disk completed units",
+        )
     if checkpoint_info.get("resumed"):
-        progress.event("run_resumed", stage="startup", message="resuming from compatible checkpoints")
+        resume_message = "resuming from compatible checkpoints"
+        if checkpoint_info.get("compatibility_mode") == "legacy_bridge_resume":
+            resume_message = "legacy compatible checkpoint bridge active"
+        progress.event("run_resumed", stage="startup", message=resume_message)
         progress.event(
             "checkpoint_reused",
             stage="startup",
@@ -4894,6 +5229,12 @@ def run_cn_replication(
             paper_years=len(checkpoint_manager.completed_paper_years()),
             message="reusing previously completed checkpoint units",
         )
+        if checkpoint_info.get("compatibility_notes"):
+            progress.event(
+                "checkpoint_bridge_notes",
+                stage="startup",
+                message=" | ".join(str(note) for note in checkpoint_info.get("compatibility_notes", [])),
+            )
     progress.event("run_started", stage="startup", message="replication started")
     result: Optional[ReplicationResult] = None
     resource_plan: Optional[ResourcePlan] = None
@@ -5108,7 +5449,14 @@ def run_cn_replication(
         progress.event(
             "run_failed",
             stage=progress.snapshot_state().get("stage", "failed"),
-            message=f"{type(exc).__name__}: {exc}",
+            completed_years=len(checkpoint_manager.completed_paper_years()),
+            total_years=int(checkpoint_manager.state.get("paper_total_years", 0) or 0),
+            message=(
+                f"{type(exc).__name__}: {exc}; "
+                f"rolling_reused={len(checkpoint_manager.completed_rolling_chunks())}; "
+                f"paper_reused={len(checkpoint_manager.completed_paper_years())}; "
+                f"pending_paper_years={','.join(str(year) for year in checkpoint_manager.pending_paper_years) or 'none'}"
+            ),
         )
         checkpoint_manager.mark_failed(stage=str(progress.snapshot_state().get("stage", "failed")))
         raise
