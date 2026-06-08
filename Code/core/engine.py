@@ -4956,6 +4956,10 @@ def export_replication_outputs(
             ) if result.pipeline.pca_cont_display is not None else 0,
             "g_fn": result.pipeline.g_fn,
             "gamma": result.pipeline.gamma,
+            "interpretation_note": (
+                "These are full-sample pipeline factor counts. "
+                "Figure 1/2 use yearly paper_factor_counts diagnostics instead."
+            ),
         },
         "sharpes": result.pipeline.sharpes,
         "panel_return_scheme": result.panel.panel_return_scheme,
@@ -5009,6 +5013,8 @@ def export_replication_outputs(
                 "K_jump_hat": result.pipeline.K_jump_hat,
                 "g_fn": result.pipeline.g_fn,
                 "gamma": result.pipeline.gamma,
+                "scope_note": "full_sample_pipeline_only",
+                "figure_1_2_source": "yearly_paper_factor_counts",
             }
         ]
         ),
