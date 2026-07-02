@@ -4,6 +4,7 @@ __pycache__/
 /Data/fact_Data/
 /Data/proc_Data/
 /Data/external_Data/
+/Data
 .hf_cache/
 replication_output*/
 replay_pid*

@@ -71,6 +71,21 @@ def _size_value_start() -> Optional[pd.Timestamp]:
         return None
 
 
+_INDUSTRY_EN_LABELS = {
+    "必需消费": "Staples",
+    "大金融": "Financials",
+    "电力设备与新能源": "Power/NewEn",
+    "房地产与建筑": "RealEstate/Build",
+    "高端制造": "AdvMfg",
+    "公用事业与交运": "Utilities/Trans",
+    "科技成长": "TechGrowth",
+    "可选消费与服务": "Discretionary",
+    "农林牧渔": "Agriculture",
+    "医药生物": "Healthcare",
+    "周期资源": "CyclicalRes",
+}
+
+
 # PAPER_TAIL_VERSION 提升以触发尾部缓存重建（应用本批论文保真修复）。
 PAPER_TAIL_VERSION = 5
 PAPER_TAIL_ALGORITHM_VERSION = "paper_faithful_v3"
@@ -1124,6 +1139,54 @@ def _drop_invalid_rows(lhs: np.ndarray, rhs: np.ndarray) -> Tuple[np.ndarray, np
     return lhs_use[mask], rhs_use[mask]
 
 
+def _orthogonal_rotation(source: np.ndarray, target: np.ndarray) -> Tuple[np.ndarray, Dict[str, Any]]:
+    src = np.asarray(source, dtype=float)
+    tgt = np.asarray(target, dtype=float)
+    if src.ndim != 2 or tgt.ndim != 2:
+        raise ValueError("source and target must both be two-dimensional matrices.")
+    k = min(src.shape[1], tgt.shape[1])
+    src = src[:, :k]
+    tgt = tgt[:, :k]
+    valid = np.isfinite(src).all(axis=1) & np.isfinite(tgt).all(axis=1)
+    if valid.sum() < max(2, k):
+        q = np.eye(k, dtype=float)
+        return q, {
+            "valid_rows": int(valid.sum()),
+            "orthogonality_error": 0.0,
+            "alignment_rmse": np.nan,
+            "used_identity": True,
+        }
+    x = src[valid]
+    y = tgt[valid]
+    u, _, vt = np.linalg.svd(x.T @ y, full_matrices=False)
+    q = u @ vt
+    aligned = x @ q
+    return q, {
+        "valid_rows": int(valid.sum()),
+        "orthogonality_error": float(np.linalg.norm(q.T @ q - np.eye(k), ord="fro")),
+        "alignment_rmse": float(np.sqrt(np.nanmean((aligned - y) ** 2))),
+        "used_identity": False,
+    }
+
+
+def _continuous_factor_segments_from_panel(panel: Any, *, jump_a: float, k: int) -> Dict[str, Any]:
+    import core.engine as eng
+
+    r_cont, _ = eng.detect_jumps(panel, a=float(jump_a))
+    pca = eng._panel_pca(r_cont, K=int(k), use_corr=True)
+    eng.orient_pca_result(pca)
+    weights = eng.factor_portfolio_weights(pca)
+    return {
+        "pca": pca,
+        "weights": weights,
+        "intraday": np.asarray(panel.R_intra @ weights, dtype=float),
+        "overnight": np.asarray(panel.R_night @ weights, dtype=float),
+        "daily": np.asarray(panel.R_daily @ weights, dtype=float),
+        "n_symbols": int(panel.N),
+        "n_days": int(panel.D),
+    }
+
+
 def _build_table_iii(
     result: Any,
     *,
@@ -1633,6 +1696,71 @@ def _build_unbalanced_pca_segments(proc_root: Path, sample_dates: pd.DatetimeInd
     return {seg: np.nan_to_num(M[seg], nan=0.0) @ W for seg in SEGMENT_ORDER}
 
 
+def _build_yearly_aligned_unbalanced_pca_segments(
+    result: Any,
+    *,
+    proc_root: Path,
+    sample_dates: pd.DatetimeIndex,
+    k: int = 4,
+) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
+    import core.engine as eng
+
+    baseline = {
+        "intraday": np.asarray(result.pipeline.F_cont_display_daily_intra, dtype=float),
+        "overnight": np.asarray(result.pipeline.F_cont_display_daily_night, dtype=float),
+        "daily": np.asarray(result.pipeline.F_cont_display_daily_total, dtype=float),
+    }
+    k_use = min(int(k), int(baseline["daily"].shape[1]))
+    out = {segment: np.full((len(sample_dates), k_use), np.nan, dtype=float) for segment in SEGMENT_ORDER}
+    diagnostics: Dict[str, Any] = {
+        "factor_set_label": "Continuous PCA (unbalanced, yearly aligned)",
+        "alignment_steps": [
+            "year-specific balanced changing-universe -> same-year fixed intersection",
+            "same-year fixed intersection -> global fixed-intersection baseline",
+        ],
+        "years": [],
+    }
+
+    years = sorted({int(date.year) for date in sample_dates})
+    for year in years:
+        year_mask = np.array([int(date.year) == int(year) for date in sample_dates], dtype=bool)
+        fixed_year_panel = eng.subset_panel_by_years(result.panel, [int(year)])
+        changing_year_panel = eng.load_proc_hf_panel(
+            proc_root=proc_root,
+            sample_mode=eng.STRICT_BALANCED_SAMPLE,
+            years=[int(year)],
+            return_mode=result.panel.requested_return_mode or "open_close",
+        )
+        fixed_segments = _continuous_factor_segments_from_panel(
+            fixed_year_panel,
+            jump_a=float(result.pipeline.jump_a),
+            k=k_use,
+        )
+        changing_segments = _continuous_factor_segments_from_panel(
+            changing_year_panel,
+            jump_a=float(result.pipeline.jump_a),
+            k=k_use,
+        )
+        global_year_daily = baseline["daily"][year_mask, :k_use]
+        q1, diag1 = _orthogonal_rotation(changing_segments["daily"][:, :k_use], fixed_segments["daily"][:, :k_use])
+        q2, diag2 = _orthogonal_rotation(fixed_segments["daily"][:, :k_use], global_year_daily)
+        q_total = q1 @ q2
+        for segment in SEGMENT_ORDER:
+            out[segment][year_mask, :] = np.asarray(changing_segments[segment][:, :k_use] @ q_total, dtype=float)
+        diagnostics["years"].append(
+            {
+                "year": int(year),
+                "n_symbols_unbalanced": int(changing_segments["n_symbols"]),
+                "n_symbols_fixed": int(fixed_segments["n_symbols"]),
+                "n_days": int(changing_segments["n_days"]),
+                "step1": diag1,
+                "step2": diag2,
+                "composite_orthogonality_error": float(np.linalg.norm(q_total.T @ q_total - np.eye(q_total.shape[1]), ord="fro")),
+            }
+        )
+    return out, diagnostics
+
+
 def _build_figure13_data(
     result: Any,
     *,
@@ -1659,7 +1787,7 @@ def _build_figure13_data(
     # P-Fig13：补“Continuous PCA (unbalanced)”行（若全市场非平衡因子可用）。
     if pca_unbalanced is not None:
         ub_names = [f"Factor {idx}" for idx in range(1, min(4, pca_unbalanced["daily"].shape[1]) + 1)]
-        factor_set_specs.append(("Continuous PCA (unbalanced)", pca_unbalanced, ub_names))
+        factor_set_specs.append(("Continuous PCA (unbalanced, yearly aligned)", pca_unbalanced, ub_names))
     factor_set_specs.append(("FFC 4-factor", ffc, ffc_names))
     for factor_set, mats, factor_names in factor_set_specs:
         # P11（论文 Figure 13 caption：“normalized by their DAILY standard deviation”）：
@@ -2004,6 +2132,38 @@ def refresh_paper_tail_views(
     return payload
 
 
+def _short_asset_label(asset: Any, max_len: int = 18) -> str:
+    raw = str(asset)
+    return raw if len(raw) <= max_len else f"{raw[: max_len - 1]}..."
+
+
+def _asset_label_map(values: Any) -> Dict[str, str]:
+    try:
+        unique = sorted({str(x) for x in pd.Series(values).dropna().tolist()})
+    except Exception:
+        unique = []
+    mapping: Dict[str, str] = {}
+    for idx, raw in enumerate(unique, start=1):
+        if raw in {"BH", "BL", "BM", "SH", "SL", "SM"}:
+            mapping[raw] = raw
+        elif raw in _INDUSTRY_EN_LABELS:
+            mapping[raw] = f"I{idx:02d}"
+        else:
+            try:
+                raw.encode("ascii")
+                mapping[raw] = _short_asset_label(raw)
+            except UnicodeEncodeError:
+                mapping[raw] = f"I{idx:02d}"
+    return mapping
+
+
+def _plot_asset_label(asset: Any, label_map: Mapping[str, str]) -> str:
+    raw = str(asset)
+    if raw in label_map:
+        return label_map[raw]
+    return _short_asset_label(raw)
+
+
 def render_figure_12(result: Any, output_path: Path, title: str) -> None:
     from core.engine import _atomic_save_figure, _save_placeholder_figure
 
@@ -2037,6 +2197,7 @@ def render_figure_12(result: Any, output_path: Path, title: str) -> None:
             if keep.dtype != bool:
                 keep = keep.astype(str).str.lower().isin({"1", "true", "yes"})
             sub = sub.loc[keep].copy()
+        label_map = _asset_label_map(sub["asset"]) if group == "industry_portfolios" and "asset" in sub.columns else {}
         title_group = gtitle.format(n_industry=n_industry) if "{n_industry}" in gtitle else gtitle
         if sub.empty:
             ax.set_title(title_group)
@@ -2060,7 +2221,12 @@ def render_figure_12(result: Any, output_path: Path, title: str) -> None:
         ax.set_ylabel("Expected overnight excess return")
         if len(sub) <= 16:
             for _, row in sub.iterrows():
-                ax.annotate(str(row["asset"]), (row["mean_intraday_excess"], row["mean_overnight_excess"]), fontsize=7, alpha=0.8)
+                ax.annotate(
+                    _plot_asset_label(row["asset"], label_map),
+                    (row["mean_intraday_excess"], row["mean_overnight_excess"]),
+                    fontsize=7,
+                    alpha=0.8,
+                )
     fig.suptitle(title)
     fig.tight_layout(rect=(0, 0, 1, 0.95))
     _atomic_save_figure(fig, output_path, dpi=170)
@@ -2084,7 +2250,7 @@ def render_figure_13(result: Any, output_path: Path, title: str) -> None:
     # 论文 Figure 13：行=因子集（PCA / PCA-unbalanced / FFC），列=频段，每子图画各因子归一化累计收益。
     seg_cols = ["intraday", "overnight", "daily"]
     seg_label = {"intraday": "Intraday", "overnight": "Overnight", "daily": "Daily"}
-    preferred = ["Continuous PCA", "Continuous PCA (unbalanced)", "FFC 4-factor"]
+    preferred = ["Continuous PCA", "Continuous PCA (unbalanced, yearly aligned)", "Continuous PCA (unbalanced)", "FFC 4-factor"]
     present = list(df["factor_set"].unique()) if "factor_set" in df.columns else []
     factor_sets = [fs for fs in preferred if fs in present] or preferred
     fig, axes = plt.subplots(len(factor_sets), 3, figsize=(16, 4.6 * len(factor_sets)), sharex=True)
@@ -2126,6 +2292,7 @@ def _render_pricing_figure(df: pd.DataFrame, output_path: Path, title: str) -> N
     seg_cols = ["daily", "intraday", "overnight"]  # 论文列序
     seg_label = {"daily": "Daily", "intraday": "Intraday", "overnight": "Overnight"}
     set_label = {"Continuous PCA": "PCA", "FFC 4-factor": "Fama-French-Carhart"}
+    asset_label_map = _asset_label_map(df["asset"]) if "asset" in df.columns else {}
     # 论文 Figure 14/15：Panel A（预测 vs 预期散点，2 行模型 × 3 列频段）在上，
     # Panel B（各资产时序定价误差 alpha 柱状，2 行 × 3 列）在下。
     fig, axes = plt.subplots(4, 3, figsize=(16, 16))
@@ -2142,6 +2309,16 @@ def _render_pricing_figure(df: pd.DataFrame, output_path: Path, title: str) -> N
             pad = max(1e-4, 0.08 * max(abs(lo), abs(hi), 1e-4))
             ax.scatter(ex, pr, facecolors="none", edgecolors="#1f5fbf", linewidths=1.0, s=42, alpha=0.85)
             ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], color="0.5", linestyle="--", linewidth=1.0)  # 45°
+            if len(sub) <= 16:
+                for _, row in sub.iterrows():
+                    ax.annotate(
+                        _plot_asset_label(row["asset"], asset_label_map),
+                        (row["expected_return"], row["predicted_return"]),
+                        fontsize=6,
+                        alpha=0.75,
+                        xytext=(3, 3),
+                        textcoords="offset points",
+                    )
             ax.set_title(f"{seg_label[segment]} {set_label[factor_set]}", fontsize=9)
             ax.set_xlabel("Expected return"); ax.set_ylabel("Predicted return")
             ax.grid(True, alpha=0.2)
@@ -2159,12 +2336,19 @@ def _render_pricing_figure(df: pd.DataFrame, output_path: Path, title: str) -> N
             ax.set_title(f"{seg_label[segment]} {set_label[factor_set]}", fontsize=9)
             ax.set_ylabel("Pricing error")
             ax.set_xticks(xpos)
-            ax.set_xticklabels([str(a) for a in subb["asset"].tolist()], fontsize=6, rotation=90 if len(subb) > 8 else 0)
+            ax.set_xticklabels(
+                [_plot_asset_label(asset, asset_label_map) for asset in subb["asset"].tolist()],
+                fontsize=6,
+                rotation=90 if len(subb) > 8 else 0,
+            )
             ax.grid(True, axis="y", alpha=0.2)
-    fig.text(0.5, 0.985, "Panel A: Predicted Returns", ha="center", fontsize=12, weight="bold")
-    fig.text(0.5, 0.495, "Panel B: Pricing Errors", ha="center", fontsize=12, weight="bold")
-    fig.suptitle(title, y=1.0, fontsize=11)
-    fig.tight_layout(rect=(0, 0, 1, 0.965))
+    title_lines = str(title).count("\n") + 1
+    panel_a_y = 0.940 if title_lines > 1 else 0.965
+    top_rect = 0.900 if title_lines > 1 else 0.935
+    fig.text(0.5, panel_a_y, "Panel A: Predicted Returns", ha="center", fontsize=12, weight="bold")
+    fig.text(0.5, 0.462, "Panel B: Pricing Errors", ha="center", fontsize=12, weight="bold")
+    fig.suptitle(title, y=0.995, fontsize=11)
+    fig.tight_layout(rect=(0.02, 0.02, 0.98, top_rect))
     _atomic_save_figure(fig, output_path, dpi=170)
     plt.close(fig)
 

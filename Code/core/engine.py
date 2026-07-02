@@ -3469,6 +3469,8 @@ def _factor_count_rows_for_panel(
             "panel_block": panel_block,
             "year": year,
             "return_component": return_component,
+            "n_symbols": int(panel.N),
+            "n_days": int(panel.D),
             "K_hat": int(max(1, K_hat)),
             "g_fn": g_fn,
             "gamma": float(gamma),
@@ -4360,6 +4362,116 @@ def build_paper_factor_counts_comparison(
         workers=workers,
         max_stocks=max_stocks,
     ).factor_counts
+
+
+_SUBMISSION_FIGURE_DIAGNOSTICS = {
+    1: "figure1_yearwise_balanced_changing_universe_diagnostics.csv",
+    2: "figure2_fixed_intersection_yearly_diagnostics.csv",
+}
+
+
+def _result_proc_root(result: ReplicationResult) -> Path:
+    proc_root = (result.panel.sample_report or {}).get("proc_root")
+    return _ensure_path(proc_root or DEFAULT_PROC_ROOT)
+
+
+def _result_diagnostics_dir(result: ReplicationResult) -> Path:
+    runtime_root = Path(getattr(result, "runtime_root", None) or result.output_root)
+    diagnostics_dir = runtime_root / "diagnostics"
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    return diagnostics_dir
+
+
+def build_submission_figure1_factor_counts(
+    result: ReplicationResult,
+    *,
+    max_stocks: Optional[int] = None,
+) -> pd.DataFrame:
+    """Submission Figure 1: year-specific balanced panels with changing N."""
+    proc_root = _result_proc_root(result)
+    years = sorted({date.year for date in result.panel.dates})
+    rows: List[Dict[str, Any]] = []
+    for year in years:
+        year_panel = load_proc_hf_panel(
+            proc_root=proc_root,
+            sample_mode=STRICT_BALANCED_SAMPLE,
+            years=[int(year)],
+            return_mode=result.panel.requested_return_mode or "open_close",
+            max_stocks=max_stocks,
+        )
+        rows.extend(
+            _factor_count_rows_for_panel(
+                year_panel,
+                panel_block="Yearwise balanced, changing universe",
+                jump_a=float(result.pipeline.jump_a),
+                k_max=int(result.pipeline.K_max),
+                gamma=float(result.pipeline.gamma),
+                g_fn=str(result.pipeline.g_fn),
+            )
+        )
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values(["year", "return_component"]).reset_index(drop=True)
+        df["figure_number"] = 1
+        df["sample_semantics"] = "cross-year unbalanced / within-year balanced"
+    return df
+
+
+def build_submission_figure2_factor_counts(
+    result: ReplicationResult,
+    *,
+    max_stocks: Optional[int] = None,
+) -> pd.DataFrame:
+    """Submission Figure 2: fixed full-sample strict intersection, sliced yearly."""
+    proc_root = _result_proc_root(result)
+    years = sorted({date.year for date in result.panel.dates})
+    full_panel = load_proc_hf_panel(
+        proc_root=proc_root,
+        sample_mode=STRICT_BALANCED_SAMPLE,
+        years=None,
+        return_mode=result.panel.requested_return_mode or "open_close",
+        max_stocks=max_stocks,
+    )
+    rows: List[Dict[str, Any]] = []
+    for year in years:
+        year_panel = subset_panel_by_years(full_panel, [int(year)])
+        rows.extend(
+            _factor_count_rows_for_panel(
+                year_panel,
+                panel_block="Fixed-intersection yearly slices",
+                jump_a=float(result.pipeline.jump_a),
+                k_max=int(result.pipeline.K_max),
+                gamma=float(result.pipeline.gamma),
+                g_fn=str(result.pipeline.g_fn),
+            )
+        )
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values(["year", "return_component"]).reset_index(drop=True)
+        df["figure_number"] = 2
+        df["sample_semantics"] = "fixed full-sample intersection / yearly slices"
+    return df
+
+
+def load_or_build_submission_figure_factor_counts(
+    result: ReplicationResult,
+    figure_number: int,
+) -> pd.DataFrame:
+    file_name = _SUBMISSION_FIGURE_DIAGNOSTICS.get(int(figure_number))
+    if file_name is None:
+        raise ValueError(f"Unsupported submission factor-count diagnostic figure: {figure_number}")
+    diagnostics_path = _result_diagnostics_dir(result) / file_name
+    if diagnostics_path.exists():
+        cached = pd.read_csv(diagnostics_path)
+        required_cols = {"year", "return_component", "K_hat", "n_symbols", "n_days"}
+        if required_cols.issubset(set(cached.columns)):
+            return cached
+    if int(figure_number) == 1:
+        df = build_submission_figure1_factor_counts(result)
+    else:
+        df = build_submission_figure2_factor_counts(result)
+    _atomic_to_csv(df, diagnostics_path, index=False, encoding="utf-8-sig")
+    return df
 
 
 def build_factor_sharpe_table(pipe: PelgerPipeline) -> pd.DataFrame:

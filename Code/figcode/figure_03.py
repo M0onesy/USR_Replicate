@@ -34,6 +34,31 @@ from core.runner import run_standalone
 TAG = "figure_03"
 FIGURE_NUMBER = 3
 
+_INDUSTRY_EN_LABELS = {
+    "必需消费": "Staples",
+    "大金融": "Financials",
+    "电力设备与新能源": "Power/NewEn",
+    "房地产与建筑": "RealEstate/Build",
+    "高端制造": "AdvMfg",
+    "公用事业与交运": "Utilities/Trans",
+    "科技成长": "TechGrowth",
+    "可选消费与服务": "Discretionary",
+    "农林牧渔": "Agriculture",
+    "医药生物": "Healthcare",
+    "周期资源": "CyclicalRes",
+}
+
+
+def _industry_display_label(name: str, label_index: dict[str, int]) -> str:
+    raw = str(name)
+    if raw in _INDUSTRY_EN_LABELS:
+        return _INDUSTRY_EN_LABELS[raw]
+    try:
+        raw.encode("ascii")
+        return raw[:18]
+    except UnicodeEncodeError:
+        return f"IND{label_index.get(raw, 0):02d}"
+
 
 def plot_weight_heatmap(df, title: str, output_path: Path) -> None:
     """复刻 engine 内 weight_heatmap：长表 -> 因子×股票矩阵 -> 热图（按 symbol 排，回退用）。"""
@@ -89,7 +114,7 @@ def plot_industry_sorted_bars(W, tickers, industry_lookup: dict, k_count: int, t
     bar_colors = [color_of[ind_sorted[j]] for j in range(len(order))]
     x = np.arange(len(order))
 
-    fig, axes = plt.subplots(k_count, 1, figsize=(12, 2.6 * k_count + 0.6), sharex=True)
+    fig, axes = plt.subplots(k_count, 1, figsize=(13.0, 2.6 * k_count + 0.8), sharex=True)
     if k_count == 1:
         axes = [axes]
     for k in range(k_count):
@@ -113,10 +138,22 @@ def plot_industry_sorted_bars(W, tickers, industry_lookup: dict, k_count: int, t
     # 行业色例（图右侧）
     if industry_lookup:
         from matplotlib.patches import Patch
-        handles = [Patch(facecolor=color_of[name], label=name) for name in uniq]
-        fig.legend(handles=handles, loc="center left", bbox_to_anchor=(1.0, 0.5), fontsize=7, frameon=False)
+        label_index = {name: idx for idx, name in enumerate(uniq, start=1)}
+        handles = [
+            Patch(facecolor=color_of[name], label=_industry_display_label(name, label_index))
+            for name in uniq
+        ]
+        fig.legend(
+            handles=handles,
+            loc="center left",
+            bbox_to_anchor=(0.835, 0.5),
+            fontsize=7,
+            frameon=False,
+            title="Industry",
+            title_fontsize=8,
+        )
     fig.suptitle(title, y=0.995, fontsize=11)
-    fig.tight_layout(rect=(0, 0, 0.86 if industry_lookup else 1.0, 0.98))
+    fig.tight_layout(rect=(0, 0, 0.82 if industry_lookup else 1.0, 0.975))
     _atomic_save_figure(fig, output_path, dpi=160)
     plt.close(fig)
 

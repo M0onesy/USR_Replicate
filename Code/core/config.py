@@ -16,6 +16,11 @@ DEFAULT_INDUSTRY_INFO_FILENAME = "stock_full_info_std_industry_final.csv"
 DEFAULT_INDUSTRY_MAPPING_FILENAME = "行业映射表_终版.csv"
 VALID_BALANCED_MODES = {STRICT_BALANCED_SAMPLE, PAPER_LENIENT_SAMPLE}
 VALID_PAPER_TAIL_WEIGHTINGS = {"value_weighted", "equal_weighted"}
+SUBMISSION_FROZEN_INDUSTRIES = (
+    "大金融",
+    "医药生物",
+    "周期资源",
+)
 
 
 def _ensure_path(value: str | Path) -> Path:
@@ -173,6 +178,7 @@ class MainLaunchProfile:
     paper_tail_weighting: str = "value_weighted"
     refresh_paper_tail: bool = True
     strict_final_export: bool = False
+    industry_factors_frozen: Optional[List[str]] = None
     industry_info_filename: str = DEFAULT_INDUSTRY_INFO_FILENAME
     industry_mapping_filename: str = DEFAULT_INDUSTRY_MAPPING_FILENAME
 
@@ -226,6 +232,28 @@ MAIN_RUN_PROFILES: Dict[str, MainLaunchProfile] = {
         heartbeat_sec=5.0,
         balanced_mode=STRICT_BALANCED_SAMPLE,
     ),
+    "submission_core_export": MainLaunchProfile(
+        task_selectors=("fig1", "fig2", "fig4", "fig7", "fig10", "fig12", "fig13", "fig14", "fig15"),
+        rebuild_result=False,
+        restart=False,
+        fail_fast=True,
+        heartbeat_sec=5.0,
+        balanced_mode=STRICT_BALANCED_SAMPLE,
+        strict_final_export=True,
+        refresh_paper_tail=False,
+        industry_factors_frozen=list(SUBMISSION_FROZEN_INDUSTRIES),
+    ),
+    "submission_core_rebuild_explicit": MainLaunchProfile(
+        task_selectors=("fig1", "fig2", "fig4", "fig7", "fig10", "fig12", "fig13", "fig14", "fig15"),
+        rebuild_result=True,
+        restart=False,
+        fail_fast=True,
+        heartbeat_sec=5.0,
+        balanced_mode=STRICT_BALANCED_SAMPLE,
+        strict_final_export=True,
+        refresh_paper_tail=False,
+        industry_factors_frozen=list(SUBMISSION_FROZEN_INDUSTRIES),
+    ),
 }
 
 # legacy profile aliases
@@ -259,11 +287,10 @@ MAIN_RUN_PROFILES["final_paper_export_hpc_96g"] = replace(
 )
 MAIN_RUN_PROFILES["final_paper_export_hpc"] = MAIN_RUN_PROFILES["final_paper_export_hpc_64g"]
 
-# Safe default: keep strict final-export semantics and preserve compatible
-# checkpoints. On the high-compute platform, switch this to
-# `final_paper_export_hpc`, `final_paper_export_hpc_48g`, or
-# `final_paper_export_hpc_96g` as needed.
-ACTIVE_MAIN_PROFILE = "final_paper_export_resume"
+# Safe default for deadline submission exports. This profile never builds a
+# ReplicationResult from main.py; use export_submission_core_fast.py for the
+# strict lightweight figure path, or switch explicitly to a rebuild profile.
+ACTIVE_MAIN_PROFILE = "submission_core_export"
 
 
 def available_main_profile_names() -> List[str]:
@@ -352,6 +379,7 @@ def profile_to_run_config(profile: MainLaunchProfile, *, save_plots: bool) -> Ru
         paper_tail_weighting=profile.paper_tail_weighting,
         refresh_paper_tail=profile.refresh_paper_tail,
         strict_final_export=profile.strict_final_export,
+        industry_factors_frozen=list(profile.industry_factors_frozen) if profile.industry_factors_frozen else None,
         industry_info_filename=profile.industry_info_filename,
         industry_mapping_filename=profile.industry_mapping_filename,
         save_plots=save_plots,
