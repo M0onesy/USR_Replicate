@@ -1,32 +1,22 @@
-"""
-figcode/figure_07.py
-====================
-
-Figure 7 —— Locally Estimated Continuous Factors（局部估计的连续因子）
-
-论文含义：
-  聚焦前几个（最多 4 个）主因子的局部 vs 全局广义相关性轨迹。相比 Figure 6 画全部
-  GC 序列，这里只看主因子，更清楚地展示"最重要的几个连续因子在时间上有多稳定"。
-
-数据来源：
-  与 Figure 6 同源（滚动 GC 表），但只取前 min(4, 序列数) 条 gc_* 列。
-"""
-
 from __future__ import annotations
 
-# --- 允许 `python figcode/xxx.py` / `python tablecode/xxx.py` 直接运行时找到 core 包 ---
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
-
+import os as _os
+import sys as _sys
 from pathlib import Path
+
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
 from core.config import RunConfig
 from core.engine import ReplicationResult
 from core.io_utils import (
-    figure_path, figure_title, get_rolling_frames, gc_columns,
-    _save_line_plot, _save_placeholder_figure,
+    _save_line_plot,
+    _save_placeholder_figure,
+    figure_path,
+    figure_title,
+    gc_columns,
+    get_rolling_frames,
 )
-from core.logging_utils import log_step, log_render
+from core.logging_utils import log_render, log_step
 from core.runner import run_standalone
 
 TAG = "figure_07"
@@ -37,27 +27,26 @@ def generate(result: ReplicationResult, cfg: RunConfig) -> Path:
     title = figure_title(FIGURE_NUMBER)
     output_path = figure_path(result, FIGURE_NUMBER)
 
-    # 论文形态优先（自洽滚动计算 figcode/_timevar）；失败回退旧绘图。
     try:
         from figcode._timevar import render_fig7
-        log_render(TAG, "按论文形态绘制（7 因子权重 GC，自洽滚动计算）")
+
+        log_render(TAG, "Rendering Figure 7 with the local-vs-global weight generalized-correlation implementation.")
         render_fig7(result, cfg, output_path, title)
         return output_path
-    except Exception as _exc:
-        log_render(TAG, f"论文形态绘制失败，回退旧实现: {_exc!r}")
+    except Exception as exc:
+        log_render(TAG, f"Paper-style renderer failed; falling back to cached rolling GC lines: {exc!r}")
 
-    # ---------------- 数据处理 ----------------
-    log_step(TAG, "还原滚动 GC 表，并取前 4 个主因子的 GC 序列")
+    log_step(TAG, "Loading rolling generalized-correlation diagnostics.")
     rolling_gc_df, _ = get_rolling_frames(result)
     gc_cols = gc_columns(rolling_gc_df)
-    top_cols = gc_cols[: min(4, len(gc_cols))]
-    log_step(TAG, f"窗口数 {len(rolling_gc_df)}，选取主因子 GC 序列 {len(top_cols)} 条")
+    top_cols = gc_cols[: min(7, len(gc_cols))]
+    log_step(TAG, f"Fallback uses {len(top_cols)} continuous-factor GC lines from a 21-trading-day window summary.")
 
-    # ---------------- 图表输出 ----------------
-    log_render(TAG, "绘制前 4 个连续因子的局部-全局 GC 曲线")
     if rolling_gc_df.empty or not top_cols:
         _save_placeholder_figure(output_path, title, "No rolling generalized-correlation data are available.")
         return output_path
+
+    log_render(TAG, "Drawing the top 7 local-vs-global continuous-factor generalized-correlation lines.")
     _save_line_plot(rolling_gc_df, "window_index", top_cols, title, output_path, ylabel="Generalized correlation")
     return output_path
 

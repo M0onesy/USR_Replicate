@@ -1,15 +1,3 @@
-"""
-figcode/figure_01.py
-====================
-
-Figure 1 —— Number of High-Frequency Factors, Unbalanced Panel
-（非平衡面板下的高频因子个数诊断）
-
-论文含义：
-  论文用“扰动特征值比 (perturbed eigenvalue ratio)”来估计因子个数 K。
-  实际显著因子个数由最后一个满足 ER_k > 1 + gamma 的 k 决定，而不是只看最大的 ER_1。
-"""
-
 from __future__ import annotations
 
 import os as _os
@@ -22,18 +10,22 @@ import pandas as pd
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
 from core.config import RunConfig
-from core.engine import ReplicationResult
+from core.engine import ReplicationResult, load_or_build_submission_figure_factor_counts
 from core.io_utils import _atomic_save_figure, _save_placeholder_figure, figure_path, figure_title
 from core.logging_utils import log_render, log_step
 from core.runner import run_standalone
 
 TAG = "figure_01"
 FIGURE_NUMBER = 1
-PANEL_BLOCK = "Unbalanced panel"
+PANEL_BLOCK = "Yearwise balanced, changing universe"
 
 
 def _build_significance_summary(df: pd.DataFrame, panel_block: str) -> tuple[pd.DataFrame, float]:
-    sub = df.loc[df["panel_block"].eq(panel_block) & df["return_component"].eq("hf")].copy()
+    sub = df.copy()
+    if "panel_block" in sub.columns and sub["panel_block"].eq(panel_block).any():
+        sub = sub.loc[sub["panel_block"].eq(panel_block)].copy()
+    if "return_component" in sub.columns:
+        sub = sub.loc[sub["return_component"].eq("hf")].copy()
     er_cols = [col for col in sub.columns if col.startswith("er_")]
     if sub.empty or not er_cols:
         return pd.DataFrame(), 1.08
@@ -54,6 +46,7 @@ def _build_significance_summary(df: pd.DataFrame, panel_block: str) -> tuple[pd.
             {
                 "panel_block": str(panel_block),
                 "year": int(row["year"]),
+                "n_symbols": int(row["n_symbols"]) if "n_symbols" in row and pd.notna(row["n_symbols"]) else np.nan,
                 "K_hat": int(row["K_hat"]),
                 "gamma": float(gamma),
                 "critical_value": float(crit),
@@ -74,11 +67,7 @@ def _plot_er_panel(df: pd.DataFrame, panel_block: str, title: str, output_path: 
     summary_df, crit = _build_significance_summary(df, panel_block)
     er_cols = [col for col in summary_df.columns if col.startswith("er_")]
     if summary_df.empty or not er_cols:
-        _save_placeholder_figure(
-            output_path,
-            title,
-            f"No HF perturbed eigenvalue-ratio data are available for {panel_block.lower()}.",
-        )
+        _save_placeholder_figure(output_path, title, "No HF perturbed eigenvalue-ratio data are available.")
         return pd.DataFrame()
 
     years = summary_df["year"].tolist()
@@ -89,7 +78,7 @@ def _plot_er_panel(df: pd.DataFrame, panel_block: str, title: str, output_path: 
     fig, axes = plt.subplots(
         nrows,
         2,
-        figsize=(12.8, max(3.2 * nrows, 3.6)),
+        figsize=(13.0, max(3.3 * nrows, 3.8)),
         sharex="col",
         gridspec_kw={"width_ratios": [1.45, 1.0]},
     )
@@ -105,7 +94,8 @@ def _plot_er_panel(df: pd.DataFrame, panel_block: str, title: str, output_path: 
             year = int(row["year"])
             k_hat = int(row["K_hat"])
             max_k = int(row["max_k_above_critical"])
-            label = f"{year} (K={k_hat})"
+            n_symbols = int(row["n_symbols"]) if pd.notna(row.get("n_symbols")) else None
+            label = f"{year} (K={k_hat}" + (f", N={n_symbols})" if n_symbols is not None else ")")
             line_full, = ax_full.plot(x, y, marker="o", linewidth=1.4, label=label)
             ax_zoom.plot(x, y, marker="o", linewidth=1.4, color=line_full.get_color(), label=label)
             if 0 < max_k <= len(y):
@@ -156,25 +146,18 @@ def _write_significance_summary(result: ReplicationResult, panel_block: str, sum
     summary_path = diagnostics_dir / f"{tag}_significance_summary.csv"
     summary_df.to_csv(summary_path, index=False, encoding="utf-8-sig")
     gt_one = int((summary_df["K_hat"] > 1).sum())
-    log_step(
-        tag,
-        (
-            f"已写出显著性摘要 {summary_path.name}；"
-            f"{panel_block} HF 中 K>1 的年份 {gt_one}/{len(summary_df)}。"
-        ),
-    )
+    log_step(tag, f"wrote {summary_path.name}; years with K>1: {gt_one}/{len(summary_df)} for {panel_block}")
 
 
 def generate(result: ReplicationResult, cfg: RunConfig) -> Path:
     title = figure_title(FIGURE_NUMBER)
     output_path = figure_path(result, FIGURE_NUMBER)
 
-    log_step(TAG, f"读取 paper_factor_counts，过滤 {PANEL_BLOCK} / HF 行")
-    df = result.paper_factor_counts.copy()
-    n_rows = int(df.loc[df.get("panel_block", "").eq(PANEL_BLOCK)].shape[0]) if not df.empty else 0
-    log_step(TAG, f"非平衡面板候选行数: {n_rows}")
+    log_step(TAG, "Loading submission-specific yearly diagnostics for Figure 1.")
+    df = load_or_build_submission_figure_factor_counts(result, FIGURE_NUMBER)
+    log_step(TAG, f"Figure 1 diagnostic rows: {len(df)}")
 
-    log_render(TAG, "绘制逐年扰动特征值比图，并突出 ER_k > 1+gamma 的显著因子个数")
+    log_render(TAG, "Rendering Figure 1 with cross-year unbalanced but within-year balanced yearly panels.")
     summary_df = _plot_er_panel(df, PANEL_BLOCK, title, output_path)
     _write_significance_summary(result, PANEL_BLOCK, summary_df, tag=TAG)
     return output_path

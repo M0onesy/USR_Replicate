@@ -72,8 +72,8 @@ def _size_value_start() -> Optional[pd.Timestamp]:
 
 
 # PAPER_TAIL_VERSION 提升以触发尾部缓存重建（应用本批论文保真修复）。
-PAPER_TAIL_VERSION = 5
-PAPER_TAIL_ALGORITHM_VERSION = "paper_faithful_v3"
+PAPER_TAIL_VERSION = 6
+PAPER_TAIL_ALGORITHM_VERSION = "paper_faithful_v4_submission"
 PORTFOLIO_ORDER = ["SL", "SM", "SH", "BL", "BM", "BH"]
 # N7：Figure 12 分组标题里的行业/规模组合数改为动态填充（新映射 11 桶）。
 GROUP_TITLES = {
@@ -82,10 +82,31 @@ GROUP_TITLES = {
     "industry_portfolios": "{n_industry} Industry Portfolios",
     "size_value_portfolios": "6 Size/Value Portfolios",
 }
-FIG13_FACTORSET_ORDER = ["Continuous PCA", "FFC 4-factor"]
+FIG13_FACTORSET_ORDER = [
+    "Continuous PCA",
+    "Continuous PCA (unbalanced, yearly aligned)",
+    "FFC 4-factor",
+]
 SEGMENT_ORDER = ["intraday", "overnight", "daily"]
 OFFICIAL_FFC_FACTORS = ["MKT_excess", "SMB", "HML", "MOM"]
 FIGURE12_MIN_ALL_STOCK_OBS = 60
+SHORT_LABEL_MAP = {
+    "公用事业与交运": "公用/交运",
+    "可选消费与服务": "可选消费",
+    "房地产与建筑": "地产/建筑",
+    "电力设备与新能源": "电新",
+    "基础化工": "基础化工",
+    "钢铁有色": "钢铁/有色",
+    "机械设备": "机械设备",
+    "食品饮料": "食饮",
+    "传媒通信与计算机": "传媒/通信/计算机",
+    "农林牧渔": "农林牧渔",
+    "石油石化与煤炭": "油气/煤炭",
+    "汽车": "汽车",
+    "医药生物": "医药",
+    "大金融": "大金融",
+    "周期资源": "周期资源",
+}
 
 
 
@@ -237,6 +258,7 @@ def _paper_tail_output_paths(root: Path) -> Dict[str, Path]:
         "industry_selection": root / "diagnostics" / "industry_selection.json",
         "factor_matrix_diagnostics": root / "diagnostics" / "factor_matrix_diagnostics.json",
         "figure12_filter": root / "diagnostics" / "figure12_all_stocks_filter.json",
+        "figure13_alignment": root / "diagnostics" / "figure13_yearly_alignment.json",
         "validation_size_value": root / "validation" / "size_value_daily_parity.csv",
         "validation_size_value_summary": root / "validation" / "size_value_daily_parity_summary.json",
         "validation_ffc": root / "validation" / "ffc_daily_validation.csv",
@@ -291,6 +313,7 @@ def _load_payload(root: Path, manifest: Mapping[str, Any]) -> Dict[str, Any]:
         "diagnostics": {
             "factor_matrix_diagnostics": _load_json(outputs["factor_matrix_diagnostics"]),
             "figure12_all_stocks_filter": _load_json(outputs["figure12_filter"]),
+            "figure13_yearly_alignment": _load_json(outputs["figure13_alignment"]),
         },
         "validation": {
             "size_value_daily_parity": pd.read_csv(outputs["validation_size_value"], parse_dates=["date"]),
@@ -400,6 +423,7 @@ def _discover_or_build_payload(
     _write_json(outputs["industry_selection"], payload["industry_selection"])
     _write_json(outputs["factor_matrix_diagnostics"], payload["diagnostics"]["factor_matrix_diagnostics"])
     _write_json(outputs["figure12_filter"], payload["diagnostics"]["figure12_all_stocks_filter"])
+    _write_json(outputs["figure13_alignment"], payload["diagnostics"]["figure13_yearly_alignment"])
     _write_csv(outputs["validation_size_value"], payload["validation"]["size_value_daily_parity"])
     _write_json(outputs["validation_size_value_summary"], payload["validation"]["size_value_daily_parity_summary"])
     _write_csv(outputs["validation_ffc"], payload["validation"]["ffc_daily_validation"])
@@ -1602,35 +1626,122 @@ def _build_figure12_data(
     )
 
 
-def _build_unbalanced_pca_segments(proc_root: Path, sample_dates: pd.DatetimeIndex, k: int = 4) -> Dict[str, np.ndarray]:
-    """论文 Figure 13 的 “PCA (unbalanced)” 行：在【全市场非平衡】日频收益上估计 PCA。
+def _orthogonal_rotation(source: np.ndarray, target: np.ndarray) -> Tuple[np.ndarray, Dict[str, Any]]:
+    src = np.asarray(source, dtype=float)
+    tgt = np.asarray(target, dtype=float)
+    if src.ndim == 1:
+        src = src[:, None]
+    if tgt.ndim == 1:
+        tgt = tgt[:, None]
+    k = min(src.shape[1], tgt.shape[1])
+    src = src[:, :k]
+    tgt = tgt[:, :k]
+    valid = np.isfinite(src).all(axis=1) & np.isfinite(tgt).all(axis=1)
+    if valid.sum() < max(2, k):
+        q = np.eye(k, dtype=float)
+        return q, {
+            "valid_rows": int(valid.sum()),
+            "orthogonality_error": 0.0,
+            "alignment_rmse": np.nan,
+            "used_identity": True,
+        }
+    x = src[valid]
+    y = tgt[valid]
+    u, _, vt = np.linalg.svd(x.T @ y, full_matrices=False)
+    q = u @ vt
+    aligned = x @ q
+    return q, {
+        "valid_rows": int(valid.sum()),
+        "orthogonality_error": float(np.linalg.norm(q.T @ q - np.eye(k), ord="fro")),
+        "alignment_rmse": float(np.sqrt(np.nanmean((aligned - y) ** 2))),
+        "used_identity": False,
+    }
 
-    近似口径（已在文档说明，与论文“逐年 PCA + 旋转”非完全一致）：对全部 symbol_returns
-    的日频【总】收益做一次全样本 pairwise PCA（NaN 容忍）得 4 个权重，再把权重施加到
-    intraday/overnight/daily 三段全市场收益，得到非平衡 PCA 因子的三段日频收益。
-    """
+
+def _continuous_factor_segments_from_panel(panel: Any, *, jump_a: float, k: int) -> Dict[str, Any]:
     import core.engine as eng
-    files = sorted((proc_root / "symbol_returns").glob("*.npz"))
-    if not files:
-        raise RuntimeError("symbol_returns 不可用，无法构建非平衡 PCA")
-    date_index = {int(ts.strftime("%Y%m%d")): i for i, ts in enumerate(sample_dates)}
-    T, N = len(sample_dates), len(files)
-    key = {"intraday": "intraday_returns", "overnight": "overnight_returns", "daily": "daily_returns"}
-    M = {seg: np.full((T, N), np.nan, dtype=np.float64) for seg in SEGMENT_ORDER}
-    for col, path in enumerate(files):
-        a = np.load(path)
-        codes = a["date_codes"].astype(np.int64, copy=False)
-        ridx = np.fromiter((date_index.get(int(c), -1) for c in codes), dtype=np.int64, count=len(codes))
-        ok = ridx >= 0
-        if not ok.any():
-            continue
-        rr = ridx[ok]
-        for seg in SEGMENT_ORDER:
-            M[seg][rr, col] = np.asarray(a[key[seg]], dtype=np.float64)[ok]
-    res = eng.pca_factors_pairwise(M["daily"], K=int(k), use_corr=True)
-    eng.orient_pca_result(res)
-    W = eng.factor_portfolio_weights(res)
-    return {seg: np.nan_to_num(M[seg], nan=0.0) @ W for seg in SEGMENT_ORDER}
+
+    r_cont, _ = eng.detect_jumps(panel, a=float(jump_a))
+    pca = eng._panel_pca(r_cont, K=int(k), use_corr=True)
+    eng.orient_pca_result(pca)
+    weights = eng.factor_portfolio_weights(pca)
+    return {
+        "pca": pca,
+        "weights": weights,
+        "intraday": np.asarray(panel.R_intra @ weights, dtype=float),
+        "overnight": np.asarray(panel.R_night @ weights, dtype=float),
+        "daily": np.asarray(panel.R_daily @ weights, dtype=float),
+        "n_symbols": int(panel.N),
+        "n_days": int(panel.D),
+    }
+
+
+def _build_yearly_aligned_unbalanced_pca_segments(
+    result: Any,
+    *,
+    proc_root: Path,
+    sample_dates: pd.DatetimeIndex,
+    k: int = 4,
+) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
+    import core.engine as eng
+
+    baseline = {
+        "intraday": np.asarray(result.pipeline.F_cont_display_daily_intra, dtype=float),
+        "overnight": np.asarray(result.pipeline.F_cont_display_daily_night, dtype=float),
+        "daily": np.asarray(result.pipeline.F_cont_display_daily_total, dtype=float),
+    }
+    k_use = min(int(k), int(baseline["daily"].shape[1]))
+    out = {
+        segment: np.full((len(sample_dates), k_use), np.nan, dtype=float)
+        for segment in SEGMENT_ORDER
+    }
+    diagnostics: Dict[str, Any] = {
+        "factor_set_label": "Continuous PCA (unbalanced, yearly aligned)",
+        "alignment_steps": [
+            "year-specific balanced changing-universe -> same-year fixed intersection",
+            "same-year fixed intersection -> global fixed-intersection baseline",
+        ],
+        "years": [],
+    }
+
+    years = sorted({int(date.year) for date in sample_dates})
+    for year in years:
+        year_mask = np.array([int(date.year) == int(year) for date in sample_dates], dtype=bool)
+        fixed_year_panel = eng.subset_panel_by_years(result.panel, [int(year)])
+        changing_year_panel = eng.load_proc_hf_panel(
+            proc_root=proc_root,
+            sample_mode=eng.STRICT_BALANCED_SAMPLE,
+            years=[int(year)],
+            return_mode=result.panel.requested_return_mode or "open_close",
+        )
+        fixed_segments = _continuous_factor_segments_from_panel(
+            fixed_year_panel,
+            jump_a=float(result.pipeline.jump_a),
+            k=k_use,
+        )
+        changing_segments = _continuous_factor_segments_from_panel(
+            changing_year_panel,
+            jump_a=float(result.pipeline.jump_a),
+            k=k_use,
+        )
+        global_year_daily = baseline["daily"][year_mask, :k_use]
+        q1, diag1 = _orthogonal_rotation(changing_segments["daily"][:, :k_use], fixed_segments["daily"][:, :k_use])
+        q2, diag2 = _orthogonal_rotation(fixed_segments["daily"][:, :k_use], global_year_daily)
+        q_total = q1 @ q2
+        for segment in SEGMENT_ORDER:
+            out[segment][year_mask, :] = np.asarray(changing_segments[segment][:, :k_use] @ q_total, dtype=float)
+        diagnostics["years"].append(
+            {
+                "year": int(year),
+                "n_symbols_unbalanced": int(changing_segments["n_symbols"]),
+                "n_symbols_fixed": int(fixed_segments["n_symbols"]),
+                "n_days": int(changing_segments["n_days"]),
+                "step1": diag1,
+                "step2": diag2,
+                "composite_orthogonality_error": float(np.linalg.norm(q_total.T @ q_total - np.eye(q_total.shape[1]), ord="fro")),
+            }
+        )
+    return out, diagnostics
 
 
 def _build_figure13_data(
@@ -1656,10 +1767,10 @@ def _build_figure13_data(
     factor_set_specs = [
         ("Continuous PCA", continuous, continuous_names),
     ]
-    # P-Fig13：补“Continuous PCA (unbalanced)”行（若全市场非平衡因子可用）。
+    # Figure 13 second row: yearly estimated, yearly aligned changing-universe factors.
     if pca_unbalanced is not None:
         ub_names = [f"Factor {idx}" for idx in range(1, min(4, pca_unbalanced["daily"].shape[1]) + 1)]
-        factor_set_specs.append(("Continuous PCA (unbalanced)", pca_unbalanced, ub_names))
+        factor_set_specs.append(("Continuous PCA (unbalanced, yearly aligned)", pca_unbalanced, ub_names))
     factor_set_specs.append(("FFC 4-factor", ffc, ffc_names))
     for factor_set, mats, factor_names in factor_set_specs:
         # P11（论文 Figure 13 caption：“normalized by their DAILY standard deviation”）：
@@ -1868,12 +1979,24 @@ def _build_payload(
         rf_daily_sample=rf_daily_sample,
         weighting=weighting,
     )
-    # P-Fig13：尝试构建“PCA (unbalanced)”行（全市场非平衡 PCA，近似口径），失败则只出 2 行。
+    figure13_alignment_diag: Dict[str, Any] = {"factor_set_label": "Continuous PCA (unbalanced, yearly aligned)", "years": [], "status": "not_built"}
     pca_unbalanced = None
     try:
-        pca_unbalanced = _build_unbalanced_pca_segments(proc_root, sample_dates, k=4)
+        pca_unbalanced, figure13_alignment_diag = _build_yearly_aligned_unbalanced_pca_segments(
+            result,
+            proc_root=proc_root,
+            sample_dates=sample_dates,
+            k=4,
+        )
+        figure13_alignment_diag["status"] = "built"
     except Exception as exc:  # pragma: no cover
-        print(f"[paper_tail] Figure 13 非平衡 PCA 行不可用，回退为 2 行: {exc!r}")
+        figure13_alignment_diag = {
+            "factor_set_label": "Continuous PCA (unbalanced, yearly aligned)",
+            "years": [],
+            "status": "failed",
+            "error": repr(exc),
+        }
+        print(f"[paper_tail] Figure 13 yearly aligned row unavailable, fallback to 2 rows: {exc!r}")
     figure13_data = _build_figure13_data(
         result,
         sample_dates=sample_dates,
@@ -1947,6 +2070,7 @@ def _build_payload(
         "diagnostics": {
             "factor_matrix_diagnostics": factor_matrix_diagnostics,
             "figure12_all_stocks_filter": figure12_filter,
+            "figure13_yearly_alignment": figure13_alignment_diag,
         },
         "validation": {
             "size_value_daily_parity": size_value_validation,
@@ -2002,6 +2126,42 @@ def refresh_paper_tail_views(
     )
     result.paper_tail = payload
     return payload
+
+
+def _short_asset_label(name: Any) -> str:
+    text = str(name)
+    if text in SHORT_LABEL_MAP:
+        return SHORT_LABEL_MAP[text]
+    if text in {"BH", "BL", "BM", "SH", "SL", "SM"}:
+        return text
+    return _short_asset_label_ascii(text)
+
+
+def _short_asset_label_ascii(text: str) -> str:
+    compact = (
+        text.replace("Industry Portfolios", "")
+        .replace("Portfolio", "")
+        .replace("portfolio", "")
+        .replace("industry", "")
+        .replace("Industry", "")
+        .replace(" & ", "/")
+        .replace(" and ", "/")
+        .strip(" /")
+    )
+    return compact if len(compact) <= 12 else compact[:12]
+    """
+    compact = (
+        text.replace("行业组合", "")
+        .replace("组合", "")
+        .replace("行业", "")
+        .replace("与", "/")
+        .replace("及", "/")
+        .strip()
+    )
+    return compact if len(compact) <= 12 else compact[:12]
+
+
+"""
 
 
 def render_figure_12(result: Any, output_path: Path, title: str) -> None:
@@ -2084,16 +2244,20 @@ def render_figure_13(result: Any, output_path: Path, title: str) -> None:
     # 论文 Figure 13：行=因子集（PCA / PCA-unbalanced / FFC），列=频段，每子图画各因子归一化累计收益。
     seg_cols = ["intraday", "overnight", "daily"]
     seg_label = {"intraday": "Intraday", "overnight": "Overnight", "daily": "Daily"}
-    preferred = ["Continuous PCA", "Continuous PCA (unbalanced)", "FFC 4-factor"]
+    preferred = [
+        "Continuous PCA",
+        "Continuous PCA (unbalanced, yearly aligned)",
+        "FFC 4-factor",
+    ]
     present = list(df["factor_set"].unique()) if "factor_set" in df.columns else []
     factor_sets = [fs for fs in preferred if fs in present] or preferred
-    fig, axes = plt.subplots(len(factor_sets), 3, figsize=(16, 4.6 * len(factor_sets)), sharex=True)
+    fig, axes = plt.subplots(len(factor_sets), 3, figsize=(16.8, 4.8 * len(factor_sets)), sharex=True)
     axes = np.atleast_2d(axes)
     for row_idx, factor_set in enumerate(factor_sets):
         for col_idx, segment in enumerate(seg_cols):
             ax = axes[row_idx, col_idx]
             sub = df.loc[df["segment_kind"].eq(segment) & df["factor_set"].eq(factor_set)].copy()
-            ax.set_title(f"{factor_set} {seg_label[segment]} Return", fontsize=9)
+            ax.set_title(f"{factor_set} | {seg_label[segment]}", fontsize=9)
             if sub.empty:
                 ax.text(0.5, 0.5, "No data", ha="center", va="center"); continue
             for factor_name, factor_df in sub.groupby("factor", sort=False):
@@ -2103,9 +2267,9 @@ def render_figure_13(result: Any, output_path: Path, title: str) -> None:
                 ax.set_xlabel("Time")
             if col_idx == 0:
                 ax.set_ylabel("Return")
-            ax.legend(loc="best", fontsize=7)
-    fig.suptitle(title)
-    fig.tight_layout(rect=(0, 0, 1, 0.97))
+            ax.legend(loc="best", fontsize=7, ncol=2)
+    fig.suptitle(title, y=0.995)
+    fig.tight_layout(rect=(0, 0, 1, 0.975))
     _atomic_save_figure(fig, output_path, dpi=170)
     plt.close(fig)
 
@@ -2178,7 +2342,176 @@ def render_figure_14(result: Any, output_path: Path, title: str) -> None:
 def render_figure_15(result: Any, output_path: Path, title: str) -> None:
     payload = getattr(result, "paper_tail", {}) or {}
     df = payload.get("pricing_size_value")
+    full_title = f"{title}\nA-share reconstructed 2x3 portfolios; sample starts 2014-07-01"
+    _render_pricing_figure(df if isinstance(df, pd.DataFrame) else pd.DataFrame(), output_path, full_title)
+
+
+def render_figure_12(result: Any, output_path: Path, title: str) -> None:
+    from core.engine import _atomic_save_figure, _save_placeholder_figure
+
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError(exc) from exc
+
+    payload = getattr(result, "paper_tail", {}) or {}
+    df = payload.get("figure12_data")
+    if df is None or df.empty:
+        _save_placeholder_figure(output_path, title, "Paper-tail Figure 12 data are not available.")
+        return
+
+    paper_groups = [
+        ("all_stocks", "All Stocks"),
+        ("industry_portfolios", "{n_industry} Industry Portfolios"),
+        ("size_value_portfolios", "6 Size/Value Portfolios"),
+    ]
+    n_industry = 0
+    if isinstance(df, pd.DataFrame) and "group" in df.columns:
+        ind = df.loc[df["group"].eq("industry_portfolios"), "asset"]
+        n_industry = int(ind.nunique()) if not ind.empty else 0
+
+    fig, axes = plt.subplots(1, 3, figsize=(18.2, 6.0), sharex=False, sharey=False)
+    for ax, (group, gtitle) in zip(np.atleast_1d(axes).flat, paper_groups):
+        sub = df.loc[df["group"].eq(group)].copy()
+        if group == "all_stocks" and "eligible_for_plot" in sub.columns:
+            keep = sub["eligible_for_plot"]
+            if keep.dtype != bool:
+                keep = keep.astype(str).str.lower().isin({"1", "true", "yes"})
+            sub = sub.loc[keep].copy()
+        title_group = gtitle.format(n_industry=n_industry) if "{n_industry}" in gtitle else gtitle
+        if sub.empty:
+            ax.set_title(title_group)
+            ax.text(0.5, 0.5, "No data", ha="center", va="center")
+            continue
+        xs = sub["mean_intraday_excess"].to_numpy(dtype=float)
+        ys = sub["mean_overnight_excess"].to_numpy(dtype=float)
+        ax.scatter(
+            xs,
+            ys,
+            facecolors="none",
+            edgecolors="#1f5fbf",
+            linewidths=1.0,
+            s=30 if len(sub) > 20 else 55,
+            alpha=0.85,
+        )
+        ax.axhline(0.0, color="0.85", linewidth=0.8)
+        ax.axvline(0.0, color="0.85", linewidth=0.8)
+        good = np.isfinite(xs) & np.isfinite(ys)
+        if good.sum() >= 2 and np.ptp(xs[good]) > 0:
+            b1, b0 = np.polyfit(xs[good], ys[good], 1)
+            xline = np.array([xs[good].min(), xs[good].max()])
+            ax.plot(xline, b0 + b1 * xline, color="0.4", linestyle="--", linewidth=1.0)
+        ax.set_title(title_group)
+        ax.set_xlabel("Expected intraday excess return")
+        ax.set_ylabel("Expected overnight excess return")
+        if group != "all_stocks" or len(sub) <= 16:
+            for _, row in sub.iterrows():
+                ax.annotate(
+                    _short_asset_label(row["asset"]),
+                    (row["mean_intraday_excess"], row["mean_overnight_excess"]),
+                    fontsize=7,
+                    alpha=0.85,
+                    xytext=(3, 2),
+                    textcoords="offset points",
+                )
+    fig.suptitle(title, y=0.99)
+    fig.tight_layout(rect=(0, 0, 1, 0.965), w_pad=2.0)
+    _atomic_save_figure(fig, output_path, dpi=170)
+    plt.close(fig)
+
+
+def _render_pricing_figure(df: pd.DataFrame, output_path: Path, title: str) -> None:
+    from core.engine import _atomic_save_figure, _save_placeholder_figure
+
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.gridspec import GridSpec
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError(exc) from exc
+
+    if df.empty:
+        _save_placeholder_figure(output_path, title, "No pricing data are available.")
+        return
+
+    factor_sets = ["Continuous PCA", "FFC 4-factor"]
+    seg_cols = ["daily", "intraday", "overnight"]
+    seg_label = {"daily": "Daily", "intraday": "Intraday", "overnight": "Overnight"}
+    set_label = {"Continuous PCA": "Continuous PCA", "FFC 4-factor": "FFC"}
+
+    fig = plt.figure(figsize=(17.2, 16.8))
+    grid = GridSpec(5, 3, figure=fig, height_ratios=[1.0, 1.0, 0.12, 1.0, 1.0], hspace=0.55, wspace=0.32)
+    axes_a = [[fig.add_subplot(grid[r, c]) for c in range(3)] for r in range(2)]
+    axes_b = [[fig.add_subplot(grid[r + 3, c]) for c in range(3)] for r in range(2)]
+
+    for r, factor_set in enumerate(factor_sets):
+        for c, segment in enumerate(seg_cols):
+            ax = axes_a[r][c]
+            sub = df.loc[df["segment_kind"].eq(segment) & df["factor_set"].eq(factor_set)].copy()
+            ax.set_title(f"{seg_label[segment]} | {set_label[factor_set]}", fontsize=9)
+            if sub.empty:
+                ax.text(0.5, 0.5, "No data", ha="center", va="center")
+                continue
+            ex = sub["expected_return"].to_numpy(dtype=float)
+            pr = sub["predicted_return"].to_numpy(dtype=float)
+            lo = float(np.nanmin(np.concatenate([ex, pr])))
+            hi = float(np.nanmax(np.concatenate([ex, pr])))
+            pad = max(1e-4, 0.08 * max(abs(lo), abs(hi), 1e-4))
+            ax.scatter(ex, pr, facecolors="none", edgecolors="#1f5fbf", linewidths=1.0, s=42, alpha=0.85)
+            ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], color="0.5", linestyle="--", linewidth=1.0)
+            ax.set_xlabel("Expected return")
+            ax.set_ylabel("Predicted return")
+            ax.grid(True, alpha=0.2)
+            if len(sub) <= 12:
+                for _, row in sub.iterrows():
+                    ax.annotate(
+                        _short_asset_label(row["asset"]),
+                        (row["expected_return"], row["predicted_return"]),
+                        fontsize=6.5,
+                        alpha=0.85,
+                        xytext=(3, 2),
+                        textcoords="offset points",
+                    )
+
+    for r, factor_set in enumerate(factor_sets):
+        for c, segment in enumerate(seg_cols):
+            ax = axes_b[r][c]
+            sub = df.loc[df["segment_kind"].eq(segment) & df["factor_set"].eq(factor_set)].copy()
+            ax.set_title(f"{seg_label[segment]} | {set_label[factor_set]}", fontsize=9)
+            if sub.empty:
+                ax.text(0.5, 0.5, "No data", ha="center", va="center")
+                continue
+            if set(sub["asset"].astype(str)) == {"BH", "BL", "BM", "SH", "SL", "SM"}:
+                order = ["BH", "BL", "BM", "SH", "SL", "SM"]
+                sub = sub.set_index("asset").reindex(order).reset_index()
+            else:
+                sub = sub.sort_values("asset").reset_index(drop=True)
+            xpos = np.arange(len(sub))
+            ax.bar(xpos, sub["alpha"].to_numpy(dtype=float), color="#1f5fbf", alpha=0.85)
+            ax.axhline(0.0, color="0.4", linewidth=0.9)
+            ax.set_ylabel("Pricing error")
+            ax.set_xticks(xpos)
+            ax.set_xticklabels([_short_asset_label(asset) for asset in sub["asset"].tolist()], fontsize=7, rotation=40 if len(sub) > 8 else 0, ha="right" if len(sub) > 8 else "center")
+            ax.grid(True, axis="y", alpha=0.2)
+
+    fig.text(0.5, 0.972, "Panel A: Predicted Returns", ha="center", fontsize=12, weight="bold")
+    fig.text(0.5, 0.462, "Panel B: Pricing Errors", ha="center", fontsize=12, weight="bold")
+    fig.suptitle(title, y=0.995, fontsize=11)
+    fig.tight_layout(rect=(0.02, 0.02, 0.98, 0.955))
+    _atomic_save_figure(fig, output_path, dpi=170)
+    plt.close(fig)
+
+
+def render_figure_14(result: Any, output_path: Path, title: str) -> None:
+    payload = getattr(result, "paper_tail", {}) or {}
+    df = payload.get("pricing_industry")
     _render_pricing_figure(df if isinstance(df, pd.DataFrame) else pd.DataFrame(), output_path, title)
+
+
+def render_figure_15(result: Any, output_path: Path, title: str) -> None:
+    payload = getattr(result, "paper_tail", {}) or {}
+    df = payload.get("pricing_size_value")
+    full_title = f"{title}\nA-share reconstructed 2x3 portfolios; sample starts 2014-07-01"
+    _render_pricing_figure(df if isinstance(df, pd.DataFrame) else pd.DataFrame(), output_path, full_title)
 
 
 def build_replication_coverage_report() -> pd.DataFrame:
@@ -2188,19 +2521,19 @@ def build_replication_coverage_report() -> pd.DataFrame:
         ("Table III", "Generalized Correlations with Industry and FFC Factors", "implemented", "Uses supplement-backed paper_tail industry portfolios and FFC factor comparisons."),
         ("Table IV", "Time-Variation Decomposition across Frequencies", "implemented_adapted", "Rolling generalized-correlation and explained-variation diagnostics come from the main replication cache."),
         ("Table V", "Intraday / Overnight / Daily Sharpe Ratios", "implemented", "Uses canonical excess-return factor sets plus the first four continuous PCA factors."),
-        ("Figure 1", "Number of HF Factors, Unbalanced Panel", "implemented_adapted", "Main replication diagnostic figure based on yearly paper_factor_counts with critical-value significance reading."),
-        ("Figure 2", "Number of HF Factors, Balanced Panel", "implemented_adapted", "Main replication diagnostic figure based on yearly paper_factor_counts with critical-value significance reading."),
-        ("Figure 3", "Proxy Factor Portfolio Weights", "implemented_adapted", "Rendered from refreshed display-layer proxy weights."),
+        ("Figure 1", "Number of HF Factors, Unbalanced Panel", "implemented_adapted", "Submission version uses cross-year unbalanced but within-year balanced yearly panels."),
+        ("Figure 2", "Number of HF Factors, Balanced Panel", "implemented_adapted", "Submission version uses fixed full-sample intersection yearly slices with constant N."),
+        ("Figure 3", "Proxy Factor Portfolio Weights", "omitted_from_submission", "Removed from the submission-core export profile."),
         ("Figure 4", "Continuous PCA Factor Portfolio Weights", "implemented_adapted", "Rendered from refreshed display-layer continuous PCA weights."),
-        ("Figure 5", "Monthly PCA Factor Portfolio Weights", "implemented_adapted", "Rendered from refreshed monthly PCA weights."),
-        ("Figure 6", "Time Variation in Loadings", "implemented_adapted", "Rendered from rolling generalized correlations."),
-        ("Figure 7", "Locally Estimated Continuous Factors", "implemented_adapted", "Rendered from rolling generalized correlations."),
-        ("Figure 8", "Time-Varying Portfolio Weights", "implemented_adapted", "Rendered from rolling weight summaries."),
-        ("Figure 9", "Time-Varying Explained Variation", "implemented_adapted", "Rendered from rolling explained variation."),
+        ("Figure 5", "Monthly PCA Factor Portfolio Weights", "omitted_from_submission", "Removed from the submission-core export profile."),
+        ("Figure 6", "Time Variation in Loadings", "omitted_from_submission", "Removed from the submission-core export profile."),
+        ("Figure 7", "Locally Estimated Continuous Factors", "implemented_adapted", "Submission version emphasizes 7 continuous factors over a 21-trading-day local window."),
+        ("Figure 8", "Time-Varying Portfolio Weights", "omitted_from_submission", "Removed from the submission-core export profile."),
+        ("Figure 9", "Time-Varying Explained Variation", "omitted_from_submission", "Removed from the submission-core export profile."),
         ("Figure 10", "Factor-Structure Time Variation Decomposition", "implemented_adapted", "Rendered from rolling generalized-correlation and explained-variation diagnostics."),
-        ("Figure 11", "Continuous Factor-Structure Decomposition", "implemented_adapted", "Rendered from rolling generalized correlations."),
+        ("Figure 11", "Continuous Factor-Structure Decomposition", "omitted_from_submission", "Removed from the submission-core export profile."),
         ("Figure 12", "Expected Intraday and Overnight Returns", "implemented", "Uses balanced-panel stocks, filtered all-stocks scatter points, 14 industry portfolios, and 6 size/value portfolios."),
-        ("Figure 13", "Normalized Cumulative Factor Returns", "implemented", "Compares continuous PCA and canonical segmented FFC returns across intraday, overnight, and daily segments."),
+        ("Figure 13", "Normalized Cumulative Factor Returns", "implemented", "Uses yearly estimated and yearly aligned changing-universe continuous PCA factors plus canonical segmented FFC returns."),
         ("Figure 14", "Asset Pricing of Industry Portfolios", "implemented", "Uses supplement-backed industry portfolios with continuous PCA and FFC pricing tests."),
         ("Figure 15", "Asset Pricing of Size- and Value-Sorted Portfolios", "implemented", "Uses supplement-backed 2x3 size/value portfolios with continuous PCA and FFC pricing tests."),
     ]
