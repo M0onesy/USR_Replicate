@@ -1,4 +1,4 @@
-"""figcode/_timevar.py
+"""figCode/_timevar.py
 =====================================================================
 论文 Figure 6–11（时间变化类）的【自洽】滚动计算 + 论文形态绘图。
 
@@ -251,7 +251,7 @@ def render_fig6(result, cfg, output_path: Path, title: str) -> None:
     for j in range(len(panels), nrow * 2):
         axes[j // 2, j % 2].axis("off")
     axes[-1, 0].set_xlabel("Time")
-    fig.suptitle(title); fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.tight_layout(rect=(0, 0, 1, 0.985))
     _save(fig, output_path); plt.close(fig)
 
 
@@ -264,7 +264,7 @@ def render_fig7(result, cfg, output_path: Path, title: str) -> None:
     suff = ["st", "nd", "rd", "th", "th", "th", "th"]
     for k in range(gc.shape[1]):
         ax.plot(r["centers"], gc[:, k], linewidth=1.2, label=f"{k+1}{suff[min(k,6)]} GC")
-    ax.set_title(title); ax.set_xlabel("Time"); ax.set_ylabel("Generalized Correlation")
+    ax.set_xlabel("Time"); ax.set_ylabel("Generalized Correlation")
     ax.set_ylim(0, 1.02); ax.grid(True, alpha=0.2); ax.legend(loc="center right", fontsize=8)
     fig.tight_layout(); _save(fig, output_path); plt.close(fig)
 
@@ -273,7 +273,7 @@ def render_fig8(result, cfg, output_path: Path, title: str, windows: Optional[Se
     """Fig 8：两个窗口的 4 因子权重行业着色柱状（4 行因子 × 2 列窗口）。
     windows 给两个日期（窗口中心）；缺省自动取“低波动”和“高波动”两个窗口。"""
     import matplotlib.pyplot as plt
-    from figcode.figure_03 import _load_industry_lookup
+    from figCode._weights import _load_industry_lookup
     r = local_pca_windows(result, 4, source="cont", step=1)
     centers = r["centers"]
     if len(r["weights"]) < 2:
@@ -316,7 +316,7 @@ def render_fig8(result, cfg, output_path: Path, title: str, windows: Optional[Se
     if lookup:
         fig.legend(handles=[Patch(facecolor=color_of[n], label=n) for n in uniq],
                    loc="center left", bbox_to_anchor=(1.0, 0.5), fontsize=7, frameon=False)
-    fig.suptitle(title); fig.tight_layout(rect=(0, 0, 0.88 if lookup else 1.0, 0.97))
+    fig.tight_layout(rect=(0, 0, 0.88 if lookup else 1.0, 0.985))
     _save(fig, output_path); plt.close(fig)
 
 
@@ -326,7 +326,7 @@ def render_fig9(result, cfg, output_path: Path, title: str) -> None:
     r = local_pca_windows(result, 4, source="cont")
     fig, ax = plt.subplots(figsize=(11, 5.0))
     ax.plot(r["centers"], r["explained"], linewidth=1.4, color="#1f5fbf")
-    ax.set_title(title); ax.set_xlabel("Time"); ax.set_ylabel("Explained variation")
+    ax.set_xlabel("Time"); ax.set_ylabel("Explained variation")
     ax.grid(True, alpha=0.2)
     fig.tight_layout(); _save(fig, output_path); plt.close(fig)
 
@@ -369,7 +369,7 @@ def _render_decomp(centers, sys_imp, avg_load, vol, output_path: Path, title: st
             if r_idx == 0 and col == 0:
                 ax.legend(loc="upper right", fontsize=7)
     axes[-1, 0].set_xlabel("Time"); axes[-1, 1].set_xlabel("Time")
-    fig.suptitle(title); fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.tight_layout(rect=(0, 0, 1, 0.985))
     _save(fig, output_path); plt.close(fig)
 
 

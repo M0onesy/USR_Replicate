@@ -1,9 +1,8 @@
-# Public runtime dependencies for:
-# - Code/allcode_Need.py
-# - Code/convert_bz2_to_csv.py
-# Excludes proprietary SDK/API dependencies used by Code/getApidb.py.
+# Public runtime dependencies for the submission-version replication runner.
+# Excludes proprietary SDK/API dependencies used by Code/dataPrepare/step_00_get_apidb.py.
 
 numpy>=1.23
 pandas>=1.5
 scipy>=1.10
 matplotlib>=3.7
+PyYAML>=6.0

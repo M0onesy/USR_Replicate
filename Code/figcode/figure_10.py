@@ -1,5 +1,5 @@
 """
-figcode/figure_10.py
+figCode/figure_10.py
 ====================
 
 Figure 10 —— Factor-Structure Time Variation Decomposition
@@ -16,7 +16,7 @@ Figure 10 —— Factor-Structure Time Variation Decomposition
 
 from __future__ import annotations
 
-# --- 允许 `python figcode/xxx.py` / `python tablecode/xxx.py` 直接运行时找到 core 包 ---
+# --- 允许 `python figCode/xxx.py` / `python tableCode/xxx.py` 直接运行时找到 core 包 ---
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
@@ -41,9 +41,9 @@ def generate(result: ReplicationResult, cfg: RunConfig) -> Path:
     title = figure_title(FIGURE_NUMBER)
     output_path = figure_path(result, FIGURE_NUMBER)
 
-    # 论文形态优先（自洽滚动计算 figcode/_timevar）；失败回退旧绘图。
+    # 论文形态优先（自洽滚动计算 figCode/_timevar）；失败回退旧绘图。
     try:
-        from figcode._timevar import render_fig10
+        from figCode._timevar import render_fig10
         log_render(TAG, "按论文形态绘制（PCA 因子结构分解，自洽滚动计算）")
         render_fig10(result, cfg, output_path, title)
         return output_path

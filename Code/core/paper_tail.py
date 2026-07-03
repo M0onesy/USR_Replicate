@@ -218,13 +218,14 @@ def _preferred_rf_file(external_root: Path) -> Path:
     candidates: List[Path] = []
     if env_path:
         candidates.append(Path(env_path).expanduser())
-    repo_root = Path(__file__).resolve().parents[2]
-    candidates.append(repo_root / "无风险利率" / "risk_free.csv")
-    candidates.extend(sorted((external_root / "factors" / "rf").glob("*.csv")))
+    candidates.append(Path(external_root) / "factors" / "rf" / "risk_free.csv")
     for path in candidates:
         if path.exists():
             return path.resolve()
-    raise FileNotFoundError(f"No RF csv files found. Checked: {', '.join(str(path) for path in candidates)}")
+    raise FileNotFoundError(
+        "No RF csv file found. Expected Data/external_Data/pelger_tail/factors/rf/risk_free.csv "
+        f"or an explicit PELGER_RF_FILE. Checked: {', '.join(str(path) for path in candidates)}"
+    )
 
 
 def _discovered_paths(proc_root: Path, external_root: Path) -> Dict[str, Path]:
@@ -2248,7 +2249,6 @@ def render_figure_12(result: Any, output_path: Path, title: str) -> None:
         if len(sub) <= 16:
             for _, row in sub.iterrows():
                 ax.annotate(str(row["asset"]), (row["mean_intraday_excess"], row["mean_overnight_excess"]), fontsize=7, alpha=0.8)
-    fig.suptitle(title)
     fig.tight_layout(rect=(0, 0, 1, 0.95))
     _atomic_save_figure(fig, output_path, dpi=170)
     plt.close(fig)
@@ -2295,7 +2295,6 @@ def render_figure_13(result: Any, output_path: Path, title: str) -> None:
             if col_idx == 0:
                 ax.set_ylabel("Return")
             ax.legend(loc="best", fontsize=7, ncol=2)
-    fig.suptitle(title, y=0.995)
     fig.tight_layout(rect=(0, 0, 1, 0.975))
     _atomic_save_figure(fig, output_path, dpi=170)
     plt.close(fig)
@@ -2354,7 +2353,6 @@ def _render_pricing_figure(df: pd.DataFrame, output_path: Path, title: str) -> N
             ax.grid(True, axis="y", alpha=0.2)
     fig.text(0.5, 0.985, "Panel A: Predicted Returns", ha="center", fontsize=12, weight="bold")
     fig.text(0.5, 0.495, "Panel B: Pricing Errors", ha="center", fontsize=12, weight="bold")
-    fig.suptitle(title, y=1.0, fontsize=11)
     fig.tight_layout(rect=(0, 0, 1, 0.965))
     _atomic_save_figure(fig, output_path, dpi=170)
     plt.close(fig)
@@ -2442,7 +2440,6 @@ def render_figure_12(result: Any, output_path: Path, title: str) -> None:
                     xytext=(3, 2),
                     textcoords="offset points",
                 )
-    fig.suptitle(title, y=0.99)
     fig.tight_layout(rect=(0, 0, 1, 0.965), w_pad=2.0)
     _atomic_save_figure(fig, output_path, dpi=170)
     plt.close(fig)
@@ -2569,7 +2566,6 @@ def _render_pricing_figure(df: pd.DataFrame, output_path: Path, title: str) -> N
     top_rect = 0.900 if title_lines > 1 else 0.935
     fig.text(0.5, panel_a_y, "Panel A: Predicted Returns", ha="center", fontsize=12, weight="bold")
     fig.text(0.5, 0.462, "Panel B: Pricing Errors", ha="center", fontsize=12, weight="bold")
-    fig.suptitle(title, y=0.995, fontsize=11)
     fig.tight_layout(rect=(0.02, 0.02, 0.98, top_rect))
     _atomic_save_figure(fig, output_path, dpi=170)
     plt.close(fig)

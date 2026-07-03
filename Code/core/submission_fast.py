@@ -45,15 +45,15 @@ from core.runner import run_generator
 
 
 SUBMISSION_FAST_FIGURES: Tuple[Tuple[str, str], ...] = (
-    ("fig1", "figcode.figure_01"),
-    ("fig2", "figcode.figure_02"),
-    ("fig4", "figcode.figure_04"),
-    ("fig7", "figcode.figure_07"),
-    ("fig10", "figcode.figure_10"),
-    ("fig12", "figcode.figure_12"),
-    ("fig13", "figcode.figure_13"),
-    ("fig14", "figcode.figure_14"),
-    ("fig15", "figcode.figure_15"),
+    ("fig1", "figCode.figure_01"),
+    ("fig2", "figCode.figure_02"),
+    ("fig4", "figCode.figure_04"),
+    ("fig7", "figCode.figure_07"),
+    ("fig10", "figCode.figure_10"),
+    ("fig12", "figCode.figure_12"),
+    ("fig13", "figCode.figure_13"),
+    ("fig14", "figCode.figure_14"),
+    ("fig15", "figCode.figure_15"),
 )
 
 SUBMISSION_TABLE_I_FILE = "Table_I_summary_statistics_for_continuous_and_jump_returns.csv"
@@ -121,13 +121,14 @@ def _rf_file(external_root: Path) -> Path:
     env_path = str(_os.environ.get("PELGER_RF_FILE", "")).strip()
     if env_path:
         candidates.append(Path(env_path).expanduser())
-    repo_root = Path(__file__).resolve().parents[2]
-    candidates.append(repo_root / "无风险利率" / "risk_free.csv")
-    candidates.extend(sorted((external_root / "factors" / "rf").glob("*.csv")))
+    candidates.append(Path(external_root) / "factors" / "rf" / "risk_free.csv")
     for path in candidates:
         if path.exists():
             return path.resolve()
-    raise FileNotFoundError(f"No RF csv files found. Checked: {', '.join(str(path) for path in candidates)}")
+    raise FileNotFoundError(
+        "No RF csv file found. Expected Data/external_Data/pelger_tail/factors/rf/risk_free.csv "
+        f"or an explicit PELGER_RF_FILE. Checked: {', '.join(str(path) for path in candidates)}"
+    )
 
 
 def _long_to_factor_mats(sample_dates: pd.DatetimeIndex, factor_df: pd.DataFrame) -> Dict[str, np.ndarray]:
@@ -364,7 +365,7 @@ def build_submission_table_i_aligned(
     return table_i
 
 
-def export_submission_table_i_fast(cfg: RunConfig) -> Path:
+def export_table_i_internal(cfg: RunConfig) -> Path:
     diagnostics_dir = _submission_fast_diagnostics_dir(cfg)
     table_i = build_submission_table_i_aligned(cfg)
     output_path = _table_i_output_path(cfg)
@@ -541,7 +542,7 @@ def build_submission_table_ii_paper_style(
     return wide, long
 
 
-def export_submission_table_ii_fast(cfg: RunConfig) -> Path:
+def export_table_ii_internal(cfg: RunConfig) -> Path:
     diagnostics_dir = _submission_fast_diagnostics_dir(cfg)
     wide, long = build_submission_table_ii_paper_style(cfg, jump_a=float(cfg.jump_a))
     output_path = _table_ii_output_path(cfg)
@@ -650,7 +651,7 @@ def build_submission_table_iii(cfg: RunConfig) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def export_submission_table_iii_fast(cfg: RunConfig) -> Path:
+def export_table_iii_internal(cfg: RunConfig) -> Path:
     diagnostics_dir = _submission_fast_diagnostics_dir(cfg)
     table_iii = build_submission_table_iii(cfg)
     output_path = _table_iii_output_path(cfg)
@@ -877,7 +878,7 @@ def build_submission_table_v(
     return table
 
 
-def export_submission_table_v_fast(cfg: RunConfig) -> Path:
+def export_table_v_internal(cfg: RunConfig) -> Path:
     diagnostics_dir = _submission_fast_diagnostics_dir(cfg)
     table_v = build_submission_table_v(cfg)
     output_path = _table_v_output_path(cfg)
@@ -1090,7 +1091,7 @@ def build_submission_fast_result(
     return result
 
 
-def export_submission_core_fast(
+def export_core_internal(
     cfg: RunConfig,
     *,
     strict_fail: bool = True,
@@ -1100,7 +1101,9 @@ def export_submission_core_fast(
     failures: List[Tuple[str, str]] = []
 
     try:
-        table_i_path = export_submission_table_i_fast(cfg)
+        from tableCode.table_i import export_fast as export_table_i
+
+        table_i_path = export_table_i(cfg)
         outputs["table_i"] = str(table_i_path)
     except Exception as exc:
         failures.append(("table_i", repr(exc)))
@@ -1139,11 +1142,6 @@ __all__ = [
     "build_submission_table_ii_paper_style",
     "build_submission_table_iii",
     "build_submission_table_v",
-    "export_submission_table_i_fast",
-    "export_submission_table_ii_fast",
-    "export_submission_table_iii_fast",
-    "export_submission_table_v_fast",
-    "export_submission_core_fast",
     "load_legacy_paper_tail_assets",
     "submission_fast_runtime_root",
 ]

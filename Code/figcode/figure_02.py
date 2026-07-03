@@ -11,7 +11,7 @@ from core.engine import ReplicationResult, load_or_build_submission_figure_facto
 from core.io_utils import figure_path, figure_title
 from core.logging_utils import log_render, log_step
 from core.runner import run_standalone
-from figcode.figure_01 import _plot_er_panel, _write_significance_summary
+from figCode.figure_01 import _plot_er_panel, _write_significance_summary
 
 TAG = "figure_02"
 FIGURE_NUMBER = 2

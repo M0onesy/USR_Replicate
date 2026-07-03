@@ -19,7 +19,7 @@ Pelger (2020) 高频系统性风险复现项目 —— 共享计算引擎（"重
 
 设计要点（与拆分方案 Option A 对应）：
   ``run_cn_replication()`` 把昂贵的上游计算只跑一次，产出一个 ``ReplicationResult``
-  对象；figcode / tablecode 下的每篇脚本都只是从这个对象里取字段、画图或落表，
+  对象；figCode / tableCode 下的每篇脚本都只是从这个对象里取字段、画图或落表，
   因此真正耗时的部分不会被重复执行。缓存层见 ``core/pipeline_cache.py``。
 
 注意：
@@ -1201,7 +1201,7 @@ def load_proc_universe(proc_root: str | Path = DEFAULT_PROC_ROOT) -> pd.DataFram
     summary_path = proc_root / "metadata" / "universe_summary.json"
     if not universe_path.exists() or not summary_path.exists():
         raise FileNotFoundError(
-            f"未找到预处理样本文件，请先运行 Code/preprocess_cn_data.py: {proc_root}"
+            f"未找到预处理样本文件，请先运行 Code/main.py --stages data --data-steps preprocess_panels: {proc_root}"
         )
 
     universe = pd.read_pickle(universe_path)
@@ -1551,7 +1551,7 @@ def _load_proc_panel_file(proc_root: Path, sample_mode: str, panel_name: str) ->
     npz_path, meta_path = _proc_panel_paths_resolved(proc_root, sample_mode, panel_name)
     if not meta_path.exists():
         raise FileNotFoundError(
-            f"Processed panel metadata not found: {meta_path}. Run Code/preprocess_cn_data.py first."
+            f"Processed panel metadata not found: {meta_path}. Run Code/main.py --stages data --data-steps preprocess_panels first."
         )
 
     meta = _load_json(meta_path)
@@ -1560,7 +1560,7 @@ def _load_proc_panel_file(proc_root: Path, sample_mode: str, panel_name: str) ->
     else:
         if not npz_path.exists():
             raise FileNotFoundError(
-                f"Processed panel arrays not found: {npz_path}. Run Code/preprocess_cn_data.py first."
+                f"Processed panel arrays not found: {npz_path}. Run Code/main.py --stages data --data-steps preprocess_panels first."
             )
         arrays_raw = np.load(npz_path, allow_pickle=False)
         arrays = {name: arrays_raw[name] for name in arrays_raw.files}
@@ -1570,14 +1570,14 @@ def _load_proc_panel_file(proc_root: Path, sample_mode: str, panel_name: str) ->
     bar_times = list(meta.get("bar_times", []))
     if "R_5min_full" not in arrays:
         raise ValueError(
-            f"旧版面板缺少 R_5min_full: {meta_path}. 请先重新运行 Code/preprocess_cn_data.py --refresh 重建 proc_Data。"
+            f"旧版面板缺少 R_5min_full: {meta_path}. 请先重新运行 Code/main.py --stages data --data-steps preprocess_panels --refresh 重建 proc_Data。"
         )
     if arrays["R_intra"].ndim != 2 or arrays["R_night"].ndim != 2 or arrays["R_daily"].ndim != 2:
-        raise ValueError(f"检测到旧版面板结构: {meta_path}. 请重新运行 Code/preprocess_cn_data.py --refresh。")
+        raise ValueError(f"检测到旧版面板结构: {meta_path}. 请重新运行 Code/main.py --stages data --data-steps preprocess_panels --refresh。")
     if arrays["R_intra"].shape != arrays["R_night"].shape or arrays["R_daily"].shape != arrays["R_intra"].shape:
-        raise ValueError(f"面板日频收益形状不一致: {meta_path}. 请重新运行 Code/preprocess_cn_data.py --refresh。")
+        raise ValueError(f"面板日频收益形状不一致: {meta_path}. 请重新运行 Code/main.py --stages data --data-steps preprocess_panels --refresh。")
     if arrays["R_intra"].shape[0] != len(dates):
-        raise ValueError(f"面板日频行数与交易日数不一致: {meta_path}. 请重新运行 Code/preprocess_cn_data.py --refresh。")
+        raise ValueError(f"面板日频行数与交易日数不一致: {meta_path}. 请重新运行 Code/main.py --stages data --data-steps preprocess_panels --refresh。")
     if arrays["R_5min_full"].shape[1] != len(tickers):
         raise ValueError(f"R_5min_full 列数与股票数不一致: {meta_path}.")
     if bar_times and arrays["R_5min_full"].shape[0] != len(dates) * len(bar_times):
@@ -4707,7 +4707,6 @@ def _maybe_save_plot(
     fig, ax = plt.subplots(figsize=(10, 4))
     for col in y_cols:
         ax.plot(series_df[x_col], series_df[col], label=col)
-    ax.set_title(title)
     ax.set_xlabel(x_col)
     ax.legend()
     fig.tight_layout()
@@ -4772,7 +4771,6 @@ def _save_line_plot(df: pd.DataFrame, x_col: str, y_cols: Sequence[str], title: 
     for col in y_cols:
         if col in df.columns:
             ax.plot(df[x_col], df[col], label=col, linewidth=1.5)
-    ax.set_title(title)
     ax.set_xlabel(x_col)
     if ylabel:
         ax.set_ylabel(ylabel)
@@ -4824,7 +4822,6 @@ def _save_cumulative_factor_grid_plot(
         axes_arr[0].legend(loc="best", fontsize=8)
     for ax in axes_arr[: len(factors)]:
         ax.set_xlabel("date")
-    fig.suptitle(title)
     fig.autofmt_xdate(rotation=30)
     fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
     _atomic_save_figure(fig, output_path, dpi=160)
@@ -4841,7 +4838,6 @@ def _save_bar_plot(df: pd.DataFrame, x_col: str, y_col: str, title: str, output_
         pivot.plot(kind="bar", ax=ax, width=0.82)
     else:
         ax.bar(df[x_col].astype(str), df[y_col])
-    ax.set_title(title)
     ax.set_xlabel(x_col)
     if ylabel:
         ax.set_ylabel(ylabel)
@@ -4857,7 +4853,6 @@ def _save_heatmap(matrix: np.ndarray, x_labels: Sequence[str], y_labels: Sequenc
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(11, 5.5))
     image = ax.imshow(matrix, aspect="auto", cmap="coolwarm")
-    ax.set_title(title)
     ax.set_xticks(np.arange(len(x_labels)))
     ax.set_xticklabels(list(x_labels), rotation=75, ha="right", fontsize=7)
     ax.set_yticks(np.arange(len(y_labels)))
@@ -5373,7 +5368,7 @@ def run_cn_replication(
         manifest_path = proc_root / "manifest.json"
         if not manifest_path.exists():
             raise FileNotFoundError(
-                f"Processed data manifest not found: {manifest_path}. Run Code/preprocess_cn_data.py first."
+                f"Processed data manifest not found: {manifest_path}. Run Code/main.py --stages data --data-steps preprocess_panels first."
             )
 
         t = time.perf_counter()

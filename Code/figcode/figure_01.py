@@ -112,7 +112,6 @@ def _plot_er_panel(df: pd.DataFrame, panel_block: str, title: str, output_path: 
         ax.grid(True, alpha=0.25)
         ax.legend(loc="best", fontsize=8, ncol=2)
 
-    fig.suptitle(title, fontsize=13, y=0.995)
     axes[-1].set_xlabel("k")
     fig.text(
         0.5,
@@ -121,7 +120,7 @@ def _plot_er_panel(df: pd.DataFrame, panel_block: str, title: str, output_path: 
         ha="center",
         fontsize=10,
     )
-    fig.tight_layout(rect=(0, 0.035, 1, 0.965))
+    fig.tight_layout(rect=(0, 0.035, 1, 0.985))
     _atomic_save_figure(fig, output_path, dpi=160)
     plt.close(fig)
     return summary_df

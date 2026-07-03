@@ -1,6 +1,6 @@
 """
-figcode/figure_03.py
-====================
+figCode/_weights.py
+===================
 
 Figure 3 —— Proxy Factor Portfolio Weights（代理因子组合权重热图）
 
@@ -19,20 +19,16 @@ Figure 3 —— Proxy Factor Portfolio Weights（代理因子组合权重热图�
 
 from __future__ import annotations
 
-# --- 允许 `python figcode/xxx.py` / `python tablecode/xxx.py` 直接运行时找到 core 包 ---
+# --- 允许 `python figCode/xxx.py` / `python tableCode/xxx.py` 直接运行时找到 core 包 ---
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
 from pathlib import Path
 
-from core.config import RunConfig
-from core.engine import ReplicationResult
-from core.io_utils import figure_path, figure_title, _save_heatmap, _save_placeholder_figure, _atomic_save_figure
-from core.logging_utils import log_step, log_render
-from core.runner import run_standalone
+from core.io_utils import _save_heatmap, _save_placeholder_figure, _atomic_save_figure
+from core.logging_utils import log_render
 
-TAG = "figure_03"
-FIGURE_NUMBER = 3
+TAG = "figure_weights"
 
 
 def plot_weight_heatmap(df, title: str, output_path: Path) -> None:
@@ -150,8 +146,7 @@ def plot_industry_sorted_bars(W, tickers, industry_lookup: dict, k_count: int, t
             title="Industry",
             title_fontsize=8,
         )
-    fig.suptitle(title, y=0.995, fontsize=11)
-    fig.tight_layout(rect=(0, 0, 0.82 if industry_lookup else 1.0, 0.975))
+    fig.tight_layout(rect=(0, 0, 0.82 if industry_lookup else 1.0, 0.985))
     _atomic_save_figure(fig, output_path, dpi=160)
     plt.close(fig)
 
@@ -176,7 +171,6 @@ def plot_industry_sorted_heatmap(W, tickers, industry_lookup: dict, k_count: int
     fig, ax = plt.subplots(figsize=(max(11, len(tickers) * 0.045), 4.6))
     vmax = float(np.nanmax(np.abs(mat))) if np.isfinite(mat).any() else 1.0
     image = ax.imshow(mat, aspect="auto", cmap="coolwarm", vmin=-vmax, vmax=vmax)
-    ax.set_title(title)
     ax.set_yticks(np.arange(k_count))
     ax.set_yticklabels([f"Factor {i + 1}" for i in range(k_count)])
     ax.set_xticks([])  # 股票太多，不逐个标代码；改在行业块中心标行业名
@@ -228,20 +222,3 @@ def _full_weight_heatmap(result, cfg, *, proxy: bool, title: str, output_path: P
         log_render(TAG, f"行业排序柱状图回退到旧实现: {exc!r}")
         df = result.proxy_weights if proxy else result.pca_weights
         plot_weight_heatmap(df, title, output_path)
-
-
-def generate(result: ReplicationResult, cfg: RunConfig) -> Path:
-    title = figure_title(FIGURE_NUMBER)
-    output_path = figure_path(result, FIGURE_NUMBER)
-
-    # ---------------- 数据处理 ----------------
-    log_step(TAG, "重算全市场 proxy 权重，按行业排序，准备绘制因子×股票热图")
-
-    # ---------------- 图表输出 ----------------
-    log_render(TAG, "绘制代理因子权重热图（按行业排序，1:1 论文 Figure 3）")
-    _full_weight_heatmap(result, cfg, proxy=True, title=title, output_path=output_path)
-    return output_path
-
-
-if __name__ == "__main__":
-    raise SystemExit(run_standalone(TAG, generate))

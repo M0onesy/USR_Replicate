@@ -292,7 +292,7 @@ MAIN_RUN_PROFILES["final_paper_export_hpc_96g"] = replace(
 )
 MAIN_RUN_PROFILES["final_paper_export_hpc"] = MAIN_RUN_PROFILES["final_paper_export_hpc_64g"]
 
-ACTIVE_MAIN_PROFILE = "submission_core_rebuild"
+ACTIVE_MAIN_PROFILE = "submission_core"
 
 
 def available_main_profile_names() -> List[str]:

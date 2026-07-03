@@ -1,5 +1,5 @@
 """
-figcode/figure_04.py
+figCode/figure_04.py
 ====================
 
 Figure 4 —— Continuous PCA Factor Portfolio Weights（连续 PCA 因子组合权重热图）
@@ -11,12 +11,12 @@ Figure 4 —— Continuous PCA Factor Portfolio Weights（连续 PCA 因子组�
 数据来源：
   result.pca_weights（列：factor, rank, symbol, weight）。
 
-绘图逻辑复用 figure_03.plot_weight_heatmap。
+绘图逻辑复用 figCode._weights helpers。
 """
 
 from __future__ import annotations
 
-# --- 允许 `python figcode/xxx.py` / `python tablecode/xxx.py` 直接运行时找到 core 包 ---
+# --- 允许 `python figCode/xxx.py` / `python tableCode/xxx.py` 直接运行时找到 core 包 ---
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
@@ -27,7 +27,7 @@ from core.engine import ReplicationResult
 from core.io_utils import figure_path, figure_title
 from core.logging_utils import log_step, log_render
 from core.runner import run_standalone
-from figcode.figure_03 import plot_weight_heatmap, _full_weight_heatmap
+from figCode._weights import _full_weight_heatmap
 
 TAG = "figure_04"
 FIGURE_NUMBER = 4

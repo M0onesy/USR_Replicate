@@ -1,51 +1,49 @@
-"""
-tablecode/table_ii.py
-=====================
-
-Table II —— Balanced and Unbalanced Panel Results（平衡与非平衡面板结果）
-
-论文含义：
-  论文要论证"严格平衡面板"提取出的因子能代表更广的非平衡全样本。Table II 通过
-  比较平衡面板因子空间与非平衡面板因子空间的"广义相关性 (generalized correlation)"
-  来量化这种代表性——相关性高，说明用平衡面板做 PCA 不会丢失系统性结构。
-
-数据来源：
-  result.paper_table_ii（逐年、balanced vs unbalanced 的因子空间 GC 汇总）。
-
-数据处理 vs 表格输出：
-  - 数据处理：取出已算好的 Table II。
-  - 表格输出：写入权威 CSV（无旧别名）。
-"""
-
 from __future__ import annotations
-
-# --- 允许 `python figcode/xxx.py` / `python tablecode/xxx.py` 直接运行时找到 core 包 ---
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
 from pathlib import Path
 
 from core.config import RunConfig
 from core.engine import ReplicationResult
-from core.io_utils import table_path, _atomic_to_csv
-from core.logging_utils import log_step, log_render
+from core.logging_utils import log_info, log_render, log_step
 from core.runner import run_standalone
+from core.submission_fast import build_submission_table_ii_paper_style
+from tableCode._common import diagnostics_dir, output_path, write_csv, write_json, write_table_with_fallback
+
 
 TAG = "table_ii"
 ROMAN = "II"
 
 
+def export_fast(cfg: RunConfig) -> Path:
+    diag_dir = diagnostics_dir(cfg)
+    wide, long = build_submission_table_ii_paper_style(cfg, jump_a=float(cfg.jump_a))
+    diagnostics_wide_path = diag_dir / "table_ii_paper_style_fixed_k.csv"
+    diagnostics_long_path = diag_dir / "table_ii_paper_style_fixed_k_long.csv"
+    write_csv(diagnostics_wide_path, wide)
+    write_csv(diagnostics_long_path, long)
+    path = write_table_with_fallback(output_path(cfg, ROMAN), wide, "paper_style_fixed_k", TAG)
+    write_json(
+        diag_dir / "table_ii_paper_style_fixed_k_summary.json",
+        {
+            "table": "Table II",
+            "mode": "submission_fast_paper_style_fixed_k",
+            "output_path": str(path),
+            "diagnostics_wide_path": str(diagnostics_wide_path),
+            "diagnostics_long_path": str(diagnostics_long_path),
+            "rows": int(wide.shape[0]),
+            "long_rows": int(long.shape[0]),
+            "blocks": wide["block"].dropna().unique().tolist() if "block" in wide else [],
+        },
+    )
+    log_info(TAG, f"Generated paper-style fixed-K Table II with {wide.shape[0]} rows.")
+    return path
+
+
 def generate(result: ReplicationResult, cfg: RunConfig) -> Path:
-    canonical = table_path(result, ROMAN)
-
-    # ---------------- 数据处理 ----------------
-    df = result.paper_table_ii
-    log_step(TAG, f"取出已算好的 Table II（{df.shape[0]} 行 × {df.shape[1]} 列）")
-
-    # ---------------- 表格输出 ----------------
-    log_render(TAG, f"写入 {canonical.name}")
-    _atomic_to_csv(df, canonical, index=False, encoding="utf-8-sig")
-    return canonical
+    log_step(TAG, "Build Table II from fixed-intersection and yearly balanced panels.")
+    path = export_fast(cfg)
+    log_render(TAG, f"Wrote {path.name}")
+    return path
 
 
 if __name__ == "__main__":

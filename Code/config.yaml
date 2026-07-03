@@ -1,0 +1,59 @@
+# Submission-oriented runtime configuration.
+# Command-line arguments passed to Code/main.py override these values.
+
+stages:
+  - figures
+  - tables
+
+figures:
+  - fig1
+  - fig2
+  - fig4
+  - fig7
+  - fig10
+  - fig12
+  - fig13
+  - fig14
+  - fig15
+
+tables:
+  - table_i
+  - table_ii
+  - table_iii
+  - table_v
+
+data_steps: []
+
+paths:
+  proc_root: Data/proc_Data/pelger_cn_adjusted
+  runtime_root: Data/proc_Data/pelger_cn_adjusted/runtime
+  final_result_root: Result/pelger_cn_adjusted
+  external_data_root: Data/external_Data/pelger_tail
+  paper_tail_root: Data/proc_Data/pelger_cn_adjusted/paper_tail
+  rf_file: Data/external_Data/pelger_tail/factors/rf/risk_free.csv
+
+run:
+  fail_fast: true
+  refresh_paper_tail: false
+  strict_final_export: true
+  rebuild_result: false
+  restart: false
+  balanced_mode: strict_balanced
+  workers:
+  panel_workers:
+  paper_workers:
+  rolling_workers:
+  memory_budget_gb:
+
+data:
+  preprocess_panels:
+    refresh: false
+    years:
+    max_stocks:
+    compress_symbol_returns: false
+  mom_5min:
+    lookback_bars: 48
+    skip_bars: 1
+    winner_pct: 0.3
+    loser_pct: 0.3
+    min_stocks: 5

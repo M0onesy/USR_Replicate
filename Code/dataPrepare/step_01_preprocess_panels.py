@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RAW_ROOT = REPO_ROOT / "Data" / "kline_Data" / "EXTRA_STOCK_A"
 DEFAULT_FACTOR_PATH = REPO_ROOT / "Data" / "fact_Data" / "backward_factor.csv"
 DEFAULT_PROC_ROOT = REPO_ROOT / "Data" / "proc_Data" / "pelger_cn_adjusted"
@@ -742,7 +742,7 @@ def _align_symbol_to_panel(
         intra_col[target_idx] = arrays["intraday_returns"][source_idx]
         if "full_5min_returns" not in arrays:
             raise KeyError(
-                f"{symbol} 缺少 full_5min_returns，请重新运行 preprocess_cn_data.py --refresh 生成新版逐股票缓存"
+                f"{symbol} 缺少 full_5min_returns，请重新运行 Code/main.py --stages data --data-steps preprocess_panels --refresh 生成新版逐股票缓存"
             )
         full_5min_col[target_idx, :] = arrays["full_5min_returns"][source_idx]
         night_col[target_idx] = arrays["overnight_returns"][source_idx]

@@ -28,7 +28,7 @@ def generate(result: ReplicationResult, cfg: RunConfig) -> Path:
     output_path = figure_path(result, FIGURE_NUMBER)
 
     try:
-        from figcode._timevar import render_fig7
+        from figCode._timevar import render_fig7
 
         log_render(TAG, "Rendering Figure 7 with the local-vs-global weight generalized-correlation implementation.")
         render_fig7(result, cfg, output_path, title)
