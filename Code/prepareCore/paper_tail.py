@@ -2558,13 +2558,6 @@ def render_figure_15(result: Any, output_path: Path, title: str) -> None:
     _render_pricing_figure(df if isinstance(df, pd.DataFrame) else pd.DataFrame(), output_path, full_title)
 
 
-def render_figure_15(result: Any, output_path: Path, title: str) -> None:
-    payload = getattr(result, "paper_tail", {}) or {}
-    df = payload.get("pricing_size_value")
-    full_title = f"{title}\nA-share reconstructed 2x3 portfolios; sample starts 2014-07-01"
-    _render_pricing_figure(df if isinstance(df, pd.DataFrame) else pd.DataFrame(), output_path, full_title)
-
-
 def build_replication_coverage_report() -> pd.DataFrame:
     rows = [
         ("Table I", "Summary Statistics for Continuous and Jump Returns", "implemented_adapted", "Balanced and unbalanced yearly jump/continuous tables come from the main replication cache."),
