@@ -1,4 +1,9 @@
 from __future__ import annotations
+"""Figure 13 renderer.
+
+Uses strict continuous PCA, yearly aligned changing-universe PCA, and FFC
+factor returns prepared in `paper_tail`. This file only renders the final plot.
+"""
 
 import os as _os
 import sys as _sys

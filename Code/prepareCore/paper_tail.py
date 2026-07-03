@@ -1,4 +1,12 @@
 from __future__ import annotations
+"""Supplement-backed tail assets and rendering helpers for Figures 12-15.
+
+The upstream PCA is built elsewhere. This module handles the "tail" layer:
+industry/size-value assets, FFC segmented returns, Figure 12/13 data, pricing
+frames, and final renderers for Figures 12-15. Refreshing this layer can be
+slower because it scans full-market asset inputs, so normal submission runs
+reuse the cached `paper_tail` unless RF or external tail data changed.
+"""
 
 import hashlib
 import json
@@ -72,8 +80,10 @@ def _size_value_start() -> Optional[pd.Timestamp]:
 
 
 # PAPER_TAIL_VERSION 提升以触发尾部缓存重建（应用本批论文保真修复）。
-PAPER_TAIL_VERSION = 6
-PAPER_TAIL_ALGORITHM_VERSION = "paper_faithful_v4_submission"
+PAPER_TAIL_VERSION = 7
+PAPER_TAIL_ALGORITHM_VERSION = "paper_faithful_v5_submission_rf_split"
+RF_INTRADAY_SHARE = 4.0 / 24.0
+RF_OVERNIGHT_SHARE = 20.0 / 24.0
 PORTFOLIO_ORDER = ["SL", "SM", "SH", "BL", "BM", "BH"]
 # N7：Figure 12 分组标题里的行业/规模组合数改为动态填充（新映射 11 桶）。
 GROUP_TITLES = {
@@ -169,19 +179,22 @@ def _find_file(root: Path, filename: str) -> Path:
 
 
 def _normalize_code(series: pd.Series) -> pd.Series:
-    out = series.astype(str).str.strip().str.upper()
-    out = out.str.replace(r"\.0+$", "", regex=True)
-    out = out.str.replace(r"\.XSHE$", ".SZ", regex=True)
-    out = out.str.replace(r"\.XSHG$", ".SH", regex=True)
-    digits_only = out.str.fullmatch(r"\d+", na=False)
-    out.loc[digits_only] = out.loc[digits_only].str.zfill(6)
-    needs_suffix = out.str.fullmatch(r"\d{6}", na=False)
-    out.loc[needs_suffix] = np.where(
-        out.loc[needs_suffix].str.startswith(("6", "9")),
-        out.loc[needs_suffix] + ".SH",
-        out.loc[needs_suffix] + ".SZ",
-    )
-    return out
+    import re
+
+    def _one(value: Any) -> str:
+        text = "" if pd.isna(value) else str(value)
+        text = text.strip().upper()
+        text = re.sub(r"\.0+$", "", text)
+        text = re.sub(r"\.XSHE$", ".SZ", text)
+        text = re.sub(r"\.XSHG$", ".SH", text)
+        if re.fullmatch(r"\d+", text):
+            text = text.zfill(6)
+        if re.fullmatch(r"\d{6}", text):
+            suffix = ".SH" if text.startswith(("6", "9")) else ".SZ"
+            text = f"{text}{suffix}"
+        return text
+
+    return pd.Series([_one(value) for value in series.to_numpy(dtype=object, copy=False)], index=series.index, dtype=object)
 
 
 def _weighted_average(values: np.ndarray, weights: np.ndarray) -> np.ndarray:
@@ -475,7 +488,7 @@ def _load_rf_series(path: Path) -> pd.Series:
     elif {"Clsdt", "Nrrdata"}.issubset(df.columns):
         df["date"] = pd.to_datetime(df["Clsdt"], errors="coerce")
         annual_pct = pd.to_numeric(df["Nrrdata"], errors="coerce")
-        df["rf_log_daily"] = np.log1p((annual_pct / 100.0) / 365.0)
+        df["rf_log_daily"] = np.log1p((annual_pct / 100.0) / float(_annualization_days()))
     else:
         raise ValueError(
             f"Unsupported RF file format: {path}. Expected date/rf_log_daily or CSMAR Clsdt/Nrrdaydt columns."
@@ -572,6 +585,7 @@ def _build_full_market_assets(
     date_index = {int(ts.strftime("%Y%m%d")): idx for idx, ts in enumerate(global_dates)}
     sample_mask = global_dates.isin(sample_dates)
     rf_daily_arr = rf_daily.reindex(global_dates, fill_value=0.0).to_numpy(dtype=float)
+    rf_by_segment = _segment_rf_vectors(rf_daily_arr)
     industry_lookup = dict(zip(industry_map["ts_code"], industry_map["std_industry"]))
     industry_names = sorted(industry_map["std_industry"].dropna().unique().tolist())
     industry_index = {name: idx for idx, name in enumerate(industry_names)}
@@ -609,8 +623,8 @@ def _build_full_market_assets(
                 {
                     "group": "all_stocks",
                     "asset": symbol,
-                    "mean_intraday_excess": float(np.nanmean(intra[sample_valid])),
-                    "mean_overnight_excess": float(np.nanmean(night[sample_valid] - rf_sample)),
+                    "mean_intraday_excess": float(np.nanmean(intra[sample_valid] - rf_by_segment["intraday"][rows_sample])),
+                    "mean_overnight_excess": float(np.nanmean(night[sample_valid] - rf_by_segment["overnight"][rows_sample])),
                     "mean_daily_excess": float(np.nanmean(daily[sample_valid] - rf_sample)),
                     "n_obs": int(sample_valid.sum()),
                 }
@@ -879,14 +893,15 @@ def _validate_size_value(
 
 def _summarize_balanced_panel(result: Any, rf_daily_sample: np.ndarray) -> pd.DataFrame:
     panel = result.panel
+    rf_by_segment = _segment_rf_vectors(rf_daily_sample)
     rows: List[Dict[str, Any]] = []
     for col_idx, symbol in enumerate(panel.tickers):
         rows.append(
             {
                 "group": "balanced_panel_individual_stocks",
                 "asset": symbol,
-                "mean_intraday_excess": float(np.nanmean(panel.R_intra[:, col_idx])),
-                "mean_overnight_excess": float(np.nanmean(panel.R_night[:, col_idx] - rf_daily_sample)),
+                "mean_intraday_excess": float(np.nanmean(panel.R_intra[:, col_idx] - rf_by_segment["intraday"])),
+                "mean_overnight_excess": float(np.nanmean(panel.R_night[:, col_idx] - rf_by_segment["overnight"])),
                 "mean_daily_excess": float(np.nanmean(panel.R_daily[:, col_idx] - rf_daily_sample)),
                 "n_obs": int(panel.D),
             }
@@ -1035,6 +1050,7 @@ def _build_ffc_segmented_frames(
     vw_assets = size_value_assets_df.loc[size_value_assets_df["weighting"].eq("value_weighted")].copy()
     official_daily = ffc_external_daily.set_index("date").reindex(dates)
     rf_daily = official_daily["RF"].fillna(0.0)
+    rf_split = _segment_rf_vectors(rf_daily.to_numpy(dtype=float))
     mom_daily = official_daily["MOM"].fillna(0.0)
 
     raw_mats: Dict[str, np.ndarray] = {}
@@ -1047,10 +1063,10 @@ def _build_ffc_segmented_frames(
         smb = pivot[["SL", "SM", "SH"]].mean(axis=1) - pivot[["BL", "BM", "BH"]].mean(axis=1)
         hml = 0.5 * (pivot["SH"] + pivot["BH"]) - 0.5 * (pivot["SL"] + pivot["BL"])
         if segment_kind == "intraday":
-            market_factor = market_vw["intraday"]
+            market_factor = market_vw["intraday"] - rf_split["intraday"]
             mom = mom_daily
         else:
-            market_factor = market_vw["overnight"] - rf_daily
+            market_factor = market_vw["overnight"] - rf_split["overnight"]
             mom = pd.Series(0.0, index=dates)
         raw_mats[segment_kind] = np.column_stack(
             [
@@ -1342,11 +1358,11 @@ def _gc_row(label: str, panel_name: str, n_factors: int, sample_n: int, gc: np.n
 
 
 def _segment_rf_vectors(rf_daily_sample: np.ndarray) -> Dict[str, np.ndarray]:
-    zeros = np.zeros(len(rf_daily_sample), dtype=float)
+    """Split daily RF into intraday/overnight/daily components consistently."""
     daily_rf = np.asarray(rf_daily_sample, dtype=float)
     return {
-        "intraday": zeros,
-        "overnight": daily_rf,
+        "intraday": daily_rf * RF_INTRADAY_SHARE,
+        "overnight": daily_rf * RF_OVERNIGHT_SHARE,
         "daily": daily_rf,
     }
 
@@ -1570,13 +1586,17 @@ def _build_figure12_data(
     rf_daily_sample: np.ndarray,
     weighting: str,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Build Figure 12 scatter data from stocks, industry portfolios and 2x3 assets."""
     rows = [balanced_summary, all_stock_summary]
     official_industry = industry_assets.loc[industry_assets["weighting"].eq(weighting) & industry_assets["date"].isin(sample_dates)].copy()
     rf_by_date = pd.Series(rf_daily_sample, index=sample_dates)
     official_industry["rf"] = official_industry["date"].map(rf_by_date).fillna(0.0)
+    official_industry["rf_segment"] = 0.0
+    official_industry.loc[official_industry["segment_kind"].eq("intraday"), "rf_segment"] = official_industry["rf"] * RF_INTRADAY_SHARE
+    official_industry.loc[official_industry["segment_kind"].eq("overnight"), "rf_segment"] = official_industry["rf"] * RF_OVERNIGHT_SHARE
+    official_industry.loc[official_industry["segment_kind"].eq("daily"), "rf_segment"] = official_industry["rf"]
     official_industry["ret_excess"] = official_industry["ret"]
-    mask_non_intra = official_industry["segment_kind"].isin(["overnight", "daily"])
-    official_industry.loc[mask_non_intra, "ret_excess"] = official_industry.loc[mask_non_intra, "ret"] - official_industry.loc[mask_non_intra, "rf"]
+    official_industry["ret_excess"] = official_industry["ret"] - official_industry["rf_segment"]
 
     industry_summary = (
         official_industry.pivot_table(index=["portfolio"], columns="segment_kind", values="ret_excess", aggfunc="mean")
@@ -1596,9 +1616,12 @@ def _build_figure12_data(
 
     official_sv = size_value_assets.loc[size_value_assets["weighting"].eq(weighting) & size_value_assets["date"].isin(sample_dates)].copy()
     official_sv["rf"] = official_sv["date"].map(rf_by_date).fillna(0.0)
+    official_sv["rf_segment"] = 0.0
+    official_sv.loc[official_sv["segment_kind"].eq("intraday"), "rf_segment"] = official_sv["rf"] * RF_INTRADAY_SHARE
+    official_sv.loc[official_sv["segment_kind"].eq("overnight"), "rf_segment"] = official_sv["rf"] * RF_OVERNIGHT_SHARE
+    official_sv.loc[official_sv["segment_kind"].eq("daily"), "rf_segment"] = official_sv["rf"]
     official_sv["ret_excess"] = official_sv["ret"]
-    mask_non_intra_sv = official_sv["segment_kind"].isin(["overnight", "daily"])
-    official_sv.loc[mask_non_intra_sv, "ret_excess"] = official_sv.loc[mask_non_intra_sv, "ret"] - official_sv.loc[mask_non_intra_sv, "rf"]
+    official_sv["ret_excess"] = official_sv["ret"] - official_sv["rf_segment"]
     size_summary = (
         official_sv.pivot_table(index=["portfolio"], columns="segment_kind", values="ret_excess", aggfunc="mean")
         .rename(columns={"intraday": "mean_intraday_excess", "overnight": "mean_overnight_excess", "daily": "mean_daily_excess"})
@@ -1844,6 +1867,7 @@ def _build_pricing_frame(
     factor_sets: Mapping[str, Mapping[str, np.ndarray]],
     rf_daily_sample: np.ndarray,
 ) -> pd.DataFrame:
+    """Run time-series pricing regressions for Figure 14/15 asset panels."""
     import prepareCore.engine as eng
 
     assets = sorted(asset_df["portfolio"].dropna().unique().tolist())
@@ -1856,8 +1880,7 @@ def _build_pricing_frame(
             .reindex(columns=assets)
             .to_numpy(dtype=float)
         )
-        if segment in {"overnight", "daily"}:
-            asset_matrix = asset_matrix - np.asarray(rf_daily_sample, dtype=float)[:, None]
+        asset_matrix = asset_matrix - _segment_rf_vectors(rf_daily_sample)[segment][:, None]
         for factor_set_name, matrices in factor_sets.items():
             factor_matrix = matrices[segment]
             Y, F = _drop_invalid_rows(asset_matrix, factor_matrix)
@@ -2123,6 +2146,11 @@ def refresh_paper_tail_views(
     refresh_paper_tail: bool = True,
     strict_final_export: bool | None = None,
 ) -> Dict[str, Any]:
+    """Refresh or load cached paper_tail assets.
+
+    Use `--refresh-paper-tail` after replacing RF or external tail data. Normal
+    figure/table runs should leave refresh disabled and reuse the cached layer.
+    """
     if not refresh_paper_tail:
         return getattr(result, "paper_tail", {}) if hasattr(result, "paper_tail") else {}
     if strict_final_export is not None:
@@ -2192,6 +2220,7 @@ def _short_asset_label_ascii(text: str) -> str:
 """
 
 def render_figure_12(result: Any, output_path: Path, title: str) -> None:
+    """Render expected intraday vs overnight returns for stock/asset groups."""
     from prepareCore.engine import _atomic_save_figure, _save_placeholder_figure
 
     try:
@@ -2250,6 +2279,8 @@ def render_figure_12(result: Any, output_path: Path, title: str) -> None:
         ax.set_xlabel("Expected intraday excess return")
         ax.set_ylabel("Expected overnight excess return")
         label_map = _asset_label_map(sub["asset"]) if group == "industry_portfolios" else {}
+        if label_map:
+            _write_industry_label_map(output_path, label_map)
         if group != "all_stocks" or len(sub) <= 16:
             for label_idx, (_, row) in enumerate(sub.iterrows()):
                 _annotate_scatter_label(
@@ -2270,6 +2301,7 @@ def render_figure_12(result: Any, output_path: Path, title: str) -> None:
 
 
 def render_figure_13(result: Any, output_path: Path, title: str) -> None:
+    """Render normalized cumulative returns for PCA and FFC factor sets."""
     from prepareCore.engine import _atomic_save_figure, _save_placeholder_figure
 
     try:
@@ -2290,6 +2322,7 @@ def render_figure_13(result: Any, output_path: Path, title: str) -> None:
         "Continuous PCA (unbalanced, yearly aligned)",
         "FFC 4-factor",
     ]
+    factor_display = {"MKT_excess": "MKT"}
     present = list(df["factor_set"].unique()) if "factor_set" in df.columns else []
     factor_sets = [factor_set for factor_set in preferred if factor_set in present] or preferred
     fig, axes = plt.subplots(len(factor_sets), 3, figsize=(16.8, 4.8 * len(factor_sets)), sharex=True)
@@ -2307,7 +2340,7 @@ def render_figure_13(result: Any, output_path: Path, title: str) -> None:
                     pd.to_datetime(factor_df["date"]),
                     factor_df["normalized_cumulative_return"],
                     linewidth=1.4,
-                    label=str(factor_name),
+                    label=factor_display.get(str(factor_name), str(factor_name)),
                 )
             ax.grid(True, alpha=0.2)
             if row_idx == len(factor_sets) - 1:
@@ -2345,7 +2378,7 @@ def _asset_label_map(values: Any) -> Dict[str, str]:
         if raw in {"BH", "BL", "BM", "SH", "SL", "SM"}:
             mapping[raw] = raw
         elif raw in _INDUSTRY_EN_LABELS:
-            mapping[raw] = f"I{idx:02d}"
+            mapping[raw] = _INDUSTRY_EN_LABELS[raw]
         else:
             try:
                 raw.encode("ascii")
@@ -2353,6 +2386,19 @@ def _asset_label_map(values: Any) -> Dict[str, str]:
             except UnicodeEncodeError:
                 mapping[raw] = f"IND{idx:02d}"
     return mapping
+
+
+def _write_industry_label_map(output_path: Path, mapping: Mapping[str, str]) -> None:
+    try:
+        rows = [
+            {"raw_label": raw, "display_label": label}
+            for raw, label in sorted(mapping.items(), key=lambda item: str(item[1]))
+            if raw in _INDUSTRY_EN_LABELS
+        ]
+        if rows:
+            pd.DataFrame(rows).to_csv(output_path.parent / "industry_label_map.csv", index=False, encoding="utf-8-sig")
+    except Exception:
+        return
 
 
 def _plot_asset_label(asset: Any, label_map: Mapping[str, str]) -> str:
@@ -2429,6 +2475,7 @@ def _render_pricing_figure(df: pd.DataFrame, output_path: Path, title: str) -> N
     seg_label = {"daily": "Daily", "intraday": "Intraday", "overnight": "Overnight"}
     set_label = {"Continuous PCA": "Continuous PCA", "FFC 4-factor": "FFC"}
     asset_label_map = _asset_label_map(df["asset"]) if "asset" in df.columns else {}
+    _write_industry_label_map(output_path, asset_label_map)
 
     fig = plt.figure(figsize=(17.2, 16.8))
     grid = GridSpec(5, 3, figure=fig, height_ratios=[1.0, 1.0, 0.12, 1.0, 1.0], hspace=0.55, wspace=0.32)
@@ -2497,12 +2544,14 @@ def _render_pricing_figure(df: pd.DataFrame, output_path: Path, title: str) -> N
 
 
 def render_figure_14(result: Any, output_path: Path, title: str) -> None:
+    """Render industry-portfolio pricing diagnostics."""
     payload = getattr(result, "paper_tail", {}) or {}
     df = payload.get("pricing_industry")
     _render_pricing_figure(df if isinstance(df, pd.DataFrame) else pd.DataFrame(), output_path, title)
 
 
 def render_figure_15(result: Any, output_path: Path, title: str) -> None:
+    """Render size-value 2x3 portfolio pricing diagnostics."""
     payload = getattr(result, "paper_tail", {}) or {}
     df = payload.get("pricing_size_value")
     full_title = f"{title}\nA-share reconstructed 2x3 portfolios; sample starts 2014-07-01"
@@ -2516,8 +2565,8 @@ def build_replication_coverage_report() -> pd.DataFrame:
         ("Table III", "Generalized Correlations with Industry and FFC Factors", "implemented", "Uses supplement-backed paper_tail industry portfolios and FFC factor comparisons."),
         ("Table IV", "Time-Variation Decomposition across Frequencies", "implemented_adapted", "Rolling generalized-correlation and explained-variation diagnostics come from the main replication cache."),
         ("Table V", "Intraday / Overnight / Daily Sharpe Ratios", "implemented", "Uses canonical excess-return factor sets plus the first four continuous PCA factors."),
-        ("Figure 1", "Number of HF Factors, Unbalanced Panel", "implemented_adapted", "Submission version uses cross-year unbalanced but within-year balanced yearly panels."),
-        ("Figure 2", "Number of HF Factors, Balanced Panel", "implemented_adapted", "Submission version uses fixed full-sample intersection yearly slices with constant N."),
+        ("Figure 1", "Number of HF Factors, Yearwise-Balanced Changing Universe", "implemented_adapted", "Submission version uses cross-year changing universe but within-year balanced yearly panels."),
+        ("Figure 2", "Number of HF Factors, Fixed-Intersection Balanced Panel", "implemented_adapted", "Submission version uses fixed full-sample intersection yearly slices with constant N."),
         ("Figure 3", "Proxy Factor Portfolio Weights", "omitted_from_submission", "Removed from the submission-core export profile."),
         ("Figure 4", "Continuous PCA Factor Portfolio Weights", "implemented_adapted", "Rendered from refreshed display-layer continuous PCA weights."),
         ("Figure 5", "Monthly PCA Factor Portfolio Weights", "omitted_from_submission", "Removed from the submission-core export profile."),

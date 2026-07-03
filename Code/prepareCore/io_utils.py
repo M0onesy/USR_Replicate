@@ -63,8 +63,8 @@ def diagnostics_dir(result: ReplicationResult) -> Path:
 
 # figure_number -> (figure_id, file_name, title)
 FIGURE_SPECS: dict[int, tuple[str, str, str]] = {
-    1: ("Figure_1", "Figure_1_number_of_hf_factors_unbalanced.png", "Figure 1. Number of High-Frequency Factors, Unbalanced Panel"),
-    2: ("Figure_2", "Figure_2_number_of_hf_factors_balanced.png", "Figure 2. Number of High-Frequency Factors, Balanced Panel"),
+    1: ("Figure_1", "Figure_1_number_of_hf_factors_unbalanced.png", "Figure 1. Number of High-Frequency Factors, Yearwise-Balanced Changing Universe"),
+    2: ("Figure_2", "Figure_2_number_of_hf_factors_balanced.png", "Figure 2. Number of High-Frequency Factors, Fixed-Intersection Balanced Panel"),
     3: ("Figure_3", "Figure_3_proxy_factor_portfolio_weights.png", "Figure 3. Proxy Factor Portfolio Weights"),
     4: ("Figure_4", "Figure_4_continuous_pca_factor_portfolio_weights.png", "Figure 4. Continuous PCA Factor Portfolio Weights"),
     5: ("Figure_5", "Figure_5_monthly_pca_factor_portfolio_weights.png", "Figure 5. Monthly PCA Factor Portfolio Weights"),

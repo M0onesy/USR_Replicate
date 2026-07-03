@@ -1,4 +1,9 @@
 from __future__ import annotations
+"""Table III exporter.
+
+Reports generalized correlations between strict continuous PCA factors and
+selected industry / FFC comparison factor sets.
+"""
 
 from pathlib import Path
 

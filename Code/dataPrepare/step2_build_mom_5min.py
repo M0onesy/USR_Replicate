@@ -1,4 +1,9 @@
-"""Build a 5-minute Carhart-style MOM factor from China A-share K-lines."""
+"""Data step 2: build a 5-minute Carhart-style MOM factor.
+
+Input comes from processed/high-frequency A-share returns; output is
+`Data/proc_Data/mom_5min/mom_factor_5min.csv`, which is later reused by the
+paper_tail FFC construction. Run this only when MOM inputs or parameters change.
+"""
 
 from __future__ import annotations
 import argparse

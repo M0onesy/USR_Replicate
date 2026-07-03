@@ -1,4 +1,9 @@
 from __future__ import annotations
+"""Figure 2 renderer.
+
+Uses the full-sample fixed-intersection strict-balanced panel and slices it by
+year, so every year has the same stock universe and the same N.
+"""
 
 import os as _os
 import sys as _sys

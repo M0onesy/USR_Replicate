@@ -1,4 +1,9 @@
 from __future__ import annotations
+"""Figure 14 renderer.
+
+Renders industry-portfolio pricing panels using strict continuous PCA factors
+and FFC comparisons prepared by the lightweight submission pipeline.
+"""
 
 import os as _os
 import sys as _sys

@@ -1,4 +1,10 @@
 from __future__ import annotations
+"""Table V exporter.
+
+Summarizes intraday, overnight and daily Sharpe ratios for PCA, aligned PCA,
+industry and FFC factor sets. These are in-sample diagnostics, not a trading
+strategy backtest.
+"""
 
 from pathlib import Path
 

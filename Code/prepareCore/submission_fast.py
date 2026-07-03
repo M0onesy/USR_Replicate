@@ -1,9 +1,17 @@
 from __future__ import annotations
+"""Lightweight submission pipeline built on existing processed data.
+
+This module connects `Code/main.py` with the retained 9 figures and 4 tables.
+It intentionally avoids the historical long `paper_tables` rebuild: it loads
+`strict_balanced/full`, runs the minimal continuous PCA needed for submission
+outputs, reuses signed rolling diagnostics where safe, and prepares the
+paper_tail-based assets only when requested.
+"""
 
 import json
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -140,6 +148,53 @@ def _long_to_factor_mats(sample_dates: pd.DatetimeIndex, factor_df: pd.DataFrame
     return mats
 
 
+def _load_industry_lookup_for_cfg(cfg: RunConfig) -> Dict[str, str]:
+    external_root = Path(cfg.external_data_root)
+    candidates = [
+        external_root / "industry" / str(cfg.industry_info_filename),
+        external_root / "industry" / "stock_full_info_std_industry_final.csv",
+        external_root / "industry" / "stock_full_info_with_std_industry.csv",
+    ]
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            df = pd.read_csv(path)
+        except Exception:
+            continue
+        if {"ts_code", "std_industry"}.issubset(df.columns):
+            use = df.loc[:, ["ts_code", "std_industry"]].dropna().copy()
+        elif {"code", "std_industry"}.issubset(df.columns):
+            use = df.loc[:, ["code", "std_industry"]].dropna().rename(columns={"code": "ts_code"})
+        else:
+            continue
+        use["ts_code"] = use["ts_code"].astype(str).str.strip().str.upper()
+        use["std_industry"] = use["std_industry"].astype(str).str.strip()
+        return dict(zip(use["ts_code"], use["std_industry"]))
+    return {}
+
+
+def write_strict_panel_industry_composition(cfg: RunConfig, panel: Any, diagnostics_dir: Path) -> Path:
+    lookup = _load_industry_lookup_for_cfg(cfg)
+    rows: List[Dict[str, Any]] = []
+    for ticker in getattr(panel, "tickers", []):
+        symbol = str(ticker).strip().upper()
+        industry = lookup.get(symbol, "UNMAPPED")
+        rows.append({"symbol": symbol, "industry": industry})
+    detail = pd.DataFrame(rows)
+    if detail.empty:
+        summary = pd.DataFrame(columns=["industry", "n_symbols", "share"])
+    else:
+        summary = detail.groupby("industry", as_index=False).size().rename(columns={"size": "n_symbols"})
+        total = float(summary["n_symbols"].sum()) if not summary.empty else 0.0
+        summary["share"] = summary["n_symbols"] / total if total else np.nan
+        summary = summary.sort_values(["n_symbols", "industry"], ascending=[False, True]).reset_index(drop=True)
+    out_path = diagnostics_dir / "strict115_industry_composition.csv"
+    _write_csv(out_path, summary)
+    _write_csv(diagnostics_dir / "strict115_industry_composition_detail.csv", detail)
+    return out_path
+
+
 def _rolling_signature_matches(cfg: RunConfig) -> bool:
     run_state_path = Path(cfg.runtime_root) / "checkpoints" / "run_state.json"
     if not run_state_path.exists():
@@ -177,22 +232,57 @@ def _rolling_signature_matches(cfg: RunConfig) -> bool:
     return bool(completed) and len(completed) == int(total)
 
 
+def _submission_rolling_signature(cfg: RunConfig, pipeline: PelgerPipeline) -> Dict[str, Any]:
+    panel = pipeline.panel
+    dates = [pd.Timestamp(date) for date in panel.dates]
+    return {
+        "kind": "submission_fast_rolling",
+        "cache_signature": cfg.cache_signature(),
+        "panel_sample_mode": str(panel.sample_mode),
+        "panel_symbols": int(panel.N),
+        "panel_days": int(panel.D),
+        "date_start": dates[0].strftime("%Y-%m-%d") if dates else None,
+        "date_end": dates[-1].strftime("%Y-%m-%d") if dates else None,
+        "k_cont_hat": int(getattr(pipeline, "K_cont_hat", 0)),
+        "window_days": int(21 if panel.D >= 21 else max(5, panel.D // 3)),
+    }
+
+
+def _signatures_equal(lhs: Mapping[str, Any], rhs: Mapping[str, Any]) -> bool:
+    try:
+        left = json.dumps(lhs, ensure_ascii=False, sort_keys=True, default=str)
+        right = json.dumps(rhs, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        return False
+    return left == right
+
+
 def _persist_rolling_outputs(
     diagnostics_dir: Path,
     rolling_gc: np.ndarray,
     rolling_ev: np.ndarray,
+    signature: Mapping[str, Any],
 ) -> None:
     rolling_gc_df, rolling_ev_df = _rolling_output_frames(rolling_gc, rolling_ev)
     _atomic_to_csv(rolling_gc_df, diagnostics_dir / "rolling_gc.csv", index=False, encoding="utf-8-sig")
     _atomic_to_csv(rolling_ev_df, diagnostics_dir / "rolling_explained_variation.csv", index=False, encoding="utf-8-sig")
+    _write_json(diagnostics_dir / "rolling_signature.json", signature)
 
 
-def _load_submission_rolling_outputs(diagnostics_dir: Path) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+def _load_submission_rolling_outputs(
+    diagnostics_dir: Path,
+    *,
+    expected_signature: Mapping[str, Any],
+) -> Optional[Tuple[np.ndarray, np.ndarray]]:
     gc_path = diagnostics_dir / "rolling_gc.csv"
     ev_path = diagnostics_dir / "rolling_explained_variation.csv"
-    if not gc_path.exists() or not ev_path.exists():
+    signature_path = diagnostics_dir / "rolling_signature.json"
+    if not gc_path.exists() or not ev_path.exists() or not signature_path.exists():
         return None
     try:
+        stored_signature = _read_json(signature_path)
+        if not _signatures_equal(stored_signature, expected_signature):
+            return None
         gc_df = pd.read_csv(gc_path)
         ev_df = pd.read_csv(ev_path)
         gc_cols = [col for col in gc_df.columns if str(col).startswith("gc_")]
@@ -213,9 +303,11 @@ def _load_or_build_rolling_outputs(
     diagnostics_dir: Path,
     pipeline: PelgerPipeline,
 ) -> Tuple[np.ndarray, np.ndarray, str]:
+    """Load signed rolling diagnostics or recompute them from strict PCA."""
     rolling_dir = Path(cfg.runtime_root) / "checkpoints" / "rolling"
+    expected_signature = _submission_rolling_signature(cfg, pipeline)
     if not _rolling_signature_matches(cfg) or not rolling_dir.exists():
-        cached = _load_submission_rolling_outputs(diagnostics_dir)
+        cached = _load_submission_rolling_outputs(diagnostics_dir, expected_signature=expected_signature)
         if cached is not None:
             log_info("submission_fast", "Reusing submission-fast rolling diagnostics cache.")
             return cached[0], cached[1], "submission_fast_cache"
@@ -231,7 +323,7 @@ def _load_or_build_rolling_outputs(
             step_days=1,
             workers=max(1, workers),
         )
-        _persist_rolling_outputs(diagnostics_dir, rolling_gc, rolling_ev)
+        _persist_rolling_outputs(diagnostics_dir, rolling_gc, rolling_ev, expected_signature)
         return rolling_gc, rolling_ev, "recomputed"
 
     window_records: List[Tuple[int, np.ndarray, float]] = []
@@ -249,7 +341,7 @@ def _load_or_build_rolling_outputs(
 
     rolling_gc = np.vstack([item[1] for item in window_records])
     rolling_ev = np.asarray([item[2] for item in window_records], dtype=np.float64)
-    _persist_rolling_outputs(diagnostics_dir, rolling_gc, rolling_ev)
+    _persist_rolling_outputs(diagnostics_dir, rolling_gc, rolling_ev, expected_signature)
     return rolling_gc, rolling_ev, "checkpoint"
 
 
@@ -493,6 +585,7 @@ def build_submission_table_ii_paper_style(
     n_fig1: Dict[int, float] = {}
     n_fig2: Dict[int, float] = {}
     k_hat_fig1: Dict[int, float] = {}
+    k_hat_fig2: Dict[int, float] = {}
 
     for year in years:
         fixed_year = subset_panel_by_years(full_panel, [int(year)])
@@ -513,6 +606,8 @@ def build_submission_table_ii_paper_style(
         n_fig2[int(year)] = float(fixed_year.N)
         if int(year) in fig1_lookup:
             k_hat_fig1[int(year)] = fig1_lookup[int(year)]["K_hat"]
+        if int(year) in fig2_lookup:
+            k_hat_fig2[int(year)] = fig2_lookup[int(year)]["K_hat"]
 
         fixed_cont, fixed_jump = detect_jumps(fixed_year, a=float(jump_a))
         changing_cont, changing_jump = detect_jumps(changing_year, a=float(jump_a))
@@ -521,9 +616,9 @@ def build_submission_table_ii_paper_style(
             "jump": (fixed_jump, changing_jump),
         }
         for component, (fixed_matrix, changing_matrix) in component_payload.items():
-            fixed_pca = _panel_pca(fixed_matrix, K=3, use_corr=True)
-            changing_pca = _panel_pca(changing_matrix, K=3, use_corr=True)
-            for K in (2, 3):
+            fixed_pca = _panel_pca(fixed_matrix, K=4, use_corr=True)
+            changing_pca = _panel_pca(changing_matrix, K=4, use_corr=True)
+            for K in (2, 3, 4):
                 block = f"First {K} {component} PCA factors"
                 gc = _safe_generalized_correlations(fixed_pca.F, changing_pca.F, K)
                 for idx, value in enumerate(gc, start=1):
@@ -544,19 +639,25 @@ def build_submission_table_ii_paper_style(
     for year in years:
         if int(year) not in k_hat_fig1:
             k_hat_fig1[int(year)] = np.nan
+        if int(year) not in k_hat_fig2:
+            k_hat_fig2[int(year)] = np.nan
         if int(year) in fig2_lookup:
+            k_hat_fig2[int(year)] = fig2_lookup[int(year)]["K_hat"]
             n_fig2[int(year)] = fig2_lookup[int(year)]["n_symbols"]
 
     rows: List[Dict[str, Any]] = [
         _gc_row("Panel metadata", "K_hat (Figure 1 HF)", years, k_hat_fig1),
+        _gc_row("Panel metadata", "K_hat (Figure 2 HF)", years, k_hat_fig2),
         _gc_row("Panel metadata", "N (Figure 1 panel)", years, n_fig1),
         _gc_row("Panel metadata", "N (Figure 2 panel)", years, n_fig2),
     ]
     for block, count in [
         ("First 2 continuous PCA factors", 2),
         ("First 3 continuous PCA factors", 3),
+        ("First 4 continuous PCA factors", 4),
         ("First 2 jump PCA factors", 2),
         ("First 3 jump PCA factors", 3),
+        ("First 4 jump PCA factors", 4),
     ]:
         for idx in range(1, count + 1):
             rows.append(_gc_row(block, f"{idx}. GC", years, gc_values.get((block, idx), {})))
@@ -620,6 +721,7 @@ def _submission_gc_row(
 
 
 def build_submission_table_iii(cfg: RunConfig) -> pd.DataFrame:
+    """Build Table III from strict PCA factors and paper_tail economic factors."""
     figure13_data = _load_submission_figure13_data(cfg)
     sample_dates = pd.DatetimeIndex(sorted(pd.to_datetime(figure13_data["date"].dropna().unique())))
     pca_factor_names = [f"Factor {idx}" for idx in range(1, 5)]
@@ -802,6 +904,7 @@ def _component_weighted_sharpes(
 def build_submission_table_v(
     cfg: RunConfig,
 ) -> pd.DataFrame:
+    """Build Table V Sharpe rows from Figure 13 and paper_tail factor returns."""
     figure13_data = _load_submission_figure13_data(cfg)
     sample_dates = pd.DatetimeIndex(sorted(pd.to_datetime(figure13_data["date"].dropna().unique())))
     pca_factor_names = [f"Factor {idx}" for idx in range(1, 5)]
@@ -853,14 +956,14 @@ def build_submission_table_v(
     rows.append(
         _sharpe_row(
             "factor_set_tangency",
-            "PCA overnight",
+            "PCA (overnight-tangency weights)",
             _component_weighted_sharpes(continuous, weight_segment="overnight"),
         )
     )
     rows.append(
         _sharpe_row(
             "factor_set_tangency",
-            "PCA daily",
+            "PCA (daily-tangency weights)",
             _component_weighted_sharpes(continuous, weight_segment="daily"),
         )
     )
@@ -939,6 +1042,7 @@ def build_submission_fast_tail_payload(
     diagnostics_dir: Path,
     strict_fail: bool = True,
 ) -> Dict[str, Any]:
+    """Prepare Figure 12/13/14/15 inputs from strict PCA plus paper_tail assets."""
     sample_dates = pd.DatetimeIndex(result.panel.dates)
     payload: Dict[str, Any] = load_legacy_paper_tail_assets(cfg.paper_tail_root, weighting=cfg.paper_tail_weighting)
 
@@ -1027,6 +1131,7 @@ def build_submission_fast_result(
     strict_fail: bool = True,
     build_factor_count_diagnostics: bool = True,
 ) -> ReplicationResult:
+    """Create the in-memory result shared by all selected submission tasks."""
     cfg.export_fidelity_env()
     diagnostics_dir = _submission_fast_diagnostics_dir(cfg)
 
@@ -1088,6 +1193,7 @@ def build_submission_fast_result(
         fig2_df = build_submission_figure2_factor_counts(result)
         _write_csv(diagnostics_dir / "figure1_yearwise_balanced_changing_universe_diagnostics.csv", fig1_df)
         _write_csv(diagnostics_dir / "figure2_fixed_intersection_yearly_diagnostics.csv", fig2_df)
+        write_strict_panel_industry_composition(cfg, result.panel, diagnostics_dir)
     else:
         log_info("submission_fast", "Skipping Figure 1/2 factor-count diagnostics for RF-only tail refresh.")
 
@@ -1110,6 +1216,12 @@ def build_submission_fast_result(
         "rolling_source": rolling_source,
         "strict_panel_symbols": int(result.panel.N),
         "sample_days": int(result.panel.D),
+        "K_cont_hat": int(result.pipeline.K_cont_hat),
+        "K_jump_hat": int(result.pipeline.K_jump_hat),
+        "K_hf_hat": int(result.pipeline.K_hf_hat),
+        "K_max": int(result.pipeline.K_max),
+        "gamma": float(result.pipeline.gamma),
+        "g_fn": str(result.pipeline.g_fn),
         "pipeline_core_sec": float(pipeline_sec),
     }
     _write_json(diagnostics_dir / "submission_fast_manifest.json", manifest)

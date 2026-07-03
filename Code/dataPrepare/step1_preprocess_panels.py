@@ -1,8 +1,10 @@
-"""Preprocess China A-share 5-minute K-line data for the Pelger replication.
+"""Data step 1: preprocess China A-share 5-minute k-line data.
 
-This script is the only project stage that reads raw `data.bz2` files. It cleans
-raw bars, applies `backward_factor.csv`, and writes fixed-return panels for
-`allcode_Need.py`.
+This is the only maintained stage that reads raw `data.bz2` files. It cleans
+bars, applies `backward_factor.csv`, and writes the processed panel cache under
+`Data/proc_Data/pelger_cn_adjusted/panels/`, including `strict_balanced` and
+`paper_lenient`. Normal figure/table runs reuse these outputs and skip this
+step.
 """
 
 from __future__ import annotations

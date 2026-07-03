@@ -1,4 +1,9 @@
 from __future__ import annotations
+"""Table I exporter.
+
+Builds descriptive continuous/jump-return statistics using the same Figure 1
+and Figure 2 panel semantics. Output goes to `Result/tables/`.
+"""
 
 from pathlib import Path
 

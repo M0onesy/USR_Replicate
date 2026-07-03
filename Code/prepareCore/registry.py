@@ -1,4 +1,9 @@
-"""Task registry for the submission-version figure and table generators."""
+"""Task registry for the submission-version figure and table generators.
+
+The public task keys used in `Code/config.yaml` and CLI flags live here.
+Each key maps to a small module exposing `generate(result, cfg)`. Keeping the
+registry explicit makes the submission scope obvious: 9 figures and 4 tables.
+"""
 
 from __future__ import annotations
 
@@ -9,12 +14,14 @@ from typing import Callable, List, Optional
 
 @dataclass(frozen=True)
 class Task:
+    """A runnable figure/table task registered under a stable short key."""
     key: str
     kind: str
     module: str
     desc: str
 
     def load_generate(self) -> Callable:
+        """Import the task module lazily so `--list` stays lightweight."""
         mod = importlib.import_module(self.module)
         return getattr(mod, "generate")
 
@@ -67,6 +74,7 @@ def get_task(key: str) -> Optional[Task]:
 
 
 def resolve_keys(selectors: List[str]) -> List[Task]:
+    """Expand user selectors such as `figures`, `tables`, `all`, or `fig13`."""
     chosen: List[Task] = []
     seen = set()
 

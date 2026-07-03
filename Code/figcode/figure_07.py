@@ -1,4 +1,10 @@
 from __future__ import annotations
+"""Figure 7 renderer.
+
+Plots 21-trading-day local continuous-PCA weight structures against the global
+strict continuous-PCA benchmark. It reuses the in-memory result from main.py and
+does not rebuild processed panels.
+"""
 
 import os as _os
 import sys as _sys

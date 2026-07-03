@@ -1,10 +1,81 @@
-# Submission-oriented runtime configuration.
-# Command-line arguments passed to Code/main.py override these values.
+# =============================================================================
+# A 股 Pelger 高频 PCA 复现项目：交稿版运行配置
+# =============================================================================
+#
+# 最常用命令速查（都在仓库根目录运行）：
+#
+#   1. 默认交稿流程：按本 YAML 生成 9 张图 + 4 张表
+#      python Code/main.py
+#
+#   2. 只跑全部图：
+#      python Code/main.py --stages figures
+#
+#   3. 只跑全部表：
+#      python Code/main.py --stages tables
+#
+#   4. 只跑指定图/表（临时覆盖 YAML，不会改本文件）：
+#      python Code/main.py --figures fig1,fig2,fig4
+#      python Code/main.py --tables table_i,table_ii
+#
+#   5. 只跑数据准备：
+#      python Code/main.py --stages data --data-steps preprocess_panels
+#      python Code/main.py --stages data --data-steps mom_5min --workers 1
+#
+#   6. 查看所有可用任务：
+#      python Code/main.py --list
+#
+# 配置优先级：
+#   命令行参数 > 本 YAML > 代码默认值。
+#   例如：YAML 里 figures 写了 9 张图，但执行
+#   python Code/main.py --figures fig13
+#   会临时只跑 fig13。
+#
+# 不建议随便使用：
+#   python Code/main.py --all
+#   这会同时跑 data + figures + tables。只有你明确要重跑数据准备时才用。
+#
 
+# -----------------------------------------------------------------------------
+# 1. stages：控制“跑哪些大阶段”
+# -----------------------------------------------------------------------------
+# 可选值：
+#   data     数据准备阶段，调用 Code/dataPrepare/step*.py
+#   figures 生成图，输出到 Result/figures/
+#   tables  生成表，输出到 Result/tables/
+#
+# 当前默认：只跑 figures + tables。这样会复用已有 proc_Data，不会重跑原始数据预处理。
+#
+# 示例：只跑数据准备
+#   stages:
+#     - data
+#
+# 示例：数据、图、表全跑
+#   stages:
+#     - data
+#     - figures
+#     - tables
 stages:
   - figures
   - tables
 
+# -----------------------------------------------------------------------------
+# 2. figures：当 stages 包含 figures 时，具体生成哪些图
+# -----------------------------------------------------------------------------
+# 当前交稿版只维护这 9 张图：
+#   fig1   Figure 1  年内平衡、跨年股票池变化的年度因子数
+#   fig2   Figure 2  全样本固定交集平衡面板的年度因子数
+#   fig4   Figure 4  连续 PCA 因子组合权重
+#   fig7   Figure 7  局部窗口 vs 全样本权重的广义相关
+#   fig10  Figure 10 因子结构时间变化分解
+#   fig12  Figure 12 日内/隔夜期望收益关系
+#   fig13  Figure 13 因子累计收益
+#   fig14  Figure 14 行业组合资产定价
+#   fig15  Figure 15 规模-价值 2x3 组合资产定价
+#
+# 示例：只把 YAML 默认改成跑 fig1、fig2
+#   figures:
+#     - fig1
+#     - fig2
 figures:
   - fig1
   - fig2
@@ -16,42 +87,127 @@ figures:
   - fig14
   - fig15
 
+# -----------------------------------------------------------------------------
+# 3. tables：当 stages 包含 tables 时，具体生成哪些表
+# -----------------------------------------------------------------------------
+# 当前交稿版只维护这 4 张表：
+#   table_i    Table I   连续收益与跳跃收益描述统计
+#   table_ii   Table II  Figure 1/2 面板口径下的 PCA 稳定性比较
+#   table_iii  Table III PCA 因子与行业/FFC 因子的广义相关
+#   table_v    Table V   日内、隔夜、日频 Sharpe ratio 对照
+#
+# 示例：只把 YAML 默认改成跑 Table I 和 Table II
+#   tables:
+#     - table_i
+#     - table_ii
 tables:
   - table_i
   - table_ii
   - table_iii
   - table_v
 
+# -----------------------------------------------------------------------------
+# 4. data_steps：当 stages 包含 data 时，具体执行哪些数据步骤
+# -----------------------------------------------------------------------------
+# 可选值：
+#   get_apidb           从外部 API 抓原始数据，依赖本机数据服务配置；一般不要在交稿前跑
+#   preprocess_panels   从 raw data.bz2 + 复权因子生成 strict_balanced / paper_lenient 面板
+#   mom_5min            构建 5 分钟 MOM 因子
+#
+# 当前默认为空：即使 stages 写了 figures/tables，也不会执行数据准备。
+#
+# 示例：只预处理高频面板
+#   stages:
+#     - data
+#   data_steps:
+#     - preprocess_panels
+#
+# 示例：预处理面板后再构建 MOM
+#   stages:
+#     - data
+#   data_steps:
+#     - preprocess_panels
+#     - mom_5min
 data_steps: []
 
+# -----------------------------------------------------------------------------
+# 5. paths：项目路径
+# -----------------------------------------------------------------------------
+# 相对路径都以仓库根目录为基准。
+# 普通使用者最常改的是 final_result_root；其他路径除非移动 Data，否则不要改。
 paths:
+  # 已处理好的主数据目录。图表默认读取这里，不直接读取原始 data.bz2。
   proc_root: Data/proc_Data/pelger_cn_adjusted
+
+  # 运行时缓存、diagnostics、export_summary.json 的位置。
   runtime_root: Data/proc_Data/pelger_cn_adjusted/runtime
+
+  # 最终交稿图表输出根目录：Result/figures 和 Result/tables。
   final_result_root: Result
+
+  # 外部补充数据：行业映射、FFC、RF、size/value 原材料等。
   external_data_root: Data/external_Data/pelger_tail
+
+  # paper_tail 资产层缓存：Figure 12/13/14/15 与 Table III/V 的部分输入来自这里。
   paper_tail_root: Data/proc_Data/pelger_cn_adjusted/paper_tail
+
+  # 无风险利率文件。推荐格式：date,rf_log_daily。
+  # 临时换 RF 可用命令行：python Code/main.py --rf-file path/to/risk_free.csv
   rf_file: Data/external_Data/pelger_tail/factors/rf/risk_free.csv
 
+# -----------------------------------------------------------------------------
+# 6. run：运行行为与资源设置
+# -----------------------------------------------------------------------------
 run:
+  # true：图/表任务遇到第一个错误就停；false：尽量继续跑完并写 export_summary。
+  # 交稿调试时可以临时用命令行 --no-fail-fast 覆盖。
   fail_fast: true
+
+  # 是否重建 paper_tail 资产层。
+  # 默认 false：更快，复用已有 paper_tail。
+  # 只有在替换 RF、行业映射、size/value 原材料或 paper_tail 逻辑后才建议改 true，
+  # 或临时运行：python Code/main.py --refresh-paper-tail
   refresh_paper_tail: false
+
+  # 交稿严格模式。保持 true；如果 paper_tail 资产重建失败，会直接报错而不是静默回退。
   strict_final_export: true
+
+  # 历史完整流程字段。当前交稿版 main.py 不走完整重建 ReplicationResult，保留 false。
   rebuild_result: false
   restart: false
+
+  # 主 PCA 样本口径。交稿版固定使用 strict_balanced。
+  # 不要在这里改成 paper_lenient；lenient 只作为 devTools 稳健性诊断。
   balanced_mode: strict_balanced
+
+  # 并行与内存。空值表示使用代码默认值。
+  # workers 会影响 data step 或部分轻量重算；机器较弱时可设为 1。
   workers:
   panel_workers:
   paper_workers:
   rolling_workers:
   memory_budget_gb:
 
+# -----------------------------------------------------------------------------
+# 7. data：数据准备阶段的细节参数
+# -----------------------------------------------------------------------------
 data:
   preprocess_panels:
+    # true 会强制刷新预处理输出；false 会尽量复用已有缓存。
     refresh: false
+
+    # years 留空表示全样本年份；例如只做 2020-2021 可写：
+    # years: [2020, 2021]
     years:
+
+    # max_stocks 留空表示不限制股票数；做 smoke test 时可设较小数值。
     max_stocks:
+
+    # 是否压缩逐股票 symbol_returns npz。压缩更省空间但 IO 更慢。
     compress_symbol_returns: false
+
   mom_5min:
+    # 5 分钟 MOM 因子参数。除非你要重做动量因子，否则保持默认。
     lookback_bars: 48
     skip_bars: 1
     winner_pct: 0.3

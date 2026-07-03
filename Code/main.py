@@ -1,4 +1,14 @@
 from __future__ import annotations
+"""Unified command-line entrypoint for the submission-version replication.
+
+`Code/config.yaml` is the default orchestration file. Explicit CLI arguments
+override YAML values, which lets users do one-off runs without editing the
+config. The runner intentionally separates three concepts:
+
+* stages: broad phases (`data`, `figures`, `tables`);
+* task lists: concrete figure/table keys inside a selected stage;
+* RunConfig: validated paths and numerical/runtime options used downstream.
+"""
 
 import argparse
 import json
@@ -72,6 +82,11 @@ def _get(mapping: Mapping[str, Any], *keys: str, default: Any = None) -> Any:
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """Parse one-off command-line overrides.
+
+    Keep this parser thin: defaults live in `Code/config.yaml`, and core PCA
+    parameters are validated by `prepareCore.config.RunConfig`.
+    """
     parser = argparse.ArgumentParser(description="Submission-version runner for the A-share Pelger replication.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="YAML config path. Default: Code/config.yaml")
     parser.add_argument("--stages", help="Comma-separated stages: data,figures,tables")
@@ -115,6 +130,7 @@ def _print_tasks() -> None:
 
 
 def _selected_stages(config: Mapping[str, Any], args: argparse.Namespace) -> list[str]:
+    """Resolve broad execution stages, with CLI taking precedence over YAML."""
     if args.all:
         return ["data", "figures", "tables"]
     stages = _as_list(args.stages, default=())
@@ -124,6 +140,7 @@ def _selected_stages(config: Mapping[str, Any], args: argparse.Namespace) -> lis
 
 
 def _selected_tasks(config: Mapping[str, Any], args: argparse.Namespace, kind: str) -> list[str]:
+    """Resolve figure/table task keys for a selected stage."""
     cli_value = getattr(args, kind)
     if cli_value:
         return _as_list(cli_value)
@@ -134,6 +151,11 @@ def _selected_tasks(config: Mapping[str, Any], args: argparse.Namespace, kind: s
 
 
 def _selected_data_steps(config: Mapping[str, Any], args: argparse.Namespace) -> list[str]:
+    """Resolve data-preparation steps.
+
+    `--all` is deliberately expansive and turns on all data steps unless the
+    caller explicitly narrows them with `--data-steps`.
+    """
     if args.all and not args.data_steps:
         return ["get_apidb", "preprocess_panels", "mom_5min"]
     if args.data_steps:
@@ -142,6 +164,7 @@ def _selected_data_steps(config: Mapping[str, Any], args: argparse.Namespace) ->
 
 
 def _build_run_config(config: Mapping[str, Any], args: argparse.Namespace, *, save_plots: bool) -> RunConfig:
+    """Merge YAML + CLI into the internal RunConfig used by all modules."""
     run_cfg = config.get("run") if isinstance(config.get("run"), Mapping) else {}
     cfg = RunConfig()
     cfg.proc_root = _as_path(args.proc_root, _get(config, "paths", "proc_root", default=cfg.proc_root))
@@ -177,6 +200,11 @@ def _fail_fast(config: Mapping[str, Any], args: argparse.Namespace) -> bool:
 
 
 def _run_data_steps(config: Mapping[str, Any], args: argparse.Namespace, cfg: RunConfig, steps: Sequence[str]) -> None:
+    """Dispatch selected data steps.
+
+    These are the only paths that read raw k-line data or rebuild processed
+    panel assets. Normal figure/table runs skip this function entirely.
+    """
     if not steps:
         log_info("data", "No data steps selected.")
         return
@@ -234,6 +262,7 @@ def _run_data_steps(config: Mapping[str, Any], args: argparse.Namespace, cfg: Ru
 
 
 def _resolve_render_tasks(figures: Sequence[str], tables: Sequence[str], stages: Sequence[str]) -> list[Task]:
+    """Translate selected figure/table keys into registered generator tasks."""
     selectors: list[str] = []
     stage_set = {str(stage).strip().lower() for stage in stages}
     if "figures" in stage_set:
@@ -251,6 +280,7 @@ def _write_export_summary(cfg: RunConfig, outputs: Mapping[str, str], failures: 
 
 
 def _run_render_tasks(tasks: Sequence[Task], cfg: RunConfig, *, fail_fast: bool) -> int:
+    """Build one lightweight strict result and reuse it for all selected tasks."""
     if not tasks:
         log_info("main", "No figure/table tasks selected.")
         return 0

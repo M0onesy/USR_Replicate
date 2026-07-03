@@ -1,4 +1,9 @@
 from __future__ import annotations
+"""Table II exporter.
+
+Compares fixed-intersection yearly slices with yearwise balanced changing
+universes through generalized correlations for the first 2/3/4 PCA factors.
+"""
 
 from pathlib import Path
 

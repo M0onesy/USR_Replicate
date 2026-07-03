@@ -1,4 +1,9 @@
 from __future__ import annotations
+"""Figure 15 renderer.
+
+Renders A-share reconstructed 2x3 size-value portfolio pricing diagnostics.
+Data come from the paper_tail layer; this module does not rebuild assets.
+"""
 
 import os as _os
 import sys as _sys

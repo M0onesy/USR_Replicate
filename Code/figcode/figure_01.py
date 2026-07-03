@@ -1,4 +1,10 @@
 from __future__ import annotations
+"""Figure 1 renderer.
+
+Uses year-specific strict-balanced panels: each year is internally balanced,
+but the stock universe may change across years. This module only renders and
+writes diagnostics; the shared lightweight result is built by `Code/main.py`.
+"""
 
 import os as _os
 import sys as _sys

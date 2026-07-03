@@ -1,4 +1,10 @@
 from __future__ import annotations
+"""Figure 12 renderer.
+
+Draws intraday vs overnight expected returns from the cached/refreshed
+paper_tail asset layer. Run with `--refresh-paper-tail` only after changing RF
+or external paper_tail inputs.
+"""
 
 import os as _os
 import sys as _sys

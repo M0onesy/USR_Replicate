@@ -33,6 +33,13 @@ python Code/main.py
 
 Figure 3/5/6/8/9/11、Table IV 和旧诊断表任务已从交稿版注册表中删除，不再作为默认可运行任务维护。
 
+二次核查后的交稿解释边界：
+
+- PCA、跳跃/连续分解、扰动特征值比、广义相关和逐年 Procrustes 对齐没有发现公式层面的致命错误。
+- Figure 2 及下游 strict 主 PCA 使用全样本固定交集，当前固定交集约为 115 只股票，属于高流动性/长期存续股票子样本；正文解释时应避免把它直接说成全 A 股整体。
+- 下游展示 4 个连续 PCA 因子是为了贴近原文结构，但第 4 因子在 A 股样本中属于边际/候选因子；核心结论优先依赖前 3 个因子，并用 Table II 的 First-4 块说明第 4 因子的样本稳定性。
+- Table V 的切点组合是全样本 in-sample 最大 Sharpe 组合，主要用于收益分解和比较，不应直接解释成可交易套利策略；A 股 T+1 与融券约束会限制隔夜做空类组合的实际可实施性。
+
 ## 快速运行
 
 在仓库根目录运行一键交稿流程：
@@ -80,6 +87,25 @@ python Code/main.py --all
 python Code/main.py --config Code/config.yaml
 python Code/main.py --stages figures --figures fig13 --output-root Result
 ```
+
+## 运行 Cookbook
+
+| 你想做什么 | 推荐命令 | 说明 |
+| --- | --- | --- |
+| 生成交稿 9 图 4 表 | `python Code/main.py` | 按 `Code/config.yaml` 默认配置运行，不跑数据准备。 |
+| 只生成全部图 | `python Code/main.py --stages figures` | 只刷新 `Result/figures/`。 |
+| 只生成全部表 | `python Code/main.py --stages tables` | 只刷新 `Result/tables/`。 |
+| 只跑几张图 | `python Code/main.py --figures fig1,fig2,fig4` | CLI 临时覆盖 YAML 的 `figures`。 |
+| 只跑几张表 | `python Code/main.py --tables table_i,table_ii` | CLI 临时覆盖 YAML 的 `tables`。 |
+| 只预处理高频面板 | `python Code/main.py --stages data --data-steps preprocess_panels` | 会读 raw `data.bz2`，通常耗时更长。 |
+| 只构建 MOM 因子 | `python Code/main.py --stages data --data-steps mom_5min --workers 1` | 用较低并行更稳。 |
+| 换 RF 后重建 paper_tail | `python Code/main.py --refresh-paper-tail` | 替换无风险利率后第一次导出必须跑。 |
+| 检查任务列表 | `python Code/main.py --list` | 不生成文件，只列出可用 key。 |
+| 检查最终产物 | `python Code/devTools/check_submission_outputs.py` | 确认 9 图 4 表齐全且非空。 |
+
+临时试运行优先用命令行参数，因为不会改配置文件；如果你希望以后默认就只跑某几张图或表，再修改 `Code/config.yaml`。命令行参数优先级高于 YAML，例如 `python Code/main.py --figures fig13` 会临时只跑 Figure 13。
+
+不要把 `--all` 当作普通交稿命令。`--all` 会把 `data`、`figures`、`tables` 三个阶段一起打开，只有明确要重新做数据准备时才使用。也不要长期把 `refresh_paper_tail: true` 写进 YAML，除非你正在更换 RF、行业映射或 paper_tail 原材料。
 
 ## 配置规则
 
@@ -176,6 +202,14 @@ Data/external_Data/pelger_tail/factors/rf/risk_free.csv
 python Code/main.py --rf-file path/to/risk_free.csv
 ```
 
+推荐 RF 文件直接提供 `date,rf_log_daily` 两列，避免年化利率折算歧义。若替换 RF 文件，第一次重新导出必须刷新 paper_tail：
+
+```bash
+python Code/main.py --refresh-paper-tail
+```
+
+原因是 FFC 的 `MKT` 因子在构建分段收益时已经内嵌 RF；不刷新会造成 PCA/定价层使用新 RF、FFC 层使用旧 RF 的混口径。当前 Figure 12、Table V、行业/规模组合定价统一采用 `intraday=4/24`、`overnight=20/24`、`daily=1` 的 RF 拆分。
+
 ## 输出位置
 
 最终图：
@@ -220,7 +254,22 @@ python Code/devTools/check_submission_outputs.py
 - `inspect_config.py`: 打印 YAML 与 CLI 合并后的实际运行配置。
 - `check_project_structure.py`: 检查当前目录结构、RF 文件和旧 `Code/core` 目录是否符合新架构。
 - `check_submission_outputs.py`: 检查 `Result/figures` 与 `Result/tables` 中的交稿产物是否齐全且非空。
+- `submission_diagnostics.py`: 生成二次核查附加诊断，包括 strict 115 行业构成、`g_fn` 敏感性、跳跃触板代理和 lenient 面板稳健性参考。
 - `export_panel_csv.py`: 面板抽样导出工具，仅用于调试和数据交接。
+
+二次核查附加诊断可按需运行，不属于默认正文 9 图 4 表：
+
+```bash
+python Code/devTools/submission_diagnostics.py
+```
+
+输出位于：
+
+```text
+Data/proc_Data/pelger_cn_adjusted/runtime/submission_fast/diagnostics/
+```
+
+其中 `strict115_industry_composition.csv` 用于说明固定交集行业分布，`g_fn_sensitivity_3x3.csv` 用于检查扰动函数敏感性，`jump_limit_proxy_diagnostics.csv` 用大幅 5 分钟收益近似识别触板式跳跃，`Table_III_robustness_lenient391.csv` 与 `Table_V_robustness_lenient391.csv` 仅作为 lenient 面板稳健性参考。
 
 ## 依赖环境
 
@@ -241,4 +290,5 @@ pip install -r requirements.txt
 - `Code/` 顶层只有 `main.py`、`config.yaml` 和子目录。
 - `Data/external_Data/pelger_tail/factors/rf/risk_free.csv` 存在。
 - README、正文和图表 caption 中的样本口径一致。
+- `Result/` 当前被 `.gitignore` 忽略；如果课程要求 Git 直接提交结果，需要临时调整 `.gitignore` 或手动打包 `Result/figures/` 与 `Result/tables/`。
 - 大体量原始 `Data/` 是否提交，按课程或仓库管理要求单独决定。

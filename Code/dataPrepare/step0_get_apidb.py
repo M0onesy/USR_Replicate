@@ -1,5 +1,11 @@
 # -*- coding: utf-8 -*-
 # python_verison == 3.10
+"""Data step 0: optional raw-data fetch through the external API helper.
+
+This step is not part of the normal submission run. Use it only when rebuilding
+`Data/kline_Data/.../data.bz2` from the data provider on a machine with the
+required proprietary API/SDK configured.
+"""
 
 import argparse
 import faulthandler

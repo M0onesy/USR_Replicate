@@ -4449,6 +4449,42 @@ def build_submission_figure2_factor_counts(
     return df
 
 
+def _submission_factor_count_cache_valid(
+    df: pd.DataFrame,
+    result: ReplicationResult,
+    figure_number: int,
+) -> bool:
+    if df.empty:
+        return False
+    expected_semantics = {
+        1: "cross-year unbalanced / within-year balanced",
+        2: "fixed full-sample intersection / yearly slices",
+    }.get(int(figure_number))
+    required = {"year", "return_component", "K_hat", "gamma", "g_fn", "sample_semantics", "n_symbols"}
+    if not required.issubset(df.columns):
+        return False
+    years_expected = sorted({int(pd.Timestamp(date).year) for date in result.panel.dates})
+    years_actual = sorted({int(year) for year in pd.to_numeric(df["year"], errors="coerce").dropna().astype(int).tolist()})
+    if years_actual != years_expected:
+        return False
+    if expected_semantics and not df["sample_semantics"].astype(str).eq(expected_semantics).all():
+        return False
+    try:
+        gamma_values = pd.to_numeric(df["gamma"], errors="coerce").dropna()
+        if gamma_values.empty or not np.allclose(gamma_values.to_numpy(dtype=float), float(result.pipeline.gamma), atol=1e-12):
+            return False
+    except Exception:
+        return False
+    if not df["g_fn"].astype(str).eq(str(result.pipeline.g_fn)).all():
+        return False
+    if int(figure_number) == 2:
+        hf = df.loc[df["return_component"].eq("hf")].copy()
+        n_values = pd.to_numeric(hf["n_symbols"], errors="coerce").dropna().unique()
+        if len(n_values) != 1 or int(round(float(n_values[0]))) != int(result.panel.N):
+            return False
+    return True
+
+
 def load_or_build_submission_figure_factor_counts(
     result: ReplicationResult,
     figure_number: int,
@@ -4458,7 +4494,9 @@ def load_or_build_submission_figure_factor_counts(
         raise ValueError(f"Unsupported submission factor-count diagnostic figure: {figure_number}")
     diagnostics_path = _result_diagnostics_dir(result) / file_name
     if diagnostics_path.exists():
-        return pd.read_csv(diagnostics_path)
+        cached = pd.read_csv(diagnostics_path)
+        if _submission_factor_count_cache_valid(cached, result, int(figure_number)):
+            return cached
     if int(figure_number) == 1:
         df = build_submission_figure1_factor_counts(result)
     else:
