@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os as _os
 import sys as _sys
 from pathlib import Path
 
@@ -11,7 +10,7 @@ if str(_CODE_DIR) not in _sys.path:
 from core.config import RunConfig, SUBMISSION_FROZEN_INDUSTRIES
 from core.engine import STRICT_BALANCED_SAMPLE
 from core.logging_utils import log_done, log_info
-from core.submission_fast import export_submission_core_fast, submission_fast_runtime_root
+from core.submission_fast import export_submission_table_ii_fast, submission_fast_runtime_root
 
 
 def _build_cfg(output_root: str | None) -> RunConfig:
@@ -20,7 +19,7 @@ def _build_cfg(output_root: str | None) -> RunConfig:
     cfg.strict_final_export = True
     cfg.industry_factors_frozen = list(SUBMISSION_FROZEN_INDUSTRIES)
     cfg.refresh_paper_tail = False
-    cfg.save_plots = True
+    cfg.save_plots = False
     if output_root:
         target = Path(output_root).expanduser().resolve()
         cfg.final_result_root = target
@@ -31,22 +30,18 @@ def _build_cfg(output_root: str | None) -> RunConfig:
 def main() -> int:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Lightweight submission-core figure export without paper_tables.")
-    parser.add_argument("--output-root", default=None, help="Optional final figure output root.")
-    parser.add_argument(
-        "--strict-fail",
-        action="store_true",
-        default=True,
-        help="Fail immediately on strict-core reconstruction errors (default: enabled).",
+    parser = argparse.ArgumentParser(
+        description="Lightweight paper-style Table II export with fixed K=2/3 continuous and jump PCA factors."
     )
+    parser.add_argument("--output-root", default=None, help="Optional final table output root.")
     args = parser.parse_args()
 
     cfg = _build_cfg(args.output_root)
     log_info("submission_fast", f"Using strict panel mode: {cfg.balanced_mode}")
-    log_info("submission_fast", f"Final figure root: {cfg.final_result_root}")
+    log_info("submission_fast", f"Final table root: {cfg.final_result_root}")
     log_info("submission_fast", f"Submission-fast runtime root: {submission_fast_runtime_root(cfg)}")
-    export_submission_core_fast(cfg, strict_fail=bool(args.strict_fail))
-    log_done("submission_fast", "Lightweight submission-core export finished.")
+    output_path = export_submission_table_ii_fast(cfg)
+    log_done("submission_fast", f"Paper-style fixed-K Table II export finished -> {output_path}")
     return 0
 
 

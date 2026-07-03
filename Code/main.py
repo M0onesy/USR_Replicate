@@ -122,8 +122,7 @@ def _resolve_result(cfg: RunConfig, *, rebuild_result: bool):
     if rebuild_result:
         log_info("main", "当前 profile 为显式重建模式：将按配置重建新的 ReplicationResult。")
         return get_result(cfg, allow_build=True, allow_fallback=False)
-    log_info("main", "当前 profile 为复用优先模式：不会重建上游 ReplicationResult；若无可复用结果将直接报错。")
-    log_info("main", "交稿轻量 strict 图表请运行 python Code/export_submission_core_fast.py。")
+    log_info("main", "当前 profile 为复用优先模式：若已有已完成结果，将直接复用并重导图表/表格。")
     return get_result(cfg, allow_build=False, allow_fallback=True)
 
 

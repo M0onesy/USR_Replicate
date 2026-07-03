@@ -30,17 +30,17 @@ def generate(result: ReplicationResult, cfg: RunConfig) -> Path:
     try:
         from figcode._timevar import render_fig7
 
-        log_render(TAG, "Rendering Figure 7 with local-vs-global weight generalized correlations.")
+        log_render(TAG, "Rendering Figure 7 with the local-vs-global weight generalized-correlation implementation.")
         render_fig7(result, cfg, output_path, title)
         return output_path
     except Exception as exc:
-        log_render(TAG, f"Paper-style renderer failed; falling back to strict rolling GC lines: {exc!r}")
+        log_render(TAG, f"Paper-style renderer failed; falling back to cached rolling GC lines: {exc!r}")
 
-    log_step(TAG, "Loading rolling generalized-correlation diagnostics from the current result.")
+    log_step(TAG, "Loading rolling generalized-correlation diagnostics.")
     rolling_gc_df, _ = get_rolling_frames(result)
     gc_cols = gc_columns(rolling_gc_df)
     top_cols = gc_cols[: min(7, len(gc_cols))]
-    log_step(TAG, f"Fallback uses {len(top_cols)} continuous-factor GC lines from current strict rolling diagnostics.")
+    log_step(TAG, f"Fallback uses {len(top_cols)} continuous-factor GC lines from a 21-trading-day window summary.")
 
     if rolling_gc_df.empty or not top_cols:
         _save_placeholder_figure(output_path, title, "No rolling generalized-correlation data are available.")

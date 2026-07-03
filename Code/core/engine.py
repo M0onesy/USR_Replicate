@@ -3470,7 +3470,6 @@ def _factor_count_rows_for_panel(
             "year": year,
             "return_component": return_component,
             "n_symbols": int(panel.N),
-            "n_days": int(panel.D),
             "K_hat": int(max(1, K_hat)),
             "g_fn": g_fn,
             "gamma": float(gamma),
@@ -4364,6 +4363,7 @@ def build_paper_factor_counts_comparison(
     ).factor_counts
 
 
+SUBMISSION_CORE_FIGURES = frozenset({1, 2, 4, 7, 10, 12, 13, 14, 15})
 _SUBMISSION_FIGURE_DIAGNOSTICS = {
     1: "figure1_yearwise_balanced_changing_universe_diagnostics.csv",
     2: "figure2_fixed_intersection_yearly_diagnostics.csv",
@@ -4387,7 +4387,6 @@ def build_submission_figure1_factor_counts(
     *,
     max_stocks: Optional[int] = None,
 ) -> pd.DataFrame:
-    """Submission Figure 1: year-specific balanced panels with changing N."""
     proc_root = _result_proc_root(result)
     years = sorted({date.year for date in result.panel.dates})
     rows: List[Dict[str, Any]] = []
@@ -4409,9 +4408,8 @@ def build_submission_figure1_factor_counts(
                 g_fn=str(result.pipeline.g_fn),
             )
         )
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(rows).sort_values(["year", "return_component"]).reset_index(drop=True)
     if not df.empty:
-        df = df.sort_values(["year", "return_component"]).reset_index(drop=True)
         df["figure_number"] = 1
         df["sample_semantics"] = "cross-year unbalanced / within-year balanced"
     return df
@@ -4422,7 +4420,6 @@ def build_submission_figure2_factor_counts(
     *,
     max_stocks: Optional[int] = None,
 ) -> pd.DataFrame:
-    """Submission Figure 2: fixed full-sample strict intersection, sliced yearly."""
     proc_root = _result_proc_root(result)
     years = sorted({date.year for date in result.panel.dates})
     full_panel = load_proc_hf_panel(
@@ -4445,9 +4442,8 @@ def build_submission_figure2_factor_counts(
                 g_fn=str(result.pipeline.g_fn),
             )
         )
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(rows).sort_values(["year", "return_component"]).reset_index(drop=True)
     if not df.empty:
-        df = df.sort_values(["year", "return_component"]).reset_index(drop=True)
         df["figure_number"] = 2
         df["sample_semantics"] = "fixed full-sample intersection / yearly slices"
     return df
@@ -4462,10 +4458,7 @@ def load_or_build_submission_figure_factor_counts(
         raise ValueError(f"Unsupported submission factor-count diagnostic figure: {figure_number}")
     diagnostics_path = _result_diagnostics_dir(result) / file_name
     if diagnostics_path.exists():
-        cached = pd.read_csv(diagnostics_path)
-        required_cols = {"year", "return_component", "K_hat", "n_symbols", "n_days"}
-        if required_cols.issubset(set(cached.columns)):
-            return cached
+        return pd.read_csv(diagnostics_path)
     if int(figure_number) == 1:
         df = build_submission_figure1_factor_counts(result)
     else:
@@ -4912,6 +4905,19 @@ def export_all_paper_figures(
             status_rows.append(_plot_status_row(figure_id, title, output_path, "error", "matplotlib", repr(exc)))
         return pd.DataFrame(status_rows).sort_values("figure_number").reset_index(drop=True), exported
 
+    def mark_skipped(figure_number: int, note: str) -> None:
+        figure_id, file_name, title = figure_specs[figure_number]
+        status_rows.append(
+            _plot_status_row(
+                figure_id,
+                title,
+                figures_dir / file_name,
+                "skipped",
+                "submission_core_profile",
+                note,
+            )
+        )
+
     def run_plot(figure_number: int, data_source: str, plot_func, notes: str = "") -> None:
         figure_id, file_name, title = figure_specs[figure_number]
         output_path = figures_dir / file_name
@@ -4925,32 +4931,29 @@ def export_all_paper_figures(
             status_rows.append(_plot_status_row(figure_id, title, output_path, "error", data_source, repr(exc)))
             exported[figure_id] = str(output_path)
 
-    def _save_er_panel(output_path: Path, panel_block: str, title: str) -> None:
-        df = result.paper_factor_counts.copy()
-        if df.empty:
-            _save_placeholder_figure(output_path, title, "No factor-count diagnostics are available.")
-            return
-        df = df.loc[df["panel_block"].eq(panel_block) & df["return_component"].eq("hf")].copy()
+    def _save_er_panel(output_path: Path, figure_number: int) -> None:
+        df = load_or_build_submission_figure_factor_counts(result, figure_number)
+        df = df.loc[df["return_component"].eq("hf")].copy() if not df.empty else df
         er_cols = [col for col in df.columns if col.startswith("er_")]
         if df.empty or not er_cols:
-            _save_placeholder_figure(output_path, title, f"No HF perturbed eigenvalue-ratio data are available for {panel_block.lower()}.")
+            _save_placeholder_figure(output_path, figure_specs[figure_number][2], "No HF perturbed eigenvalue-ratio data are available.")
             return
         x = np.arange(1, len(er_cols) + 1)
         fig, ax = plt.subplots(figsize=(9.5, 5.0))
         for _, row in df.sort_values("year").iterrows():
             y = [float(row[col]) for col in er_cols]
-            label = f"{int(row['year'])} (K={int(row['K_hat'])})"
+            n_symbols = int(row["n_symbols"]) if "n_symbols" in row and pd.notna(row["n_symbols"]) else None
+            label = f"{int(row['year'])} (K={int(row['K_hat'])}" + (f", N={n_symbols})" if n_symbols is not None else ")")
             ax.plot(x, y, marker="o", linewidth=1.4, label=label)
-        # 1:1 复刻论文 Figure 1/2：critical value 判别线（=1+gamma，论文 1.08）。
-        _gamma = 0.08
+        gamma = 0.08
         if "gamma" in df.columns and df["gamma"].notna().any():
             try:
-                _gamma = float(df["gamma"].dropna().iloc[0])
+                gamma = float(df["gamma"].dropna().iloc[0])
             except Exception:
-                _gamma = 0.08
-        _crit = 1.0 + _gamma
-        ax.axhline(_crit, color="red", linestyle="--", linewidth=1.3, label=f"critical value {_crit:.2f}")
-        ax.set_title(title)
+                gamma = 0.08
+        crit = 1.0 + gamma
+        ax.axhline(crit, color="red", linestyle="--", linewidth=1.3, label=f"critical value {crit:.2f}")
+        ax.set_title(figure_specs[figure_number][2])
         ax.set_xlabel("k")
         ax.set_ylabel("Perturbed eigenvalue ratio")
         ax.set_xticks(x)
@@ -4967,23 +4970,38 @@ def export_all_paper_figures(
         pivot = df.pivot_table(index="factor", columns="symbol", values="weight", aggfunc="first").fillna(0.0)
         _save_heatmap(pivot.to_numpy(), pivot.columns.tolist(), [f"Factor {idx}" for idx in pivot.index], title, output_path)
 
-    run_plot(1, "paper_factor_count_diagnostics", lambda path: _save_er_panel(path, "Unbalanced panel", figure_specs[1][2]))
-    run_plot(2, "paper_factor_count_diagnostics", lambda path: _save_er_panel(path, "Balanced panel", figure_specs[2][2]))
-    run_plot(3, "proxy_weights", lambda path: weight_heatmap(result.proxy_weights, figure_specs[3][2], path))
-    run_plot(4, "pca_weights", lambda path: weight_heatmap(result.pca_weights, figure_specs[4][2], path))
-    run_plot(5, "monthly_pca_weights", lambda path: weight_heatmap(result.monthly_pca_weights, figure_specs[5][2], path))
-
     gc_cols = [col for col in rolling_gc_df.columns if col.startswith("gc_")]
-    run_plot(6, "rolling_gc", lambda path: _save_line_plot(rolling_gc_df, "window_index", gc_cols, figure_specs[6][2], path, ylabel="Generalized correlation"))
-    run_plot(7, "rolling_gc", lambda path: _save_line_plot(rolling_gc_df, "window_index", gc_cols[: min(4, len(gc_cols))], figure_specs[7][2], path, ylabel="Generalized correlation"))
 
-    def fig08(output_path: Path) -> None:
-        if result.rolling_weight_summary.empty:
-            _save_placeholder_figure(output_path, figure_specs[8][2], "No rolling weight summary is available.")
-            return
-        pivot = result.rolling_weight_summary.pivot_table(index="start_day", columns="symbol", values="weight_factor_1", aggfunc="first").reset_index()
-        y_cols = [col for col in pivot.columns if col != "start_day"]
-        _save_line_plot(pivot, "start_day", y_cols, figure_specs[8][2], output_path, ylabel="Factor 1 weight")
+    for figure_number in sorted(figure_specs):
+        if figure_number not in SUBMISSION_CORE_FIGURES:
+            mark_skipped(figure_number, "Excluded from submission core export.")
+
+    run_plot(
+        1,
+        "submission.figure1_yearwise_balanced_changing_universe_diagnostics",
+        lambda path: _save_er_panel(path, 1),
+        "Cross-year unbalanced, within-year balanced yearly panels.",
+    )
+    run_plot(
+        2,
+        "submission.figure2_fixed_intersection_yearly_diagnostics",
+        lambda path: _save_er_panel(path, 2),
+        "Fixed full-sample intersection panel sliced year by year.",
+    )
+    run_plot(4, "pca_weights", lambda path: weight_heatmap(result.pca_weights, figure_specs[4][2], path))
+    run_plot(
+        7,
+        "rolling_gc",
+        lambda path: _save_line_plot(
+            rolling_gc_df,
+            "window_index",
+            gc_cols[: min(7, len(gc_cols))],
+            figure_specs[7][2],
+            path,
+            ylabel="Generalized correlation",
+        ),
+        "Top 7 continuous-factor generalized correlations with a 21-trading-day local window.",
+    )
 
     def fig10(output_path: Path) -> None:
         if rolling_gc_df.empty:
@@ -4993,16 +5011,13 @@ def export_all_paper_figures(
         df["avg_gc"] = df[gc_cols].mean(axis=1) if gc_cols else np.nan
         if not rolling_explained_df.empty:
             df = df.merge(rolling_explained_df, on="window_index", how="left")
-        _save_line_plot(df, "window_index", [col for col in ["avg_gc", "explained_variation"] if col in df.columns], figure_specs[10][2], output_path)
-
-    def fig11(output_path: Path) -> None:
-        if rolling_gc_df.empty:
-            _save_placeholder_figure(output_path, figure_specs[11][2], "No rolling generalized-correlation data are available.")
-            return
-        df = rolling_gc_df.copy()
-        df["min_gc"] = df[gc_cols].min(axis=1) if gc_cols else np.nan
-        df["mean_gc"] = df[gc_cols].mean(axis=1) if gc_cols else np.nan
-        _save_line_plot(df, "window_index", ["min_gc", "mean_gc"], figure_specs[11][2], output_path, ylabel="Generalized correlation")
+        _save_line_plot(
+            df,
+            "window_index",
+            [col for col in ["avg_gc", "explained_variation"] if col in df.columns],
+            figure_specs[10][2],
+            output_path,
+        )
 
     def fig12(output_path: Path) -> None:
         from core.paper_tail import render_figure_12
@@ -5024,10 +5039,7 @@ def export_all_paper_figures(
 
         render_figure_15(result, output_path, figure_specs[15][2])
 
-    run_plot(8, "rolling_weight_summary", fig08)
-    run_plot(9, "rolling_explained_variation", lambda path: _save_line_plot(rolling_explained_df, "window_index", ["explained_variation"], figure_specs[9][2], path, ylabel="Explained variation"))
     run_plot(10, "rolling_gc_and_explained_variation", fig10)
-    run_plot(11, "rolling_gc", fig11)
     run_plot(12, "paper_tail.figure12_data", fig12)
     run_plot(13, "paper_tail.figure13_data", fig13)
     run_plot(14, "paper_tail.pricing_industry", fig14)
@@ -5070,7 +5082,8 @@ def export_replication_outputs(
             "gamma": result.pipeline.gamma,
             "interpretation_note": (
                 "These are full-sample pipeline factor counts. "
-                "Figure 1/2 use yearly paper_factor_counts diagnostics instead."
+                "Figure 1 uses yearwise balanced changing-universe diagnostics; "
+                "Figure 2 uses fixed-intersection yearly-slice diagnostics."
             ),
         },
         "sharpes": result.pipeline.sharpes,

@@ -78,7 +78,7 @@ def _plot_er_panel(df: pd.DataFrame, panel_block: str, title: str, output_path: 
     fig, axes = plt.subplots(
         nrows,
         1,
-        figsize=(10.8, max(3.0 * nrows + 0.8, 4.2)),
+        figsize=(10.8, max(2.8 * nrows + 0.6, 4.0)),
         sharex=True,
     )
     axes = np.atleast_1d(axes)
@@ -107,13 +107,13 @@ def _plot_er_panel(df: pd.DataFrame, panel_block: str, title: str, output_path: 
                 )
         ax.axhline(crit, color="green", linewidth=1.3, label=f"Critical value {crit:.2f}")
         ax.set_xticks(x)
-        ax.grid(True, alpha=0.25)
         ax.set_ylabel("Perturbed ER")
         ax.set_title(f"Years {grp[0]}-{grp[-1]}", fontsize=10)
+        ax.grid(True, alpha=0.25)
         ax.legend(loc="best", fontsize=8, ncol=2)
 
-    axes[-1].set_xlabel("k")
     fig.suptitle(title, fontsize=13, y=0.995)
+    axes[-1].set_xlabel("k")
     fig.text(
         0.5,
         0.01,

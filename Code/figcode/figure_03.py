@@ -34,31 +34,6 @@ from core.runner import run_standalone
 TAG = "figure_03"
 FIGURE_NUMBER = 3
 
-_INDUSTRY_EN_LABELS = {
-    "必需消费": "Staples",
-    "大金融": "Financials",
-    "电力设备与新能源": "Power/NewEn",
-    "房地产与建筑": "RealEstate/Build",
-    "高端制造": "AdvMfg",
-    "公用事业与交运": "Utilities/Trans",
-    "科技成长": "TechGrowth",
-    "可选消费与服务": "Discretionary",
-    "农林牧渔": "Agriculture",
-    "医药生物": "Healthcare",
-    "周期资源": "CyclicalRes",
-}
-
-
-def _industry_display_label(name: str, label_index: dict[str, int]) -> str:
-    raw = str(name)
-    if raw in _INDUSTRY_EN_LABELS:
-        return _INDUSTRY_EN_LABELS[raw]
-    try:
-        raw.encode("ascii")
-        return raw[:18]
-    except UnicodeEncodeError:
-        return f"IND{label_index.get(raw, 0):02d}"
-
 
 def plot_weight_heatmap(df, title: str, output_path: Path) -> None:
     """复刻 engine 内 weight_heatmap：长表 -> 因子×股票矩阵 -> 热图（按 symbol 排，回退用）。"""
@@ -88,6 +63,32 @@ def _load_industry_lookup(cfg) -> dict:
         return dict(zip(d[code_col].astype(str).str.strip(), d[ind_col].astype(str).str.strip()))
     except Exception:
         return {}
+
+
+_INDUSTRY_EN_LABELS = {
+    "必需消费": "Staples",
+    "大金融": "Financials",
+    "电力设备与新能源": "Power/NewEn",
+    "房地产与建筑": "RealEstate/Build",
+    "高端制造": "AdvMfg",
+    "公用事业与交运": "Utilities/Trans",
+    "科技成长": "TechGrowth",
+    "可选消费与服务": "Discretionary",
+    "农林牧渔": "Agriculture",
+    "医药生物": "Healthcare",
+    "周期资源": "CyclicalRes",
+}
+
+
+def _industry_display_label(name: str, label_index: dict[str, int]) -> str:
+    raw = str(name)
+    if raw in _INDUSTRY_EN_LABELS:
+        return _INDUSTRY_EN_LABELS[raw]
+    try:
+        raw.encode("ascii")
+        return raw[:18]
+    except UnicodeEncodeError:
+        return f"IND{label_index.get(raw, 0):02d}"
 
 
 def plot_industry_sorted_bars(W, tickers, industry_lookup: dict, k_count: int, title: str, output_path: Path) -> None:
@@ -138,11 +139,8 @@ def plot_industry_sorted_bars(W, tickers, industry_lookup: dict, k_count: int, t
     # 行业色例（图右侧）
     if industry_lookup:
         from matplotlib.patches import Patch
-        label_index = {name: idx for idx, name in enumerate(uniq, start=1)}
-        handles = [
-            Patch(facecolor=color_of[name], label=_industry_display_label(name, label_index))
-            for name in uniq
-        ]
+        label_index = {name: idx + 1 for idx, name in enumerate(uniq)}
+        handles = [Patch(facecolor=color_of[name], label=_industry_display_label(name, label_index)) for name in uniq]
         fig.legend(
             handles=handles,
             loc="center left",
