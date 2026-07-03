@@ -16,7 +16,7 @@ Figure 4 —— Continuous PCA Factor Portfolio Weights（连续 PCA 因子组�
 
 from __future__ import annotations
 
-# --- 允许 `python figCode/xxx.py` / `python tableCode/xxx.py` 直接运行时找到 core 包 ---
+# --- 允许 `python figCode/xxx.py` / `python tableCode/xxx.py` 直接运行时找到 prepareCore 包 ---
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 

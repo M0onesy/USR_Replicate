@@ -1,5 +1,5 @@
 # Public runtime dependencies for the submission-version replication runner.
-# Excludes proprietary SDK/API dependencies used by Code/dataPrepare/step_00_get_apidb.py.
+# Excludes proprietary SDK/API dependencies used by Code/dataPrepare/step0_get_apidb.py.
 
 numpy>=1.23
 pandas>=1.5

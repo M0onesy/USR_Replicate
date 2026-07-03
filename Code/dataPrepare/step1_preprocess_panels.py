@@ -547,7 +547,7 @@ def _summarize_processed_universe(universe: pd.DataFrame, proc_root: Path) -> Tu
     # 这里用“每年覆盖率 ≥ 阈值（默认 0.96，≈ ≤500/12000 缺失）”近似该过滤，
     # 并要求样本期首尾年都达标（13 年都在）。
     # 注意：要真正用 paper_lenient 面板跑 PCA，面板构建器需对缺失日做插值
-    # （详见 docs/SPEC_PAPER_FAITHFUL.md 的 P2 小节）；本标记先把“可用宇宙”
+    # （旧审计文档中称为 P2 口径）；本标记先把“可用宇宙”
     # 选出来。切换到 paper_lenient 会改变面板，使既有重结果缓存失效（完整路径）。
     min_cov = _balanced_min_coverage()
     year_cov_cols = [f"coverage_{year}" for year in global_dates_by_year]

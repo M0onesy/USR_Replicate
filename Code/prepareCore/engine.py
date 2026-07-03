@@ -1,5 +1,5 @@
 """
-core/engine.py
+prepareCore/engine.py
 ==============
 
 Pelger (2020) 高频系统性风险复现项目 —— 共享计算引擎（"重活"全部在这里）。
@@ -20,7 +20,7 @@ Pelger (2020) 高频系统性风险复现项目 —— 共享计算引擎（"重
 设计要点（与拆分方案 Option A 对应）：
   ``run_cn_replication()`` 把昂贵的上游计算只跑一次，产出一个 ``ReplicationResult``
   对象；figCode / tableCode 下的每篇脚本都只是从这个对象里取字段、画图或落表，
-  因此真正耗时的部分不会被重复执行。缓存层见 ``core/pipeline_cache.py``。
+  因此真正耗时的部分不会被重复执行。缓存层见 ``prepareCore/pipeline_cache.py``。
 
 注意：
   - 本文件不读取原始 K 线 ``data.bz2``，只消费 ``Data/proc_Data``。
@@ -74,7 +74,7 @@ VALID_PANEL_SAMPLE_MODES = {STRICT_BALANCED_SAMPLE, PAPER_LENIENT_SAMPLE}
 PANEL_RETURN_SCHEME = "daily_intra_night_total_plus_full_5min_v1"
 
 # 拆分后本文件位于 Code/prepareCore/engine.py，比原始 Code/allcode_Need.py 深一层，
-# 因此仓库根目录需要回退两级（core -> Code -> Reposit）。
+# 因此仓库根目录需要回退两级（prepareCore -> Code -> Reposit）。
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PROC_ROOT = REPO_ROOT / "Data" / "proc_Data" / "pelger_cn_adjusted"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "Result"

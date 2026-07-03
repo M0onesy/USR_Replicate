@@ -19,7 +19,7 @@ Figure 3 —— Proxy Factor Portfolio Weights（代理因子组合权重热图�
 
 from __future__ import annotations
 
-# --- 允许 `python figCode/xxx.py` / `python tableCode/xxx.py` 直接运行时找到 core 包 ---
+# --- 允许 `python figCode/xxx.py` / `python tableCode/xxx.py` 直接运行时找到 prepareCore 包 ---
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 

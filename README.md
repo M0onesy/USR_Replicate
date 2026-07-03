@@ -1,8 +1,8 @@
 # A 股高频系统性风险复现项目
 
-本项目基于 Pelger (2020) 高频 PCA 系统性风险框架，使用中国 A 股 5 分钟数据做适配复现。当前版本采用“交稿版精简口径”：重点保证方法链路清楚、核心图表可复现、目录结构易读易维护，而不是逐图逐表 1:1 复刻美股原文数值。
+本项目基于 Pelger 高频 PCA 系统性风险框架，使用中国 A 股 5 分钟数据做适配复现。当前仓库采用“交稿版精简口径”：重点保证方法链路清楚、核心图表可复现、目录结构易维护，而不是逐图逐表 1:1 复刻美股原文数值。
 
-当前仓库唯一顶层运行入口是：
+当前唯一顶层运行入口是：
 
 ```bash
 python Code/main.py
@@ -10,7 +10,7 @@ python Code/main.py
 
 无参数运行时读取 `Code/config.yaml`；命令行显式参数优先于 YAML。旧的 `export_submission_*_fast.py`、顶层 `preprocess_cn_data.py`、顶层 `build_mom_5min.py` 等入口已移除，相关能力由 `main.py` 统一调度。
 
-## 交稿版结果范围
+## 交稿结果范围
 
 正文默认保留 9 张图：
 
@@ -74,29 +74,24 @@ python Code/main.py --stages data --data-steps mom_5min --workers 1
 python Code/main.py --all
 ```
 
-指定配置文件：
+指定配置文件或输出目录：
 
 ```bash
 python Code/main.py --config Code/config.yaml
+python Code/main.py --stages figures --figures fig13 --output-root Result
 ```
 
 ## 配置规则
 
-`Code/config.yaml` 是用户日常修改的配置文件，主要控制：
+`Code/config.yaml` 是用户日常修改的运行编排配置，主要控制：
 
 - `stages`: 运行 `data`、`figures`、`tables` 中哪些阶段。
-- `figures`: 要生成哪些交稿图。
-- `tables`: 要生成哪些交稿表。
-- `data_steps`: 要执行哪些数据步骤。
+- `figures`: 生成哪些交稿图。
+- `tables`: 生成哪些交稿表。
+- `data_steps`: 执行哪些数据步骤。
 - `paths`: 处理后数据、输出目录、外部数据、RF 文件路径。
-- `run`: fail-fast、是否刷新 paper_tail、worker、内存预算等运行编排参数。
+- `run`: fail-fast、是否刷新 paper_tail、worker、内存预算等运行参数。
 - `data`: 预处理和 MOM 因子的步骤参数。
-
-命令行显式传入的参数覆盖 YAML。例如：
-
-```bash
-python Code/main.py --stages figures --figures fig13 --output-root Result
-```
 
 核心 PCA 和缓存签名参数仍由 `Code/prepareCore/config.py` 的 `RunConfig` 做内部校验；一般不需要直接改 Python 配置。
 
@@ -120,12 +115,11 @@ Reposit/
 ├─ Result/
 │  ├─ figures/
 │  └─ tables/
-├─ docs/
 ├─ requirements.txt
 └─ README.md
 ```
 
-`Code/prepareCore/` 存放核心数据结构、PCA 引擎、缓存、paper_tail 资产逻辑、任务注册表和轻量交稿结果构造。
+`Code/prepareCore/` 存放核心数据结构、PCA 引擎、缓存、paper_tail 资产逻辑、任务注册表和轻量交稿结果构造。`main.py` 中保留了 `core -> prepareCore` 的临时兼容别名，仅用于降低旧 pickle/缓存反序列化风险；新代码应统一使用 `prepareCore`。
 
 `Code/dataPrepare/` 存放数据准备步骤：
 
@@ -137,9 +131,11 @@ Reposit/
 
 `Code/tableCode/` 存放交稿版保留表的导出代码。每张核心表对应一个文件：`table_i.py`、`table_ii.py`、`table_iii.py`、`table_v.py`。
 
-`Code/devTools/` 存放开发调试工具，例如面板 CSV 导出工具。这里的脚本不属于交稿主流程。
+`Code/devTools/` 存放开发调试工具，不属于交稿主流程。
 
-## 数据流
+历史 `docs/` 目录不作为当前交付必备目录；若以后恢复历史修复记录，以当前 README 和当前代码为准。
+
+## 数据流与样本口径
 
 原始数据入口：
 
@@ -203,9 +199,28 @@ Data/proc_Data/pelger_cn_adjusted/runtime/submission_fast/diagnostics/
 运行成功后重点检查：
 
 - `export_summary.json` 中 `failures` 为空。
-- `figures/` 中有 9 张交稿图。
-- `tables/` 中有 Table I、II、III、V。
-- 控制台不应出现完整 `paper_tables` 重跑。
+- `Result/figures/` 中有 9 张交稿图。
+- `Result/tables/` 中有 Table I、II、III、V。
+- 控制台不应进入完整 `paper_tables` 重跑。
+
+## devTools 调试工具
+
+推荐在交稿前运行：
+
+```bash
+python Code/devTools/smoke_imports.py
+python Code/devTools/inspect_config.py
+python Code/devTools/check_project_structure.py
+python Code/devTools/check_submission_outputs.py
+```
+
+工具用途：
+
+- `smoke_imports.py`: 检查 9 图 4 表注册任务是否都能导入。
+- `inspect_config.py`: 打印 YAML 与 CLI 合并后的实际运行配置。
+- `check_project_structure.py`: 检查当前目录结构、RF 文件和旧 `Code/core` 目录是否符合新架构。
+- `check_submission_outputs.py`: 检查 `Result/figures` 与 `Result/tables` 中的交稿产物是否齐全且非空。
+- `export_panel_csv.py`: 面板抽样导出工具，仅用于调试和数据交接。
 
 ## 依赖环境
 
@@ -217,13 +232,13 @@ pip install -r requirements.txt
 
 `requirements.txt` 不包含 `step0_get_apidb.py` 可能需要的专有 SDK/API 依赖；如需抓取原始数据，应按数据服务方说明单独配置。
 
-## 提交检查清单
+## 最终提交检查清单
 
+- `python -m py_compile` 覆盖 `Code/**/*.py` 后无语法错误。
 - `python Code/main.py --list` 能列出 9 个 figure 任务、4 个 table 任务和 3 个 data step。
-- `python Code/main.py --stages figures` 能生成 9 张图。
-- `python Code/main.py --stages tables` 能生成 4 张表。
+- `python Code/main.py --no-fail-fast` 能生成 9 图 4 表，且 `failures=[]`。
+- `python Code/devTools/check_submission_outputs.py` 全部为 `[OK]`。
 - `Code/` 顶层只有 `main.py`、`config.yaml` 和子目录。
 - `Data/external_Data/pelger_tail/factors/rf/risk_free.csv` 存在。
 - README、正文和图表 caption 中的样本口径一致。
 - 大体量原始 `Data/` 是否提交，按课程或仓库管理要求单独决定。
-
