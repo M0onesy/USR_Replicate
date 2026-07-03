@@ -6,12 +6,12 @@ from pathlib import Path
 
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
-from core.config import RunConfig
-from core.engine import ReplicationResult
-from core.io_utils import figure_path, figure_title
-from core.logging_utils import log_render, log_step
-from core.paper_tail import render_figure_14
-from core.runner import run_standalone
+from prepareCore.config import RunConfig
+from prepareCore.engine import ReplicationResult
+from prepareCore.io_utils import figure_path, figure_title
+from prepareCore.logging_utils import log_render, log_step
+from prepareCore.paper_tail import render_figure_14
+from prepareCore.runner import run_standalone
 
 
 TAG = "figure_14"

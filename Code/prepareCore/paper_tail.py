@@ -928,7 +928,7 @@ def _pivot_factor_matrix(
 
 
 def _select_industries_from_pca(result: Any, industry_map: pd.DataFrame) -> Dict[str, Any]:
-    import core.engine as eng
+    import prepareCore.engine as eng
 
     mapping = dict(zip(industry_map["ts_code"], industry_map["std_industry"]))
     available = set(str(x) for x in industry_map["std_industry"].dropna().unique().tolist())
@@ -1184,7 +1184,7 @@ def _build_table_iii(
     ffc_external: pd.DataFrame,
     selected_industries: Sequence[str],
 ) -> pd.DataFrame:
-    import core.engine as eng
+    import prepareCore.engine as eng
 
     continuous = np.asarray(result.pipeline.F_cont_display_daily_total, dtype=float)
     factor_order = ["Market", *list(selected_industries)]
@@ -1236,7 +1236,7 @@ def _build_table_iii(
 
 
 def _gc_safe(A: np.ndarray, B: np.ndarray) -> np.ndarray:
-    import core.engine as eng
+    import prepareCore.engine as eng
     A = np.asarray(A, dtype=float)
     B = np.asarray(B, dtype=float)
     if A.ndim != 2 or B.ndim != 2 or A.size == 0 or B.size == 0:
@@ -1246,7 +1246,7 @@ def _gc_safe(A: np.ndarray, B: np.ndarray) -> np.ndarray:
 
 def _pca_loadings(R: Optional[np.ndarray], K: int) -> Optional[np.ndarray]:
     """对一个 (T×N) 收益矩阵做 PCA，返回 N×K 载荷（用于载荷空间 GC）。"""
-    import core.engine as eng
+    import prepareCore.engine as eng
     if R is None:
         return None
     R = np.asarray(R, dtype=float)
@@ -1265,7 +1265,7 @@ def _aggregate_daily_to_period(R_daily: np.ndarray, dates: pd.DatetimeIndex, fre
 
 def _extend_table_iii(rows: List[Dict[str, Any]], result: Any, *, sample_dates: pd.DatetimeIndex) -> None:
     """N9 的扩展行（top: HF PCA / PCA Proxy；bottom: ω 频率载荷 GC）。"""
-    import core.engine as eng
+    import prepareCore.engine as eng
     pipe = result.pipeline
     panel = result.panel
     display_k = int(np.asarray(pipe.F_cont_display_daily_total).shape[1]) if getattr(pipe, "F_cont_display_daily_total", None) is not None else 4
@@ -1320,7 +1320,7 @@ def _extend_table_iii(rows: List[Dict[str, Any]], result: Any, *, sample_dates: 
 
 
 def _truncate_or_pca(pipe: Any, which: str, k: int):
-    import core.engine as eng
+    import prepareCore.engine as eng
     src = getattr(pipe, f"pca_{which}", None)
     if src is not None and int(src.Lambda.shape[1]) >= k:
         return eng._truncate_pca_result(src, k)
@@ -1367,7 +1367,7 @@ def _to_excess_matrices(
 
 
 def _portfolio_sharpes_from_excess_matrices(matrix_by_segment: Mapping[str, np.ndarray]) -> Dict[str, float]:
-    import core.engine as eng
+    import prepareCore.engine as eng
 
     scale = np.sqrt(float(_annualization_days()))  # N6: 论文 252；A 股可设 PELGER_ANNUALIZATION_DAYS=243
     intra = np.asarray(matrix_by_segment["intraday"], dtype=float)
@@ -1424,7 +1424,7 @@ def _build_factor_sets(
     industry_factors: pd.DataFrame,
     ffc_segmented: pd.DataFrame,
 ) -> Tuple[Dict[str, Dict[str, np.ndarray]], Dict[str, Dict[str, Any]]]:
-    import core.engine as eng
+    import prepareCore.engine as eng
 
     display_pca = result.pipeline.pca_cont_display if getattr(result.pipeline, "pca_cont_display", None) is not None else result.pipeline.pca_cont
     weights = eng.factor_portfolio_weights(display_pca)
@@ -1687,7 +1687,7 @@ def _orthogonal_rotation(source: np.ndarray, target: np.ndarray) -> Tuple[np.nda
 
 
 def _continuous_factor_segments_from_panel(panel: Any, *, jump_a: float, k: int) -> Dict[str, Any]:
-    import core.engine as eng
+    import prepareCore.engine as eng
 
     r_cont, _ = eng.detect_jumps(panel, a=float(jump_a))
     pca = eng._panel_pca(r_cont, K=int(k), use_corr=True)
@@ -1711,7 +1711,7 @@ def _build_yearly_aligned_unbalanced_pca_segments(
     sample_dates: pd.DatetimeIndex,
     k: int = 4,
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
-    import core.engine as eng
+    import prepareCore.engine as eng
 
     baseline = {
         "intraday": np.asarray(result.pipeline.F_cont_display_daily_intra, dtype=float),
@@ -1844,7 +1844,7 @@ def _build_pricing_frame(
     factor_sets: Mapping[str, Mapping[str, np.ndarray]],
     rf_daily_sample: np.ndarray,
 ) -> pd.DataFrame:
-    import core.engine as eng
+    import prepareCore.engine as eng
 
     assets = sorted(asset_df["portfolio"].dropna().unique().tolist())
     rows: List[Dict[str, Any]] = []
@@ -1926,7 +1926,7 @@ def _build_payload(
     size_value_source = "legacy_balanced_subset"
     if _size_value_full_market():
         try:
-            from core.paper_fidelity import build_full_market_size_value
+            from prepareCore.paper_fidelity import build_full_market_size_value
             size_value_assets = build_full_market_size_value(
                 proc_root, assignments, global_dates=global_dates, mcap_matrix=mcap_matrix, symbols=symbols
             )
@@ -1961,7 +1961,7 @@ def _build_payload(
     ffc_source = "legacy_residual_allocation"
     try:
         if _ffc_mom_mode() == "carhart_daily":
-            from core.paper_fidelity import build_full_market_momentum, build_ffc_segmented_clean, split_daily_rf
+            from prepareCore.paper_fidelity import build_full_market_momentum, build_ffc_segmented_clean, split_daily_rf
             rf_global = rf_daily.reindex(global_dates, fill_value=0.0).to_numpy(dtype=float)
             rf_split_global = split_daily_rf(rf_global)
             mom_segmented = build_full_market_momentum(
@@ -2191,188 +2191,8 @@ def _short_asset_label_ascii(text: str) -> str:
 
 """
 
-
 def render_figure_12(result: Any, output_path: Path, title: str) -> None:
-    from core.engine import _atomic_save_figure, _save_placeholder_figure
-
-    try:
-        import matplotlib.pyplot as plt
-    except Exception as exc:  # pragma: no cover
-        raise RuntimeError(exc) from exc
-
-    payload = getattr(result, "paper_tail", {}) or {}
-    df = payload.get("figure12_data")
-    if df is None or df.empty:
-        _save_placeholder_figure(output_path, title, "Paper-tail Figure 12 data are not available.")
-        return
-
-    # 论文 Figure 12：3 个面板（All stocks / Industry / Sorted），1 行 × 3 列。
-    # 用空心圆点（无填充、无色条），并画一条向下倾斜的趋势参考线（intraday↔overnight 反向）。
-    paper_groups = [
-        ("all_stocks", "All Stocks"),
-        ("industry_portfolios", "{n_industry} Industry Portfolios"),
-        ("size_value_portfolios", "6 Size/Value Portfolios"),
-    ]
-    n_industry = 0
-    if isinstance(df, pd.DataFrame) and "group" in df.columns:
-        ind = df.loc[df["group"].eq("industry_portfolios"), "asset"]
-        n_industry = int(ind.nunique()) if not ind.empty else 0
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5.2), sharex=False, sharey=False)
-    for ax, (group, gtitle) in zip(np.atleast_1d(axes).flat, paper_groups):
-        sub = df.loc[df["group"].eq(group)].copy()
-        if group == "all_stocks" and "eligible_for_plot" in sub.columns:
-            keep = sub["eligible_for_plot"]
-            if keep.dtype != bool:
-                keep = keep.astype(str).str.lower().isin({"1", "true", "yes"})
-            sub = sub.loc[keep].copy()
-        title_group = gtitle.format(n_industry=n_industry) if "{n_industry}" in gtitle else gtitle
-        if sub.empty:
-            ax.set_title(title_group)
-            ax.text(0.5, 0.5, "No data", ha="center", va="center")
-            continue
-        xs = sub["mean_intraday_excess"].to_numpy(dtype=float)
-        ys = sub["mean_overnight_excess"].to_numpy(dtype=float)
-        # N4：x=预期盘中、y=预期隔夜；空心圆（论文样式）。
-        ax.scatter(xs, ys, facecolors="none", edgecolors="#1f5fbf", linewidths=1.0,
-                   s=30 if len(sub) > 20 else 55, alpha=0.85)
-        ax.axhline(0.0, color="0.85", linewidth=0.8)
-        ax.axvline(0.0, color="0.85", linewidth=0.8)
-        # 向下趋势参考线：对该面板点做一次最小二乘拟合（捕捉论文强调的负相关）。
-        good = np.isfinite(xs) & np.isfinite(ys)
-        if good.sum() >= 2 and np.ptp(xs[good]) > 0:
-            b1, b0 = np.polyfit(xs[good], ys[good], 1)
-            xline = np.array([xs[good].min(), xs[good].max()])
-            ax.plot(xline, b0 + b1 * xline, color="0.4", linestyle="--", linewidth=1.0)
-        ax.set_title(title_group)
-        ax.set_xlabel("Expected intraday excess return")
-        ax.set_ylabel("Expected overnight excess return")
-        if len(sub) <= 16:
-            for _, row in sub.iterrows():
-                ax.annotate(str(row["asset"]), (row["mean_intraday_excess"], row["mean_overnight_excess"]), fontsize=7, alpha=0.8)
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
-    _atomic_save_figure(fig, output_path, dpi=170)
-    plt.close(fig)
-
-
-def render_figure_13(result: Any, output_path: Path, title: str) -> None:
-    from core.engine import _atomic_save_figure, _save_placeholder_figure
-
-    try:
-        import matplotlib.pyplot as plt
-    except Exception as exc:  # pragma: no cover
-        raise RuntimeError(exc) from exc
-
-    payload = getattr(result, "paper_tail", {}) or {}
-    df = payload.get("figure13_data")
-    if df is None or df.empty:
-        _save_placeholder_figure(output_path, title, "Paper-tail Figure 13 data are not available.")
-        return
-
-    # 论文 Figure 13：行=因子集（PCA / PCA-unbalanced / FFC），列=频段，每子图画各因子归一化累计收益。
-    seg_cols = ["intraday", "overnight", "daily"]
-    seg_label = {"intraday": "Intraday", "overnight": "Overnight", "daily": "Daily"}
-    preferred = [
-        "Continuous PCA",
-        "Continuous PCA (unbalanced, yearly aligned)",
-        "FFC 4-factor",
-    ]
-    present = list(df["factor_set"].unique()) if "factor_set" in df.columns else []
-    factor_sets = [fs for fs in preferred if fs in present] or preferred
-    fig, axes = plt.subplots(len(factor_sets), 3, figsize=(16.8, 4.8 * len(factor_sets)), sharex=True)
-    axes = np.atleast_2d(axes)
-    for row_idx, factor_set in enumerate(factor_sets):
-        for col_idx, segment in enumerate(seg_cols):
-            ax = axes[row_idx, col_idx]
-            sub = df.loc[df["segment_kind"].eq(segment) & df["factor_set"].eq(factor_set)].copy()
-            ax.set_title(f"{factor_set} | {seg_label[segment]}", fontsize=9)
-            if sub.empty:
-                ax.text(0.5, 0.5, "No data", ha="center", va="center"); continue
-            for factor_name, factor_df in sub.groupby("factor", sort=False):
-                ax.plot(pd.to_datetime(factor_df["date"]), factor_df["normalized_cumulative_return"], linewidth=1.4, label=str(factor_name))
-            ax.grid(True, alpha=0.2)
-            if row_idx == len(factor_sets) - 1:
-                ax.set_xlabel("Time")
-            if col_idx == 0:
-                ax.set_ylabel("Return")
-            ax.legend(loc="best", fontsize=7, ncol=2)
-    fig.tight_layout(rect=(0, 0, 1, 0.975))
-    _atomic_save_figure(fig, output_path, dpi=170)
-    plt.close(fig)
-
-
-def _render_pricing_figure(df: pd.DataFrame, output_path: Path, title: str) -> None:
-    from core.engine import _atomic_save_figure, _save_placeholder_figure
-
-    try:
-        import matplotlib.pyplot as plt
-    except Exception as exc:  # pragma: no cover
-        raise RuntimeError(exc) from exc
-
-    if df.empty:
-        _save_placeholder_figure(output_path, title, "No pricing data are available.")
-        return
-
-    factor_sets = ["Continuous PCA", "FFC 4-factor"]
-    seg_cols = ["daily", "intraday", "overnight"]  # 论文列序
-    seg_label = {"daily": "Daily", "intraday": "Intraday", "overnight": "Overnight"}
-    set_label = {"Continuous PCA": "PCA", "FFC 4-factor": "Fama-French-Carhart"}
-    # 论文 Figure 14/15：Panel A（预测 vs 预期散点，2 行模型 × 3 列频段）在上，
-    # Panel B（各资产时序定价误差 alpha 柱状，2 行 × 3 列）在下。
-    fig, axes = plt.subplots(4, 3, figsize=(16, 16))
-    for r, factor_set in enumerate(factor_sets):          # Panel A 两行
-        for c, segment in enumerate(seg_cols):
-            ax = axes[r, c]
-            sub = df.loc[df["segment_kind"].eq(segment) & df["factor_set"].eq(factor_set)].copy()
-            if sub.empty:
-                ax.set_title(f"{seg_label[segment]} {set_label[factor_set]}", fontsize=9)
-                ax.text(0.5, 0.5, "No data", ha="center", va="center"); continue
-            ex = sub["expected_return"].to_numpy(dtype=float)
-            pr = sub["predicted_return"].to_numpy(dtype=float)
-            lo = float(np.nanmin(np.concatenate([ex, pr]))); hi = float(np.nanmax(np.concatenate([ex, pr])))
-            pad = max(1e-4, 0.08 * max(abs(lo), abs(hi), 1e-4))
-            ax.scatter(ex, pr, facecolors="none", edgecolors="#1f5fbf", linewidths=1.0, s=42, alpha=0.85)
-            ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], color="0.5", linestyle="--", linewidth=1.0)  # 45°
-            ax.set_title(f"{seg_label[segment]} {set_label[factor_set]}", fontsize=9)
-            ax.set_xlabel("Expected return"); ax.set_ylabel("Predicted return")
-            ax.grid(True, alpha=0.2)
-    for r, factor_set in enumerate(factor_sets):          # Panel B 两行（柱状）
-        for c, segment in enumerate(seg_cols):
-            ax = axes[r + 2, c]
-            sub = df.loc[df["segment_kind"].eq(segment) & df["factor_set"].eq(factor_set)].copy()
-            if sub.empty:
-                ax.set_title(f"{seg_label[segment]} {set_label[factor_set]}", fontsize=9)
-                ax.text(0.5, 0.5, "No data", ha="center", va="center"); continue
-            subb = sub.sort_values("asset")
-            xpos = np.arange(len(subb))
-            ax.bar(xpos, subb["alpha"].to_numpy(dtype=float), color="#1f5fbf", alpha=0.85)
-            ax.axhline(0.0, color="0.4", linewidth=0.9)
-            ax.set_title(f"{seg_label[segment]} {set_label[factor_set]}", fontsize=9)
-            ax.set_ylabel("Pricing error")
-            ax.set_xticks(xpos)
-            ax.set_xticklabels([str(a) for a in subb["asset"].tolist()], fontsize=6, rotation=90 if len(subb) > 8 else 0)
-            ax.grid(True, axis="y", alpha=0.2)
-    fig.text(0.5, 0.985, "Panel A: Predicted Returns", ha="center", fontsize=12, weight="bold")
-    fig.text(0.5, 0.495, "Panel B: Pricing Errors", ha="center", fontsize=12, weight="bold")
-    fig.tight_layout(rect=(0, 0, 1, 0.965))
-    _atomic_save_figure(fig, output_path, dpi=170)
-    plt.close(fig)
-
-
-def render_figure_14(result: Any, output_path: Path, title: str) -> None:
-    payload = getattr(result, "paper_tail", {}) or {}
-    df = payload.get("pricing_industry")
-    _render_pricing_figure(df if isinstance(df, pd.DataFrame) else pd.DataFrame(), output_path, title)
-
-
-def render_figure_15(result: Any, output_path: Path, title: str) -> None:
-    payload = getattr(result, "paper_tail", {}) or {}
-    df = payload.get("pricing_size_value")
-    full_title = f"{title}\nA-share reconstructed 2x3 portfolios; sample starts 2014-07-01"
-    _render_pricing_figure(df if isinstance(df, pd.DataFrame) else pd.DataFrame(), output_path, full_title)
-
-
-def render_figure_12(result: Any, output_path: Path, title: str) -> None:
-    from core.engine import _atomic_save_figure, _save_placeholder_figure
+    from prepareCore.engine import _atomic_save_figure, _save_placeholder_figure
 
     try:
         import matplotlib.pyplot as plt
@@ -2431,16 +2251,71 @@ def render_figure_12(result: Any, output_path: Path, title: str) -> None:
         ax.set_ylabel("Expected overnight excess return")
         label_map = _asset_label_map(sub["asset"]) if group == "industry_portfolios" else {}
         if group != "all_stocks" or len(sub) <= 16:
-            for _, row in sub.iterrows():
-                ax.annotate(
+            for label_idx, (_, row) in enumerate(sub.iterrows()):
+                _annotate_scatter_label(
+                    ax,
                     _plot_asset_label(row["asset"], label_map),
-                    (row["mean_intraday_excess"], row["mean_overnight_excess"]),
+                    float(row["mean_intraday_excess"]),
+                    float(row["mean_overnight_excess"]),
+                    label_idx,
+                    center=(
+                        float(np.nanmedian(xs[good])) if good.any() else float(np.nanmean(xs)),
+                        float(np.nanmedian(ys[good])) if good.any() else float(np.nanmean(ys)),
+                    ),
                     fontsize=7,
-                    alpha=0.85,
-                    xytext=(3, 2),
-                    textcoords="offset points",
                 )
     fig.tight_layout(rect=(0, 0, 1, 0.965), w_pad=2.0)
+    _atomic_save_figure(fig, output_path, dpi=170)
+    plt.close(fig)
+
+
+def render_figure_13(result: Any, output_path: Path, title: str) -> None:
+    from prepareCore.engine import _atomic_save_figure, _save_placeholder_figure
+
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError(exc) from exc
+
+    payload = getattr(result, "paper_tail", {}) or {}
+    df = payload.get("figure13_data")
+    if df is None or df.empty:
+        _save_placeholder_figure(output_path, title, "Paper-tail Figure 13 data are not available.")
+        return
+
+    seg_cols = ["intraday", "overnight", "daily"]
+    seg_label = {"intraday": "Intraday", "overnight": "Overnight", "daily": "Daily"}
+    preferred = [
+        "Continuous PCA",
+        "Continuous PCA (unbalanced, yearly aligned)",
+        "FFC 4-factor",
+    ]
+    present = list(df["factor_set"].unique()) if "factor_set" in df.columns else []
+    factor_sets = [factor_set for factor_set in preferred if factor_set in present] or preferred
+    fig, axes = plt.subplots(len(factor_sets), 3, figsize=(16.8, 4.8 * len(factor_sets)), sharex=True)
+    axes = np.atleast_2d(axes)
+    for row_idx, factor_set in enumerate(factor_sets):
+        for col_idx, segment in enumerate(seg_cols):
+            ax = axes[row_idx, col_idx]
+            sub = df.loc[df["segment_kind"].eq(segment) & df["factor_set"].eq(factor_set)].copy()
+            ax.set_title(f"{factor_set} | {seg_label[segment]}", fontsize=9)
+            if sub.empty:
+                ax.text(0.5, 0.5, "No data", ha="center", va="center")
+                continue
+            for factor_name, factor_df in sub.groupby("factor", sort=False):
+                ax.plot(
+                    pd.to_datetime(factor_df["date"]),
+                    factor_df["normalized_cumulative_return"],
+                    linewidth=1.4,
+                    label=str(factor_name),
+                )
+            ax.grid(True, alpha=0.2)
+            if row_idx == len(factor_sets) - 1:
+                ax.set_xlabel("Time")
+            if col_idx == 0:
+                ax.set_ylabel("Return")
+            ax.legend(loc="best", fontsize=7, ncol=2)
+    fig.tight_layout(rect=(0, 0, 1, 0.975))
     _atomic_save_figure(fig, output_path, dpi=170)
     plt.close(fig)
 
@@ -2487,8 +2362,57 @@ def _plot_asset_label(asset: Any, label_map: Mapping[str, str]) -> str:
     return _short_asset_label(raw)
 
 
+def _annotate_scatter_label(
+    ax: Any,
+    label: str,
+    x: float,
+    y: float,
+    index: int,
+    *,
+    fontsize: float = 7.0,
+    center: Optional[Tuple[float, float]] = None,
+) -> None:
+    if center is None or not np.isfinite(center[0]) or not np.isfinite(center[1]):
+        angle = (int(index) % 12) * (2.0 * np.pi / 12.0)
+    else:
+        x0, y0 = center
+        xlim = ax.get_xlim()
+        ylim = ax.get_ylim()
+        xscale = max(abs(xlim[1] - xlim[0]), 1e-12)
+        yscale = max(abs(ylim[1] - ylim[0]), 1e-12)
+        vx = (float(x) - float(x0)) / xscale
+        vy = (float(y) - float(y0)) / yscale
+        if abs(vx) + abs(vy) < 1e-9:
+            angle = (int(index) % 12) * (2.0 * np.pi / 12.0)
+        else:
+            angle = float(np.arctan2(vy, vx))
+    radius = 16.0 + 3.0 * (int(index) % 3)
+    tangent = [-8.0, 0.0, 8.0, -13.0, 13.0][int(index) % 5]
+    dx = float(np.cos(angle) * radius - np.sin(angle) * tangent)
+    dy = float(np.sin(angle) * radius + np.cos(angle) * tangent)
+    ax.annotate(
+        str(label),
+        (x, y),
+        fontsize=fontsize,
+        alpha=0.88,
+        xytext=(dx, dy),
+        textcoords="offset points",
+        ha="left" if dx >= 0 else "right",
+        va="bottom" if dy >= 0 else "top",
+        arrowprops={
+            "arrowstyle": "-",
+            "color": "0.55",
+            "linewidth": 0.45,
+            "alpha": 0.65,
+            "shrinkA": 1.5,
+            "shrinkB": 1.5,
+        },
+        bbox={"boxstyle": "round,pad=0.12", "fc": "white", "ec": "none", "alpha": 0.62},
+    )
+
+
 def _render_pricing_figure(df: pd.DataFrame, output_path: Path, title: str) -> None:
-    from core.engine import _atomic_save_figure, _save_placeholder_figure
+    from prepareCore.engine import _atomic_save_figure, _save_placeholder_figure
 
     try:
         import matplotlib.pyplot as plt
@@ -2530,14 +2454,15 @@ def _render_pricing_figure(df: pd.DataFrame, output_path: Path, title: str) -> N
             ax.set_ylabel("Predicted return")
             ax.grid(True, alpha=0.2)
             if len(sub) <= 12:
-                for _, row in sub.iterrows():
-                    ax.annotate(
+                for label_idx, (_, row) in enumerate(sub.iterrows()):
+                    _annotate_scatter_label(
+                        ax,
                         _plot_asset_label(row["asset"], asset_label_map),
-                        (row["expected_return"], row["predicted_return"]),
+                        float(row["expected_return"]),
+                        float(row["predicted_return"]),
+                        label_idx,
+                        center=(float(np.nanmedian(ex)), float(np.nanmedian(pr))),
                         fontsize=6.5,
-                        alpha=0.85,
-                        xytext=(3, 2),
-                        textcoords="offset points",
                     )
 
     for r, factor_set in enumerate(factor_sets):
@@ -2566,7 +2491,7 @@ def _render_pricing_figure(df: pd.DataFrame, output_path: Path, title: str) -> N
     top_rect = 0.900 if title_lines > 1 else 0.935
     fig.text(0.5, panel_a_y, "Panel A: Predicted Returns", ha="center", fontsize=12, weight="bold")
     fig.text(0.5, 0.462, "Panel B: Pricing Errors", ha="center", fontsize=12, weight="bold")
-    fig.tight_layout(rect=(0.02, 0.02, 0.98, top_rect))
+    fig.subplots_adjust(left=0.075, right=0.975, bottom=0.06, top=top_rect, hspace=0.75, wspace=0.32)
     _atomic_save_figure(fig, output_path, dpi=170)
     plt.close(fig)
 

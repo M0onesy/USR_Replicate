@@ -22,7 +22,7 @@ from typing import Sequence
 import numpy as np
 import pandas as pd
 
-from core.engine import (
+from prepareCore.engine import (
     ReplicationResult,
     _rolling_output_frames,
     _atomic_to_csv,

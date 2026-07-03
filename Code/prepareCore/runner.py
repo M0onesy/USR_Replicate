@@ -9,9 +9,9 @@ _CODE_DIR = Path(__file__).resolve().parents[1]
 if str(_CODE_DIR) not in sys.path:
     sys.path.insert(0, str(_CODE_DIR))
 
-from core.config import RunConfig
-from core.engine import ReplicationResult
-from core.logging_utils import log_done, log_start, log_warn
+from prepareCore.config import RunConfig
+from prepareCore.engine import ReplicationResult
+from prepareCore.logging_utils import log_done, log_start, log_warn
 
 
 GenerateFn = Callable[[ReplicationResult, RunConfig], Path]
@@ -25,7 +25,7 @@ def run_generator(
 ) -> Path:
     cfg = cfg or RunConfig()
     if result is None:
-        from core.pipeline_cache import get_result
+        from prepareCore.pipeline_cache import get_result
 
         result = get_result(cfg, allow_build=False, allow_fallback=True)
 
@@ -68,7 +68,7 @@ def run_standalone(tag: str, generate: GenerateFn) -> int:
     cfg.save_plots = False
     cfg.restart = False
 
-    from core.pipeline_cache import get_result
+    from prepareCore.pipeline_cache import get_result
 
     result = get_result(
         cfg,

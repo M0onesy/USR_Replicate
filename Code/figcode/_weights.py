@@ -25,8 +25,8 @@ _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)
 
 from pathlib import Path
 
-from core.io_utils import _save_heatmap, _save_placeholder_figure, _atomic_save_figure
-from core.logging_utils import log_render
+from prepareCore.io_utils import _save_heatmap, _save_placeholder_figure, _atomic_save_figure
+from prepareCore.logging_utils import log_render
 
 TAG = "figure_weights"
 
@@ -117,7 +117,14 @@ def plot_industry_sorted_bars(W, tickers, industry_lookup: dict, k_count: int, t
     for k in range(k_count):
         ax = axes[k]
         heights = W[order, k]
-        ax.bar(x, heights, width=1.0, color=bar_colors, linewidth=0)
+        ax.bar(
+            x,
+            heights,
+            width=0.86,
+            color=bar_colors,
+            edgecolor="white",
+            linewidth=0.25,
+        )
         ax.axhline(0.0, color="0.4", linewidth=0.8)
         ax.set_ylabel("Loadings")
         ax.set_title(f"Factor {k + 1}", fontsize=10)
@@ -127,7 +134,7 @@ def plot_industry_sorted_bars(W, tickers, industry_lookup: dict, k_count: int, t
             for i in range(1, len(ind_sorted) + 1):
                 if i == len(ind_sorted) or ind_sorted[i] != ind_sorted[start]:
                     if start > 0:
-                        ax.axvline(start - 0.5, color="0.85", linewidth=0.5)
+                        ax.axvline(start - 0.5, color="#d62728", linestyle="--", linewidth=0.9, alpha=0.9)
                     start = i
         ax.set_xlim(-0.5, len(order) - 0.5)
         ax.set_xticks([])
@@ -200,7 +207,7 @@ def _full_weight_heatmap(result, cfg, *, proxy: bool, title: str, output_path: P
     """从 pipeline 重算【全部股票】的权重向量（已含 P4 符号定向），按行业排序画热图。
     任何异常都回退到旧的 top-N、按代码排序的热图，保证出图不中断。"""
     try:
-        import core.engine as eng
+        import prepareCore.engine as eng
         import numpy as np
         pipe = result.pipeline
         panel = result.panel

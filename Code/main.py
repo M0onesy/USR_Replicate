@@ -13,12 +13,16 @@ _CODE_DIR = Path(__file__).resolve().parent
 if str(_CODE_DIR) not in sys.path:
     sys.path.insert(0, str(_CODE_DIR))
 
-from core.config import RunConfig, SUBMISSION_FROZEN_INDUSTRIES
-from core.engine import STRICT_BALANCED_SAMPLE
-from core.logging_utils import log_done, log_info, log_warn
-from core.registry import Task, all_tasks, resolve_keys
-from core.runner import run_generator
-from core.submission_fast import build_submission_fast_result, submission_fast_runtime_root
+import prepareCore as _prepare_core
+
+sys.modules.setdefault("core", _prepare_core)
+
+from prepareCore.config import RunConfig, SUBMISSION_FROZEN_INDUSTRIES
+from prepareCore.engine import STRICT_BALANCED_SAMPLE
+from prepareCore.logging_utils import log_done, log_info, log_warn
+from prepareCore.registry import Task, all_tasks, resolve_keys
+from prepareCore.runner import run_generator
+from prepareCore.submission_fast import build_submission_fast_result, submission_fast_runtime_root
 
 
 DEFAULT_CONFIG_PATH = _CODE_DIR / "config.yaml"
@@ -180,15 +184,15 @@ def _run_data_steps(config: Mapping[str, Any], args: argparse.Namespace, cfg: Ru
     for step in steps:
         key = str(step).strip().lower()
         if key == "get_apidb":
-            from dataPrepare import step_00_get_apidb
+            from dataPrepare import step0_get_apidb
 
-            log_info("data", "Running step_00_get_apidb with its own CLI defaults.")
-            step_00_get_apidb.main()
+            log_info("data", "Running step0_get_apidb with its own CLI defaults.")
+            step0_get_apidb.main()
         elif key == "preprocess_panels":
-            from dataPrepare.step_01_preprocess_panels import preprocess_cn_data
+            from dataPrepare.step1_preprocess_panels import preprocess_cn_data
 
             step_cfg = data_cfg.get("preprocess_panels") if isinstance(data_cfg.get("preprocess_panels"), Mapping) else {}
-            log_info("data", "Running step_01_preprocess_panels.")
+            log_info("data", "Running step1_preprocess_panels.")
             preprocess_cn_data(
                 proc_root=cfg.proc_root,
                 years=step_cfg.get("years"),
@@ -199,7 +203,7 @@ def _run_data_steps(config: Mapping[str, Any], args: argparse.Namespace, cfg: Ru
                 compress_symbol_returns=bool(step_cfg.get("compress_symbol_returns", False)),
             )
         elif key == "mom_5min":
-            from dataPrepare import step_02_build_mom_5min
+            from dataPrepare import step2_build_mom_5min
 
             step_cfg = data_cfg.get("mom_5min") if isinstance(data_cfg.get("mom_5min"), Mapping) else {}
             argv = [
@@ -218,11 +222,11 @@ def _run_data_steps(config: Mapping[str, Any], args: argparse.Namespace, cfg: Ru
             ]
             if args.workers is not None:
                 argv.extend(["--workers", str(args.workers)])
-            log_info("data", "Running step_02_build_mom_5min.")
+            log_info("data", "Running step2_build_mom_5min.")
             old_argv = sys.argv[:]
             try:
-                sys.argv = ["step_02_build_mom_5min.py", *argv]
-                step_02_build_mom_5min.main()
+                sys.argv = ["step2_build_mom_5min.py", *argv]
+                step2_build_mom_5min.main()
             finally:
                 sys.argv = old_argv
         else:

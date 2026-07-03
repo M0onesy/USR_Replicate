@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from core.config import RunConfig
-from core.engine import ReplicationResult
-from core.logging_utils import log_info, log_render, log_step
-from core.runner import run_standalone
-from core.submission_fast import build_submission_table_i_aligned
+from prepareCore.config import RunConfig
+from prepareCore.engine import ReplicationResult
+from prepareCore.logging_utils import log_info, log_render, log_step
+from prepareCore.runner import run_standalone
+from prepareCore.submission_fast import build_submission_table_i_aligned
 from tableCode._common import diagnostics_dir, output_path, write_csv, write_json, write_table_with_fallback
 
 

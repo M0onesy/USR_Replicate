@@ -95,10 +95,10 @@ python Code/main.py --config Code/config.yaml
 命令行显式传入的参数覆盖 YAML。例如：
 
 ```bash
-python Code/main.py --stages figures --figures fig13 --output-root Result/pelger_cn_adjusted
+python Code/main.py --stages figures --figures fig13 --output-root Result
 ```
 
-核心 PCA 和缓存签名参数仍由 `Code/core/config.py` 的 `RunConfig` 做内部校验；一般不需要直接改 Python 配置。
+核心 PCA 和缓存签名参数仍由 `Code/prepareCore/config.py` 的 `RunConfig` 做内部校验；一般不需要直接改 Python 配置。
 
 ## 目录结构
 
@@ -107,7 +107,7 @@ Reposit/
 ├─ Code/
 │  ├─ main.py
 │  ├─ config.yaml
-│  ├─ core/
+│  ├─ prepareCore/
 │  ├─ dataPrepare/
 │  ├─ figCode/
 │  ├─ tableCode/
@@ -118,19 +118,20 @@ Reposit/
 │  ├─ external_Data/
 │  └─ proc_Data/
 ├─ Result/
-│  └─ pelger_cn_adjusted/
+│  ├─ figures/
+│  └─ tables/
 ├─ docs/
 ├─ requirements.txt
 └─ README.md
 ```
 
-`Code/core/` 存放核心数据结构、PCA 引擎、缓存、paper_tail 资产逻辑、任务注册表和轻量交稿结果构造。
+`Code/prepareCore/` 存放核心数据结构、PCA 引擎、缓存、paper_tail 资产逻辑、任务注册表和轻量交稿结果构造。
 
 `Code/dataPrepare/` 存放数据准备步骤：
 
-- `step_00_get_apidb.py`: 外部 API 原始数据抓取工具。
-- `step_01_preprocess_panels.py`: 从 raw `.bz2` 和复权因子生成 `strict_balanced` / `paper_lenient` 面板。
-- `step_02_build_mom_5min.py`: 构建 5 分钟 MOM 因子。
+- `step0_get_apidb.py`: 外部 API 原始数据抓取工具。
+- `step1_preprocess_panels.py`: 从 raw `.bz2` 和复权因子生成 `strict_balanced` / `paper_lenient` 面板。
+- `step2_build_mom_5min.py`: 构建 5 分钟 MOM 因子。
 
 `Code/figCode/` 存放交稿版保留图的渲染代码。共享绘图 helper 放在 `_weights.py`、`_timevar.py` 等内部模块中。
 
@@ -184,13 +185,13 @@ python Code/main.py --rf-file path/to/risk_free.csv
 最终图：
 
 ```text
-Result/pelger_cn_adjusted/figures/
+Result/figures/
 ```
 
 最终表：
 
 ```text
-Result/pelger_cn_adjusted/tables/
+Result/tables/
 ```
 
 轻量运行诊断：
@@ -214,7 +215,7 @@ Data/proc_Data/pelger_cn_adjusted/runtime/submission_fast/diagnostics/
 pip install -r requirements.txt
 ```
 
-`requirements.txt` 不包含 `step_00_get_apidb.py` 可能需要的专有 SDK/API 依赖；如需抓取原始数据，应按数据服务方说明单独配置。
+`requirements.txt` 不包含 `step0_get_apidb.py` 可能需要的专有 SDK/API 依赖；如需抓取原始数据，应按数据服务方说明单独配置。
 
 ## 提交检查清单
 

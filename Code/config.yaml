@@ -27,7 +27,7 @@ data_steps: []
 paths:
   proc_root: Data/proc_Data/pelger_cn_adjusted
   runtime_root: Data/proc_Data/pelger_cn_adjusted/runtime
-  final_result_root: Result/pelger_cn_adjusted
+  final_result_root: Result
   external_data_root: Data/external_Data/pelger_tail
   paper_tail_root: Data/proc_Data/pelger_cn_adjusted/paper_tail
   rf_file: Data/external_Data/pelger_tail/factors/rf/risk_free.csv

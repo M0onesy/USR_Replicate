@@ -6,8 +6,8 @@ from typing import Any, Mapping
 
 import pandas as pd
 
-from core.config import RunConfig
-from core.logging_utils import log_warn
+from prepareCore.config import RunConfig
+from prepareCore.logging_utils import log_warn
 
 
 TABLE_FILES = {
@@ -19,7 +19,7 @@ TABLE_FILES = {
 
 
 def diagnostics_dir(cfg: RunConfig) -> Path:
-    from core.submission_fast import submission_fast_runtime_root
+    from prepareCore.submission_fast import submission_fast_runtime_root
 
     path = submission_fast_runtime_root(cfg) / "diagnostics"
     path.mkdir(parents=True, exist_ok=True)

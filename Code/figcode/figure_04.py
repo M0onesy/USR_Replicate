@@ -22,11 +22,11 @@ _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)
 
 from pathlib import Path
 
-from core.config import RunConfig
-from core.engine import ReplicationResult
-from core.io_utils import figure_path, figure_title
-from core.logging_utils import log_step, log_render
-from core.runner import run_standalone
+from prepareCore.config import RunConfig
+from prepareCore.engine import ReplicationResult
+from prepareCore.io_utils import figure_path, figure_title
+from prepareCore.logging_utils import log_step, log_render
+from prepareCore.runner import run_standalone
 from figCode._weights import _full_weight_heatmap
 
 TAG = "figure_04"

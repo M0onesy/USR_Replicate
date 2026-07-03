@@ -8,9 +8,9 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
-from core.config import RunConfig
-from core.engine import ReplicationResult, refresh_replication_result_views, run_cn_replication
-from core.logging_utils import log_info, log_step
+from prepareCore.config import RunConfig
+from prepareCore.engine import ReplicationResult, refresh_replication_result_views, run_cn_replication
+from prepareCore.logging_utils import log_info, log_step
 
 
 _MEMORY_CACHE: dict[str, ReplicationResult] = {}
@@ -219,7 +219,7 @@ def get_existing_result(cfg: RunConfig, *, allow_fallback: bool = True) -> Repli
         "No reusable ReplicationResult was found."
         f" Searched checkpoint roots: {roots}.{details} "
         "If this run is driven by main.py, switch ACTIVE_MAIN_PROFILE to a rebuild profile "
-        "or set rebuild_result=True and restart=True in Code/core/config.py. "
+        "or set rebuild_result=True and restart=True in Code/prepareCore/config.py. "
         "If this is a standalone figure/table script, rerun it with --allow-build."
     )
 

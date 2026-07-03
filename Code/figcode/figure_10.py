@@ -24,14 +24,14 @@ from pathlib import Path
 
 import numpy as np
 
-from core.config import RunConfig
-from core.engine import ReplicationResult
-from core.io_utils import (
+from prepareCore.config import RunConfig
+from prepareCore.engine import ReplicationResult
+from prepareCore.io_utils import (
     figure_path, figure_title, get_rolling_frames, gc_columns,
     _save_line_plot, _save_placeholder_figure,
 )
-from core.logging_utils import log_step, log_render
-from core.runner import run_standalone
+from prepareCore.logging_utils import log_step, log_render
+from prepareCore.runner import run_standalone
 
 TAG = "figure_10"
 FIGURE_NUMBER = 10

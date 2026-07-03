@@ -73,11 +73,11 @@ PAPER_LENIENT_SAMPLE = "paper_lenient"
 VALID_PANEL_SAMPLE_MODES = {STRICT_BALANCED_SAMPLE, PAPER_LENIENT_SAMPLE}
 PANEL_RETURN_SCHEME = "daily_intra_night_total_plus_full_5min_v1"
 
-# 拆分后本文件位于 Code/core/engine.py，比原始 Code/allcode_Need.py 深一层，
+# 拆分后本文件位于 Code/prepareCore/engine.py，比原始 Code/allcode_Need.py 深一层，
 # 因此仓库根目录需要回退两级（core -> Code -> Reposit）。
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PROC_ROOT = REPO_ROOT / "Data" / "proc_Data" / "pelger_cn_adjusted"
-DEFAULT_OUTPUT_ROOT = REPO_ROOT / "Result" / "pelger_cn_adjusted"
+DEFAULT_OUTPUT_ROOT = REPO_ROOT / "Result"
 DEFAULT_RUNTIME_ROOT = DEFAULT_PROC_ROOT / "runtime"
 BLAS_THREAD_ENV_KEYS = (
     "OMP_NUM_THREADS",
@@ -4524,7 +4524,7 @@ def build_paper_table_v(pipe: PelgerPipeline) -> pd.DataFrame:
 
 def build_replication_coverage_report() -> pd.DataFrame:
     """列出论文表图在当前 A 股数据条件下的复现状态。"""
-    from core.paper_tail import build_replication_coverage_report as build_tail_coverage_report
+    from prepareCore.paper_tail import build_replication_coverage_report as build_tail_coverage_report
 
     return build_tail_coverage_report()
 
@@ -4628,6 +4628,7 @@ def refresh_replication_result_views(
     paper_tail_weighting: str = "value_weighted",
     refresh_paper_tail: bool = True,
     strict_final_export: bool = False,
+    refresh_monthly_weights: bool = True,
 ) -> ReplicationResult:
     """Refresh lightweight presentation-layer tables from an existing ReplicationResult.
 
@@ -4662,15 +4663,17 @@ def refresh_replication_result_views(
 
     result.pca_weights, result.proxy_weights = build_weight_tables(pipe, panel)
     result.factor_return_summary, result.cumulative_factor_returns = build_factor_return_tables(pipe, panel)
-    if result.monthly_pca_weights.empty:
+    # Monthly PCA weights only served the removed Figure 5 path.  Keep the
+    # legacy default for old callers, but let the submission-fast path skip it.
+    if refresh_monthly_weights and result.monthly_pca_weights.empty:
         result.monthly_pca_weights = build_monthly_pca_weights(panel)
 
     if not hasattr(result, "paper_tail") or result.paper_tail is None:
         result.paper_tail = {}
 
     if refresh_paper_tail:
-        from core.paper_tail import build_replication_coverage_report as build_tail_coverage_report
-        from core.paper_tail import refresh_paper_tail_views
+        from prepareCore.paper_tail import build_replication_coverage_report as build_tail_coverage_report
+        from prepareCore.paper_tail import refresh_paper_tail_views
 
         payload = refresh_paper_tail_views(
             result,
@@ -5015,22 +5018,22 @@ def export_all_paper_figures(
         )
 
     def fig12(output_path: Path) -> None:
-        from core.paper_tail import render_figure_12
+        from prepareCore.paper_tail import render_figure_12
 
         render_figure_12(result, output_path, figure_specs[12][2])
 
     def fig13(output_path: Path) -> None:
-        from core.paper_tail import render_figure_13
+        from prepareCore.paper_tail import render_figure_13
 
         render_figure_13(result, output_path, figure_specs[13][2])
 
     def fig14(output_path: Path) -> None:
-        from core.paper_tail import render_figure_14
+        from prepareCore.paper_tail import render_figure_14
 
         render_figure_14(result, output_path, figure_specs[14][2])
 
     def fig15(output_path: Path) -> None:
-        from core.paper_tail import render_figure_15
+        from prepareCore.paper_tail import render_figure_15
 
         render_figure_15(result, output_path, figure_specs[15][2])
 

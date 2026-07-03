@@ -32,7 +32,7 @@ import pandas as pd
 # 基础：窗口与局部 PCA
 # ----------------------------------------------------------------------
 def _eng():
-    import core.engine as eng
+    import prepareCore.engine as eng
     return eng
 
 
@@ -214,7 +214,7 @@ def _daily_factor_sets(result: Any) -> Dict[str, np.ndarray]:
 # 绘图：Figure 6 / 7 / 8 / 9 / 10 / 11
 # ----------------------------------------------------------------------
 def _save(fig, output_path: Path):
-    from core.io_utils import _atomic_save_figure
+    from prepareCore.io_utils import _atomic_save_figure
     _atomic_save_figure(fig, output_path, dpi=160)
 
 

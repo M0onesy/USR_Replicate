@@ -8,8 +8,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-from core.config import RunConfig
-from core.engine import (
+from prepareCore.config import RunConfig
+from prepareCore.engine import (
     DEFAULT_PROC_ROOT,
     STRICT_BALANCED_SAMPLE,
     PelgerPipeline,
@@ -27,8 +27,8 @@ from core.engine import (
     rolling_gc_and_explained_variation,
     subset_panel_by_years,
 )
-from core.logging_utils import log_info, log_step, log_warn
-from core.paper_tail import (
+from prepareCore.logging_utils import log_info, log_step, log_warn
+from prepareCore.paper_tail import (
     OFFICIAL_FFC_FACTORS,
     SEGMENT_ORDER,
     _annualization_days,
@@ -41,7 +41,7 @@ from core.paper_tail import (
     _portfolio_sharpes_from_excess_matrices,
     _to_excess_matrices,
 )
-from core.runner import run_generator
+from prepareCore.runner import run_generator
 
 
 SUBMISSION_FAST_FIGURES: Tuple[Tuple[str, str], ...] = (
@@ -187,6 +187,26 @@ def _persist_rolling_outputs(
     _atomic_to_csv(rolling_ev_df, diagnostics_dir / "rolling_explained_variation.csv", index=False, encoding="utf-8-sig")
 
 
+def _load_submission_rolling_outputs(diagnostics_dir: Path) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    gc_path = diagnostics_dir / "rolling_gc.csv"
+    ev_path = diagnostics_dir / "rolling_explained_variation.csv"
+    if not gc_path.exists() or not ev_path.exists():
+        return None
+    try:
+        gc_df = pd.read_csv(gc_path)
+        ev_df = pd.read_csv(ev_path)
+        gc_cols = [col for col in gc_df.columns if str(col).startswith("gc_")]
+        if not gc_cols or "explained_variation" not in ev_df.columns:
+            return None
+        rolling_gc = gc_df[gc_cols].to_numpy(dtype=np.float64)
+        rolling_ev = ev_df["explained_variation"].to_numpy(dtype=np.float64)
+        if rolling_gc.shape[0] == 0 or rolling_gc.shape[0] != rolling_ev.shape[0]:
+            return None
+        return rolling_gc, rolling_ev
+    except Exception:
+        return None
+
+
 def _load_or_build_rolling_outputs(
     cfg: RunConfig,
     *,
@@ -195,6 +215,10 @@ def _load_or_build_rolling_outputs(
 ) -> Tuple[np.ndarray, np.ndarray, str]:
     rolling_dir = Path(cfg.runtime_root) / "checkpoints" / "rolling"
     if not _rolling_signature_matches(cfg) or not rolling_dir.exists():
+        cached = _load_submission_rolling_outputs(diagnostics_dir)
+        if cached is not None:
+            log_info("submission_fast", "Reusing submission-fast rolling diagnostics cache.")
+            return cached[0], cached[1], "submission_fast_cache"
         log_warn("submission_fast", "No compatible strict rolling checkpoints were found; recomputing strict rolling diagnostics.")
         rolling_window = 21 if pipeline.panel.D >= 21 else max(5, pipeline.panel.D // 3)
         workers = int(cfg.rolling_workers or cfg.workers or 1)
@@ -733,7 +757,7 @@ def _sharpe_row(section: str, portfolio: str, sharpes: Mapping[str, float]) -> D
 
 
 def _single_segment_tangency_sr(matrix: np.ndarray) -> float:
-    import core.engine as eng
+    import prepareCore.engine as eng
 
     x = np.asarray(matrix, dtype=float)
     if x.ndim == 1:
@@ -751,7 +775,7 @@ def _component_weighted_sharpes(
     weight_segment: str,
 ) -> Dict[str, float]:
     """Estimate tangency weights on one segment and evaluate them on all segments."""
-    import core.engine as eng
+    import prepareCore.engine as eng
 
     base = np.asarray(matrix_by_segment[weight_segment], dtype=float)
     if base.ndim == 1:
@@ -1056,6 +1080,7 @@ def build_submission_fast_result(
         paper_tail_weighting=cfg.paper_tail_weighting,
         refresh_paper_tail=bool(cfg.refresh_paper_tail),
         strict_final_export=cfg.strict_final_export,
+        refresh_monthly_weights=False,
     )
 
     if build_factor_count_diagnostics:

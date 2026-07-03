@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from core.engine import (
+from prepareCore.engine import (
     DEFAULT_OUTPUT_ROOT,
     DEFAULT_PROC_ROOT,
     PAPER_LENIENT_SAMPLE,

@@ -23,9 +23,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from core.engine import load_proc_hf_panel
+from prepareCore.engine import load_proc_hf_panel
 
-REPO_ROOT = SCRIPT_DIR.parent
+REPO_ROOT = SCRIPT_DIR.parents[1]
 DEFAULT_PROC_ROOT = REPO_ROOT / "Data" / "proc_Data" / "pelger_cn_adjusted"
 STRICT_BALANCED_ROOT = DEFAULT_PROC_ROOT / "panels" / "strict_balanced"
 

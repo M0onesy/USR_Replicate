@@ -6,9 +6,9 @@ from pathlib import Path
 
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
-from core.config import RunConfig
-from core.engine import ReplicationResult
-from core.io_utils import (
+from prepareCore.config import RunConfig
+from prepareCore.engine import ReplicationResult
+from prepareCore.io_utils import (
     _save_line_plot,
     _save_placeholder_figure,
     figure_path,
@@ -16,8 +16,8 @@ from core.io_utils import (
     gc_columns,
     get_rolling_frames,
 )
-from core.logging_utils import log_render, log_step
-from core.runner import run_standalone
+from prepareCore.logging_utils import log_render, log_step
+from prepareCore.runner import run_standalone
 
 TAG = "figure_07"
 FIGURE_NUMBER = 7
